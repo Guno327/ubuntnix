@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test suite
+        run: ./tests/run.sh
+
+  lint:
+    name: Shell lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          files=$(find . -name '*.sh' -not -path './.git/*')
+          [ -z "$files" ] || shellcheck $files

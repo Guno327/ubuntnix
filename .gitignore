@@ -1,0 +1,12 @@
+# build outputs
+result
+result-*
+*.img
+*.qcow2
+*.iso
+*.erofs
+*.squashfs
+
+# local scratch
+scratch/
+.direnv/

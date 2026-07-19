@@ -69,6 +69,13 @@ Three principles anchor every decision:
 - **G9 — Canonical-backed security.** Ubuntu Pro is required (free personal
   tokens exist, so this does not gate adoption): esm-apps patch coverage for
   universe, Livepatch for the kernel.
+- **G10 — Documentation as a first-class deliverable.** A Read the Docs
+  (Sphinx-based) site — hosting via GitHub Pages, provisioned by the owner —
+  documenting the installation process, module authoring, and operational
+  workflows, plus an **auto-generated reference of all available options and
+  modules reflecting the current state of the tree**, regenerated in CI so
+  it can never drift from the code. The PM owns standing this up and keeping
+  it current from early in the project.
 
 ## 3. Non-goals
 
@@ -471,6 +478,9 @@ content (§4.4).
 
 OSS-from-day-one: public repo, README, contributor docs, and CI from M1;
 every milestone lands with QEMU-based end-to-end tests where applicable.
+The documentation site (G10) is stood up early — PM-scheduled, not gated on
+a milestone — with guides growing alongside features and the options/module
+reference regenerated in CI from the tree.
 
 - **M1 — Boot.** Ubuntu-native stdenv bootstrap; archive lockfile with
   apt-solver-based resolution (declared packages → pinned
@@ -587,6 +597,7 @@ questions will be added here as they arise during implementation.
 | V1.0 target | ISO → USB → installer → system ≡ upstream Desktop/Server install (same software/defaults), ubuntnix-managed, config in `/flake`; divergences limited to the enumerated parity exceptions | §10 |
 | Primitive set | Closed, parity-audited: packages (debs/snaps+state), files (etc/units/unit-state/home), users (+password hashes via secrets), debconf preseeds, boot (kernel+params), secrets | §6 |
 | Audience | Open source from day one | docs + CI from M1 |
+| Documentation | Read the Docs (Sphinx) site, GitHub Pages hosting (owner-provisioned): install guide, module authoring, workflows, plus auto-generated options/modules reference regenerated in CI | G10; PM-owned |
 | License / hosting / naming | GPL-3.0 · GitHub + Actions · project `ubuntnix`, CLI alias `ubx` | |
 
 ### Superseded (traceability)

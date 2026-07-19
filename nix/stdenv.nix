@@ -218,6 +218,18 @@ let
       builder = ld;
       args = [ "--library-path" libraryPath bashPath scriptFile ];
       PATH = binPath;
+      # BOOTSTRAP CAVEAT (CI run 29705389052): the loader trick above only
+      # covers the ENTRY binary (bash). When the script execs another
+      # dynamically-linked ubuntu-base binary by bare name, the kernel
+      # looks for that binary's hardcoded ELF interpreter
+      # (/lib64/ld-linux-x86-64.so.2), which does not exist inside the Nix
+      # sandbox — "cannot execute: required file not found". Until #9's
+      # chroot/namespace builder provides a real FHS root, scripts must
+      # invoke dynamically-linked children through the loader explicitly:
+      #   "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" <abs path> <args>
+      # (Shell builtins, bash scripts, and static binaries are unaffected.)
+      UBX_LD = ld;
+      UBX_LIBRARY_PATH = libraryPath;
     });
 in
 {
@@ -250,9 +262,11 @@ in
           echo "MARKER=ubuntnix-stdenv-proof-v1"
           echo "ubuntu-base=${ubuntuBase.version}-${ubuntuBase.arch}"
           echo "== dpkg --version =="
-          dpkg --version
+          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
+            "${ubuntuBase.unpacked}/usr/bin/dpkg" --version
           echo "== bash --version =="
-          bash --version
+          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
+            "${ubuntuBase.unpacked}/usr/bin/bash" --version
         } > "$out"
       '';
     };

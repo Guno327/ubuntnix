@@ -228,8 +228,13 @@ let
       # invoke dynamically-linked children through the loader explicitly:
       #   "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" <abs path> <args>
       # (Shell builtins, bash scripts, and static binaries are unaffected.)
+      # NOTE: these live as derivation ENV ATTRS, not inside the script
+      # text — `builtins.toFile` (used for the script) must not contain
+      # references to derivation outputs (CI run 29705452988), while env
+      # attrs may. Scripts therefore address the base tree as "$UBX_BASE".
       UBX_LD = ld;
       UBX_LIBRARY_PATH = libraryPath;
+      UBX_BASE = "${ubuntuBase.unpacked}";
     });
 in
 {
@@ -263,10 +268,10 @@ in
           echo "ubuntu-base=${ubuntuBase.version}-${ubuntuBase.arch}"
           echo "== dpkg --version =="
           "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
-            "${ubuntuBase.unpacked}/usr/bin/dpkg" --version
+            "$UBX_BASE/usr/bin/dpkg" --version
           echo "== bash --version =="
           "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
-            "${ubuntuBase.unpacked}/usr/bin/bash" --version
+            "$UBX_BASE/usr/bin/bash" --version
         } > "$out"
       '';
     };

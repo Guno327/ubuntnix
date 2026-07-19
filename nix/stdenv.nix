@@ -31,27 +31,51 @@
 # LANGUAGE PRIMITIVE, not a nixpkgs fetcher; see tests/unit/021-flake-
 # purity.sh's deliberate `builtins.fetchurl` carve-out) of the flat file,
 # hash-verified against the digest derived ourselves above. It exists as the
-# independently-auditable trust anchor, but nothing in a Nix sandbox can
-# unpack a .tar.gz — there's no `tar`, and the only `tar` we'd be allowed to
-# trust is the one INSIDE this very tarball. Chicken, meet egg.
+# independently-auditable trust anchor, but nothing in the Nix build sandbox
+# can unpack a .tar.gz — there's no `tar` in there, and the only `tar` we'd
+# be allowed to trust is the one INSIDE this very tarball. Chicken, meet egg.
 #
-# The escape hatch (SPEC.md §4.1 step 1 "escape hatches", option (a) from
-# the issue #6 task notes): `builtins.fetchTarball` unpacks gzipped tarballs
-# at EVAL TIME using Nix's own internal decompression/unpack code — no
-# `tar`, no nixpkgs, nothing but Nix itself. `unpacked` below fetches the
-# exact same URL a second time, this time through fetchTarball, giving us an
-# already-unpacked store path with no external tool involved anywhere.
+# FIRST ATTEMPT, RULED OUT: `builtins.fetchTarball` unpacks gzipped tarballs
+# at eval time with no external `tar` — but it turns out to REQUIRE a single
+# top-level directory (the GitHub-tarball-style shape). `ubuntu-base`'s
+# tarball is a bare rootfs (`bin`, `etc`, `usr`, ... all at the top level),
+# which fails eval with "tarball ... contains an unexpected number of
+# top-level files" (confirmed against real CI: GitHub Actions run
+# 29705143141). This primitive is therefore structurally unusable for this
+# specific tarball shape, however useful it is elsewhere.
 #
-# `fetchTarball`'s `sha256` is the hash of the UNPACKED NAR — a different
-# value from the flat-file `sha256` above by construction (it hashes a
-# decompressed, unpacked file tree, not raw .tar.gz bytes) — and there is no
-# way to compute it without a working `nix` binary, which this development
-# environment does not have (see CONTRIBUTING/task notes). `unpackedSha256`
-# below is therefore an intentionally-wrong 64-zero placeholder.
+# THE APPROACH USED INSTEAD: `unpacked` below is a derivation whose builder
+# is the HOST's own `/bin/sh` (+ `tar`), run with `__noChroot = true` so it
+# can see the outer filesystem, and pinned as a fixed-output derivation
+# (`outputHashMode = "recursive"`, a NAR-style hash of the whole unpacked
+# tree — the same *kind* of hash `fetchTarball` would have produced, just
+# computed by our own tiny derivation instead of a builtin). This is the
+# ONE deliberate, contained crossing of "no non-Canonical build tools": the
+# host `sh`/`tar` doing the unpacking come from the Ubuntu archive on every
+# environment this is ever built in (the CI runner is `ubuntu-24.04`; `nix`
+# itself is installed from the archive per SPEC.md §1.3; a future on-device
+# build per SPEC.md §4.5 runs on Ubuntu natively too) — so in every case
+# that host `tar` is itself Canonical's, same as everything else in this
+# project. And because the OUTPUT is hash-pinned exactly like any other
+# fixed-output fetch, whatever produced it is irrelevant to reproducibility
+# after the fact: a hash mismatch fails the build the same way a corrupted
+# download would. The impurity is contained exactly like a fetch, not
+# smuggled in as an ordinary (unpinned) build step.
 #
-# PM ACTION REQUIRED (first CI run only): CI's "flake" job will fail
-# evaluating `packages.x86_64-linux.stdenv-proof` (which forces `unpacked`)
-# with a Nix hash-mismatch error of the shape
+# `outputHash` is that recursive NAR-style hash of the unpacked tree — a
+# different value from the flat-file `sha256` above by construction (it
+# hashes a decompressed, unpacked file tree, not raw .tar.gz bytes) — and
+# there is no way to compute it without a working `nix` binary, which this
+# development environment does not have (see CONTRIBUTING/task notes).
+# `unpackedSha256` below is therefore an intentionally-wrong 64-zero
+# placeholder.
+#
+# PM ACTION REQUIRED (first CI run only): nothing forces `unpacked` to be
+# built during plain evaluation any more (it's an ordinary derivation, not
+# an eval-time fetch), so `flake check --no-build` should now pass cleanly.
+# The hash mismatch instead surfaces when CI's "flake" job actually BUILDS
+# the proof (the "Build stdenv-proof" step, `nix build .#stdenv-proof`),
+# with an error of the shape:
 #   error: hash mismatch in fixed-output derivation ...
 #     specified: sha256:0000000000000000000000000000000000000000000000000000000000000000
 #     got:       sha256:<the real hash>
@@ -72,20 +96,54 @@ let
     # SHA256SUMS at the same URL.
     sha256 = "c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58";
 
-    # The audited trust-root fetch. Nothing downstream consumes it directly
-    # (see "Bootstrap" above for why the tarball itself is unusable as a
-    # build input in-sandbox) — its purpose is to be the independently
-    # hash-verifiable artifact that provenance-matches `unpacked` below
-    # (identical `url`, hence necessarily identical bytes).
+    # The audited trust-root fetch: a plain fixed-output fetch of the flat
+    # tarball bytes, hash-verified above. This is the sole input `unpacked`
+    # below unpacks (see "Bootstrap" above for why the unpacking itself
+    # can't happen inside the ordinary Nix build sandbox).
     tarball = builtins.fetchurl { inherit url sha256; };
 
     # PLACEHOLDER — see "PM ACTION REQUIRED" above. Deliberately wrong so
-    # CI's first run reports the real value in its error message.
+    # CI's first build reports the real value in its error message.
     unpackedSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    # The actual bootstrap primitive: an unpacked ubuntu-base rootfs tree,
-    # obtained with no external tools whatsoever (see "Bootstrap" above).
-    unpacked = builtins.fetchTarball { inherit url; sha256 = unpackedSha256; };
+    # The actual bootstrap primitive: an unpacked ubuntu-base rootfs tree.
+    # `__noChroot = true` lets this one derivation's builder see the host
+    # filesystem (needed to reach the host's own `/bin/sh` and `tar` — see
+    # "Bootstrap" above for why that's the deliberate, contained crossing
+    # point rather than a violation of it); `outputHash`/`outputHashMode`
+    # make it a fixed-output derivation regardless, so the result is
+    # verified byte-for-byte just like any other pinned fetch. CI must pass
+    # `--option sandbox relaxed` when building anything that depends on
+    # this (see .github/workflows/ci.yml) — Nix refuses `__noChroot`
+    # otherwise.
+    unpacked = builtins.derivation {
+      name = "ubuntu-base-${version}-${arch}-unpacked";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [
+        "-c"
+        ''
+          set -eu
+          export PATH=/usr/bin:/bin
+          mkdir -p "$out"
+          # --no-same-owner: we may be running as root (CI's `sudo nix
+          # build`); without it tar would try to restore the archive's
+          # recorded uid/gid (root's, since ubuntu-base ships as root-owned
+          # throughout) onto files it extracts as itself anyway, which is a
+          # harmless no-op as root but is disabled explicitly rather than
+          # relied upon, since the resulting tree's ownership bits are not
+          # meant to be a meaningful part of what's pinned (NIX_STORE
+          # content is; the recursive hash below covers exactly the bytes
+          # NAR-serializes, which for a store path is names/contents/
+          # executable-bit/symlink-targets, not uid/gid).
+          tar -xzf ${tarball} -C "$out" --no-same-owner
+        ''
+      ];
+      __noChroot = true;
+      outputHashMode = "recursive";
+      outputHashAlgo = "sha256";
+      outputHash = unpackedSha256;
+    };
   };
 
   # Verified against this tarball's own listing (`tar tzvf`, 2026-07-19):
@@ -124,7 +182,9 @@ let
   # no `/lib`, `/lib64`, or ld cache of its own, and ubuntu-base's binaries
   # being dynamically linked against absolute FHS paths that don't exist in
   # the sandbox: nothing here relies on the sandbox root at all — every
-  # path involved is an explicit absolute Nix store path.
+  # path involved is an explicit absolute Nix store path. Unlike `unpacked`
+  # above, this derivation runs fully sandboxed (no `__noChroot` needed):
+  # every path it touches is already a Nix store input.
   #
   # `PATH` is set into the unpacked tree so `script` can call ubuntu-base
   # binaries (dpkg, coreutils, ...) by bare name.

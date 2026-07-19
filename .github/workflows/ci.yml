@@ -23,3 +23,23 @@ jobs:
         run: |
           files=$(find . -name '*.sh' -not -path './.git/*')
           [ -z "$files" ] || shellcheck $files
+
+  flake:
+    name: Flake evaluation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix
+      - name: Lock and check the flake
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' flake lock
+          sudo nix --extra-experimental-features 'nix-command flakes' flake check --no-build
+          sudo chown "$USER" flake.lock
+      - name: Upload flake.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-lock
+          path: flake.lock

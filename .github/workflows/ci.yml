@@ -45,6 +45,30 @@ jobs:
           sudo nix --extra-experimental-features 'nix-command flakes' flake lock
           sudo nix --extra-experimental-features 'nix-command flakes' flake check --no-build
           sudo chown "$USER" flake.lock
+      # Ubuntu-native stdenv bootstrap proof (SPEC.md §4.1; issue #6, M1).
+      # `nix/stdenv.nix`'s `unpacked` is an ordinary derivation now (not an
+      # eval-time fetch), so `flake check --no-build` above does not force
+      # or build it — the expected first-run hash mismatch on a
+      # freshly-unfilled `unpackedSha256` placeholder surfaces HERE, when
+      # this step actually builds `.#stdenv-proof`, not in "Lock and check
+      # the flake". See nix/stdenv.nix's own "PM ACTION REQUIRED" comment
+      # for what to do with that error.
+      #
+      # `--option sandbox relaxed`: `unpacked`'s builder sets
+      # `__noChroot = true` (it needs the host's own `/bin/sh` + `tar` to
+      # unpack the ubuntu-base tarball — see nix/stdenv.nix's "Bootstrap"
+      # comment for why that's the deliberate, hash-pinned crossing point).
+      # Nix refuses `__noChroot` derivations under the default sandboxed
+      # build mode; relaxed sandboxing is required to build this one.
+      - name: Build stdenv-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#stdenv-proof -L
+          sudo chown "$USER" result
+      - name: Assert stdenv-proof output
+        run: |
+          grep -q 'MARKER=ubuntnix-stdenv-proof-v1' result
+          grep -qi 'dpkg' result
+          grep -qE 'version [0-9]+\.[0-9]+' result
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

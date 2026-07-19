@@ -44,7 +44,28 @@ check "nixpkgs.legacyPackages" 'nixpkgs\.legacyPackages'
 check "pkgs.<attr> access" '\bpkgs\.'
 check "buildInputs" 'buildInputs'
 check "mkDerivation" 'mkDerivation'
-check "fetchurl" 'fetchurl'
 check "fetchFromGitHub" 'fetchFromGitHub'
+
+# `fetchurl` gets a narrower, deliberate carve-out rather than the blanket
+# `check` above (SPEC.md §4.1 / issue #6): nix/stdenv.nix legitimately calls
+# `builtins.fetchurl` — a Nix LANGUAGE PRIMITIVE, always built into Nix
+# itself, not a nixpkgs fetcher — to pin Canonical's ubuntu-base tarball,
+# the project's one deliberate trust root besides Nix (SPEC.md §1.3/§4.1).
+# Only that exact spelling is allowed; any OTHER shape (bare `fetchurl`,
+# `pkgs.fetchurl`, an aliased/`with`-imported `fetchurl`, ...) still trips
+# this guard, since those shapes indicate a nixpkgs fetcher rather than the
+# builtin.
+check_fetchurl() {
+  local f matches
+  for f in "${files[@]}"; do
+    matches="$(grep -nE 'fetchurl' "$f" 2>/dev/null | grep -vE 'builtins\.fetchurl')"
+    if [ -n "$matches" ]; then
+      echo "FAIL: $f references forbidden pattern (fetchurl, non-builtins spelling) — a no-nixpkgs-binaries violation (SPEC.md §1.3)" >&2
+      echo "$matches" >&2
+      fails=$((fails + 1))
+    fi
+  done
+}
+check_fetchurl
 
 exit "$fails"

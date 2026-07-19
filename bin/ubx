@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ubx — the ubuntnix CLI (full name: ubuntnix; alias: ubx). See SPEC.md
+# §4.5 for the on-device tooling contract this stubs out.
+#
+# Pre-M1: every real subcommand below is a stub. Implementations land with
+# the milestones that give them something to act on (M2: switch/rollback/
+# diff; M3: snaps feed `update`; etc).
+set -u
+
+prog_name="ubuntnix (ubx)"
+
+usage() {
+  cat <<USAGE
+usage: ubx <command> [args]
+
+commands:
+  rebuild <switch|boot|test>  build and activate a new generation
+  rollback                    revert to the previous generation
+  list-generations            list available generations
+  diff                        show pending changes vs. the running system
+  update                      refresh lockfiles (flake/archive/snap pins)
+  help, --help                show this message
+
+$prog_name is pre-M1: every command above is a stub (SPEC.md §11).
+USAGE
+}
+
+not_implemented() {
+  echo "ubx: $1: not implemented (pre-M1)" >&2
+  exit 1
+}
+
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    "")
+      usage >&2
+      exit 2
+      ;;
+    rebuild)
+      local verb="${2:-}"
+      case "$verb" in
+        switch | boot | test)
+          not_implemented "rebuild $verb"
+          ;;
+        *)
+          usage >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    rollback | list-generations | diff | update)
+      not_implemented "$cmd"
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

@@ -21,7 +21,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: |
-          files=$(find . -name '*.sh' -not -path './.git/*')
+          # *.sh anywhere, plus extensionless scripts identified by a
+          # bash/sh shebang (e.g. bin/ubx) — see issue #15.
+          files=$(
+            {
+              find . -name '*.sh' -not -path './.git/*' -type f
+              grep -rlIE --exclude-dir=.git '^#!(/usr)?/bin/(env +)?(ba)?sh' . || true
+            } | sort -u
+          )
           [ -z "$files" ] || shellcheck $files
 
   flake:

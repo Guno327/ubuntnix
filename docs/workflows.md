@@ -140,6 +140,8 @@ Secrets are first-class, not bolted on (`SPEC.md` §8.1). The design:
 Secrets land at milestone **M4** (`SPEC.md` §11); until then, user
 authentication is interim (SSH keys, from M2).
 
+(updates-and-lockfiles)=
+
 ## Updates and lockfiles
 
 `ubx update` refreshes the pins that make the system reproducible

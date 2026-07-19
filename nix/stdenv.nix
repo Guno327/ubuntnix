@@ -104,7 +104,11 @@ let
 
     # PLACEHOLDER — see "PM ACTION REQUIRED" above. Deliberately wrong so
     # CI's first build reports the real value in its error message.
-    unpackedSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+    # Filled from the first CI run's fixed-output hash-mismatch error
+    # (run 29705333709, "Build stdenv-proof": got sha256-/M1f0hVn4Hbslk
+    # UVHEgKAYMHMkL8bCAg7+4Z+0ztefo=, converted SRI→hex). Permanent for
+    # this url/version/arch pin.
+    unpackedSha256 = "fccd5fd21567e076ec9645151c480a0183073242fc6c2020efee19fb4ced79fa";
 
     # The actual bootstrap primitive: an unpacked ubuntu-base rootfs tree.
     # `__noChroot = true` lets this one derivation's builder see the host

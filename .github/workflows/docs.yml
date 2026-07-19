@@ -1,0 +1,50 @@
+name: Docs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Sphinx + MyST (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-sphinx python3-myst-parser
+
+      - name: Generate options/modules reference
+        run: python3 docs/gen_reference.py
+
+      - name: Build Sphinx site
+        run: sphinx-build -W --keep-going -b html docs docs/_build/html
+
+      # No configure-pages step: it fails while Pages is not yet enabled
+      # (issue #11), and upload-pages-artifact does not require it.
+      # PM decision — see issue #4 integration notes.
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Pages not yet enabled by owner — see issue #11; flip to strict once enabled
+    continue-on-error: true
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

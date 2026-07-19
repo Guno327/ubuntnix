@@ -10,3 +10,7 @@ result-*
 # local scratch
 scratch/
 .direnv/
+
+# generated docs reference (produced by docs/gen_reference.py in CI; see
+# docs/conf.py and docs/reference/index.md)
+docs/reference/options.md

@@ -15,7 +15,7 @@ jobs:
       - name: Install Sphinx + MyST (Ubuntu archive)
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-sphinx python3-myst-parser
+          sudo apt-get install -y python3-sphinx python3-myst-parser python3-sphinx-rtd-theme
 
       - name: Generate options/modules reference
         run: python3 docs/gen_reference.py

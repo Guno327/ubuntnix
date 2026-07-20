@@ -547,8 +547,14 @@ let
         # zlib1g) are already inside ubuntu-base (see archive.lock.json's
         # comment on the squashfs-tools entry); only liblzo2-2 lives in
         # `tools` instead -- both directories are on one combined
-        # --library-path.
-        "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu" \
+        # --library-path. BOTH $tools lib dirs must be listed: a deb's
+        # data tar may address the merged-/usr layout from either side
+        # (liblzo2-2 ships './lib/x86_64-linux-gnu/liblzo2.so.2',
+        # counting on the usrmerge symlink a real root has -- toolsFHS's
+        # flat extraction has no such symlink, proven by CI run
+        # 29786592587: mksquashfs failed to load liblzo2.so.2 with only
+        # the usr/lib path on the search path).
+        "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu:$tools/lib/x86_64-linux-gnu" \
           "$tools/usr/bin/mksquashfs" "$rootfs" "$out/rootfs.squashfs" \
           -mkfs-time 0 -all-time 0 -no-progress -processors 1
       '';

@@ -374,8 +374,13 @@ for i, pkg in enumerate(resolved):
     if not isinstance(path, str) or not path.startswith("pool/") or not path.endswith(".deb"):
         errors.append(f"{label} has an invalid path (want pool/....deb): {path!r}")
 
-    if pkg["arch"] != "amd64":
-        errors.append(f"{label} has an unsupported arch (only amd64): {pkg['arch']!r}")
+    # "all" is a legitimate Debian archive architecture (arch-independent
+    # packages, e.g. tzdata) alongside this project's native amd64 target;
+    # a real closure routinely contains both.
+    if pkg["arch"] not in ("amd64", "all"):
+        errors.append(
+            f"{label} has an unsupported arch (only amd64/all): {pkg['arch']!r}"
+        )
 
     if pkg["component"] not in VALID_COMPONENTS:
         errors.append(
@@ -526,18 +531,31 @@ with open(uris_file, encoding="utf-8") as f:
         # filename (lossy: e.g. a Debian epoch like zlib1g's "1:..." is
         # dropped from the filename by convention) -- ask the downloaded
         # archive's own control file, via dpkg-deb, which is authoritative.
-        fields = subprocess.check_output(
+        # NOTE: when more than one field is requested, dpkg-deb prefixes
+        # each output line with its field name ("Package: htop"), and emits
+        # them in CONTROL-FILE order, not argument order -- so parse by
+        # field name, never by position or bare value.
+        raw_fields = subprocess.check_output(
             ["dpkg-deb", "--field", local, "Package", "Version", "Architecture"],
             text=True,
         ).splitlines()
-        if len(fields) != 3:
+        parsed = {}
+        for line in raw_fields:
+            key, sep, value = line.partition(":")
+            if sep:
+                parsed[key.strip()] = value.strip()
+        if set(parsed) != {"Package", "Version", "Architecture"} or not all(
+            parsed.values()
+        ):
             print(
                 f"error: dpkg-deb --field returned unexpected output for "
-                f"{local}: {fields!r}",
+                f"{local}: {raw_fields!r}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        name, version, arch = fields
+        name = parsed["Package"]
+        version = parsed["Version"]
+        arch = parsed["Architecture"]
 
         entries.append(
             {

@@ -161,7 +161,7 @@ jobs:
         run: |
           status="result-compose-proof/var/lib/dpkg/status"
           [ -f "$status" ] || { echo "no dpkg status database in composed rootfs"; exit 1; }
-          for pkg in htop hello; do
+          for pkg in htop hello libnl-3-200 libnl-genl-3-200; do
             grep -A5 "^Package: $pkg\$" "$status" | grep -q '^Status: install ok installed$' || {
               echo "package $pkg is not 'install ok installed' in the composed dpkg database" >&2
               exit 1

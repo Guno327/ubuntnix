@@ -559,7 +559,15 @@ in
       composeProof = composeRootfs {
         inherit system;
         name = "compose-proof";
-        packages = [ "htop" "hello" ];
+        # htop's libnl dependencies must be composed IN-SET: composeRootfs
+        # stages exactly the named debs (dependency closure is the
+        # lockfile's/#20's job, not composition's), and CI run 29786182993
+        # proved dpkg --configure correctly refuses a dependency-incomplete
+        # set (htop left unconfigured without libnl-3-200/-genl-3-200 --
+        # its only dependencies not already inside ubuntu-base). That
+        # refusal is composition working as intended: the fix is a
+        # complete declared set, not a weaker proof.
+        packages = [ "htop" "hello" "libnl-3-200" "libnl-genl-3-200" ];
       };
 
       # compose-preseed-proof (issue #9 task item 2): tzdata's postinst

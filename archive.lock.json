@@ -79,6 +79,26 @@
         "path": "pool/main/l/lzo2/liblzo2-2_2.10-2build4_amd64.deb",
         "sha256": "e0d13be155013138b8db4cfe68212b866080af661c78302c2eab0d2f9d0d454e",
         "size": 54148
+      },
+      {
+        "_comment": "htop's two runtime dependencies not already shipped inside ubuntu-base (proven by CI run 29786182993: dpkg --configure left htop unconfigured without them; every other htop dependency -- libc6, libncursesw6, libtinfo6 -- is part of ubuntu-base's own base package set). Added for issue #9 so compose-proof composes a dependency-complete set; sha256/size recomputed from the actually-downloaded snapshot bytes and cross-checked against the snapshot index, per bin/ubx-resolve doctrine. Superseded by issue #20's full resolver-generated regeneration of this file.",
+        "name": "libnl-3-200",
+        "version": "3.7.0-0.3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libn/libnl3/libnl-3-200_3.7.0-0.3build1_amd64.deb",
+        "sha256": "0afff6a14f55122757db02ff7e11ad58f128465fd796e2e33a0b0fe5b45a09ed",
+        "size": 55616
+      },
+      {
+        "_comment": "See libnl-3-200 above -- htop's second missing runtime dependency (Depends: libnl-3-200 (= 3.7.0-0.3build1), libc6; both satisfied in-set).",
+        "name": "libnl-genl-3-200",
+        "version": "3.7.0-0.3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libn/libnl3/libnl-genl-3-200_3.7.0-0.3build1_amd64.deb",
+        "sha256": "5d2967002e3cf1603985c537a6cf1385c131fefc88651bca0164efb4f3b8405b",
+        "size": 12126
       }
     ]
   },

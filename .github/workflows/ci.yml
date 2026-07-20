@@ -119,3 +119,122 @@ jobs:
         with:
           name: flake-lock
           path: flake.lock
+
+  compose:
+    name: Rootfs composition (SPEC.md §4.2/§11 M1; issue #9)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix
+      # nix/compose.nix's HARDENING step nests a user namespace
+      # (`unshare --user --map-root-user`) inside Nix's own build sandbox to
+      # get a real chroot for maintainer scripts (see that file's
+      # "HARDENING" comment). Ubuntu 24.04 restricts unprivileged user
+      # namespaces via an AppArmor knob by default (LP: this is the same
+      # restriction that broke Chromium/Electron sandboxes on 24.04
+      # runners); GitHub's ubuntu-24.04 runner image has been observed both
+      # with and without this loosened, so set it explicitly rather than
+      # hoping the image already has it — harmless (`|| true`) if the knob
+      # doesn't exist on whatever kernel actually runs this.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # compose-proof (issue #9 task item 1): ubuntu-base + htop + hello,
+      # unpacked and configured inside the hardened chroot, no preseed.
+      # `--option sandbox relaxed`: same reason as stdenv-proof/
+      # archive-fetch-proof above -- composeRootfs is built via
+      # runInUbuntuBase, which transitively depends on the one
+      # `__noChroot = true` derivation in this project (nix/stdenv.nix's
+      # `ubuntuBase.unpacked`).
+      - name: Build compose-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-proof -L -o result-compose-proof
+          sudo chown -R "$USER" result-compose-proof
+      # dpkg database consistency (issue #9 CI guidance): both declared
+      # packages must have run all the way through preinst -> unpack ->
+      # postinst and land in dpkg's normal steady state, never stuck
+      # half-installed/half-configured/unpacked -- that would mean a
+      # maintainer script failed or was skipped silently.
+      - name: Assert compose-proof dpkg database consistency
+        run: |
+          status="result-compose-proof/var/lib/dpkg/status"
+          [ -f "$status" ] || { echo "no dpkg status database in composed rootfs"; exit 1; }
+          for pkg in htop hello; do
+            grep -A5 "^Package: $pkg\$" "$status" | grep -q '^Status: install ok installed$' || {
+              echo "package $pkg is not 'install ok installed' in the composed dpkg database" >&2
+              exit 1
+            }
+          done
+          if grep -qE '^Status: install ok (half-installed|unpacked|half-configured|triggers-awaited|triggers-pending)$' "$status"; then
+            echo "composed dpkg database has a package stuck mid-configuration" >&2
+            grep -B5 -E '^Status: install ok (half-installed|unpacked|half-configured|triggers-awaited|triggers-pending)$' "$status" >&2
+            exit 1
+          fi
+      # compose-preseed-proof (issue #9 task item 2): tzdata preseeded to
+      # America/New_York (SPEC.md §6 ubuntnix.debconf primitive) -- proves
+      # the preseed answers actually reached tzdata's postinst, since
+      # America/New_York is not tzdata's own Etc/UTC fallback.
+      - name: Build compose-preseed-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-preseed-proof -L -o result-compose-preseed-proof
+          sudo chown -R "$USER" result-compose-preseed-proof
+      - name: Assert debconf preseed effect (tzdata -> America/New_York)
+        run: |
+          tz_file="result-compose-preseed-proof/etc/timezone"
+          [ -f "$tz_file" ] || { echo "no /etc/timezone in the preseeded composed rootfs"; exit 1; }
+          [ "$(cat "$tz_file")" = "America/New_York" ] || {
+            echo "expected /etc/timezone = America/New_York, got: $(cat "$tz_file")" >&2
+            exit 1
+          }
+          localtime_link="result-compose-preseed-proof/etc/localtime"
+          [ -L "$localtime_link" ] || { echo "/etc/localtime is not a symlink in the preseeded composed rootfs"; exit 1; }
+          case "$(readlink "$localtime_link")" in
+            */America/New_York) ;;
+            *) echo "expected /etc/localtime -> .../America/New_York, got: $(readlink "$localtime_link")" >&2; exit 1 ;;
+          esac
+      # compose-image-proof (issue #9 task item 3): the read-only squashfs
+      # image artifact built from compose-proof's already-composed tree.
+      - name: Build compose-image-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-image-proof -L -o result-compose-image-proof
+          sudo chown -R "$USER" result-compose-image-proof
+      - name: Assert compose-image-proof artifact
+        run: |
+          img="result-compose-image-proof/rootfs.squashfs"
+          [ -s "$img" ] || { echo "no (non-empty) rootfs.squashfs produced"; exit 1; }
+          # squashfs's on-disk magic ("hsqs", the superblock's 0x73717368
+          # magic number read little-endian) -- avoids depending on `file`
+          # being present on the runner.
+          magic="$(head -c4 "$img")"
+          [ "$magic" = "hsqs" ] || {
+            echo "rootfs.squashfs does not start with the squashfs magic (got: $magic)" >&2
+            exit 1
+          }
+      # Two-run determinism comparison (issue #9 task item 4; SPEC.md §12
+      # R1, a TRACKED RISK, not a guarantee): rebuild compose-proof and
+      # compare against the first build. `--rebuild` forces Nix to actually
+      # redo the build (ignoring the already-valid output from the step
+      # above) and fails loudly with a diff-bearing error if the two
+      # outputs differ. Per R1 and this issue's own guidance, byte-identical
+      # reproducibility is a goal this file works toward (mtime
+      # normalization, dpkg.log removal, single-threaded mksquashfs) but has
+      # NOT been independently verified byte-for-byte here before now --
+      # this step is what actually proves or disproves it. If it diverges,
+      # document the divergence and keep the job green rather than block M1
+      # on a risk SPEC.md already tracks as open; a future issue should
+      # follow up on any divergence this surfaces.
+      - name: Two-run determinism check (compose-proof --rebuild)
+        run: |
+          set +e
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-proof --rebuild -L >determinism.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "compose-proof rebuilt bit-for-bit identically across two independent builds (SPEC.md §12 R1: no divergence observed this run)."
+          else
+            echo "::warning::compose-proof did NOT reproduce bit-for-bit across two independent builds (SPEC.md §12 R1 tracked risk)."
+            echo "-- documenting the divergence per this issue's CI guidance rather than failing the job --"
+            cat determinism.log
+          fi

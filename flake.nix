@@ -22,6 +22,7 @@
         ./nix/ubx.nix
         ./nix/stdenv.nix
         ./nix/archive.nix
+        ./nix/compose.nix
       ];
     };
 }

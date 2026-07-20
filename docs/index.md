@@ -23,12 +23,13 @@ repository root for the full specification):
 ```{admonition} Project status
 :class: important
 
-This repository is **pre-M1**. There is no flake, no modules, and no
-working `ubx` tool yet — only the specification and project scaffolding
-(tests, CI, this documentation site). The guides below describe the
-*design* laid out in `SPEC.md` and are explicit about what is implemented
-today versus what is planned for a future milestone (M1 through M7). See
-`SPEC.md` §11 for the milestone plan.
+This repository is **early in milestone M1**. The flake skeleton, the
+Ubuntu-native stdenv bootstrap, and the archive lockfile with
+snapshot-pinned deb fetching exist; there are no modules and no working
+`ubx` tool yet. The guides below describe the *design* laid out in
+`SPEC.md` and are explicit about what is implemented today versus what is
+planned for a future milestone (M1 through M7). See `SPEC.md` §11 for the
+milestone plan.
 ```
 
 ## Guides
@@ -38,6 +39,8 @@ today versus what is planned for a future milestone (M1 through M7). See
   modules, and the dendritic flake-parts layout.
 - {doc}`workflows` — the planned day-to-day operational workflows: `ubx`
   verbs, generations and rollback, secrets, and updates.
+- {doc}`archive` — the archive lockfile: two-tier pinning of the deb
+  universe and snapshot-pinned fetching (implemented in M1).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -49,5 +52,6 @@ today versus what is planned for a future milestone (M1 through M7). See
 install
 modules
 workflows
+archive
 reference/index
 ```

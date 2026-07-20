@@ -69,6 +69,50 @@ jobs:
           grep -q 'MARKER=ubuntnix-stdenv-proof-v1' result
           grep -qi 'dpkg' result
           grep -qE 'version [0-9]+\.[0-9]+' result
+      # Archive lockfile + snapshot-pinned deb fetching proof (SPEC.md
+      # §4.4; issue #7, M1). Depends on every pinned public-tier deb
+      # (nix/archive.nix's `debs`), which Nix fetches and hash-verifies
+      # against archive.lock.json's pinned sha256s as part of this build.
+      #
+      # `--option sandbox relaxed`: this proof is built via
+      # nix/stdenv.nix's `runInUbuntuBase`, whose builder is ubuntu-base's
+      # own `ld-linux` binary — so `ubuntuBase.unpacked` (the one
+      # `__noChroot = true` derivation in this project) is a transitive
+      # build dependency here too, exactly as for `.#stdenv-proof` above;
+      # see nix/archive.nix's own "SANDBOXING NOTE" for the full reasoning.
+      - name: Build archive-fetch-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#archive-fetch-proof -L
+          sudo chown "$USER" result
+      - name: Assert archive-fetch-proof output
+        run: |
+          grep -q 'MARKER=ubuntnix-archive-fetch-proof-v1' result
+          grep -q 'snapshot=20260715T000000Z' result
+          for pkg in ed hello htop jq zlib1g; do
+            grep -q "deb name=$pkg " result
+          done
+          # dpkg-deb --info actually ran against a fetched .deb inside the
+          # ubuntu-native stdenv (not just a byte-for-byte fetch) and
+          # produced real control-file output.
+          grep -q 'Package:' result
+      # Negative case (issue #7 task item 3): archive-hash-mismatch-proof
+      # fetches a real pinned deb's URL but with a deliberately WRONG
+      # sha256 (nix/archive.nix's own "DELIBERATELY BROKEN" derivation).
+      # This build MUST FAIL — that failure, with Nix's own "hash
+      # mismatch" message, is the actual assertion; a successful build
+      # here would mean hash verification silently stopped working.
+      - name: Build archive-hash-mismatch-proof (expected to fail)
+        run: |
+          if sudo nix --extra-experimental-features 'nix-command flakes' build .#archive-hash-mismatch-proof -L >mismatch.log 2>&1; then
+            echo "archive-hash-mismatch-proof built successfully — it must fail (hash verification is broken)" >&2
+            cat mismatch.log
+            exit 1
+          fi
+          grep -qi 'hash mismatch' mismatch.log || {
+            echo "archive-hash-mismatch-proof failed, but not with a hash mismatch — unexpected failure mode" >&2
+            cat mismatch.log
+            exit 1
+          }
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

@@ -91,9 +91,10 @@ jobs:
           for pkg in ed hello htop jq zlib1g; do
             grep -q "deb name=$pkg " result
           done
-          # dpkg-deb --info actually ran against a fetched .deb inside the
-          # ubuntu-native stdenv (not just a byte-for-byte fetch) and
-          # produced real control-file output.
+          # dpkg-deb + tar actually parsed a fetched .deb inside the
+          # ubuntu-native stdenv (dpkg-deb --ctrl-tarfile piped into tar
+          # via the loader pattern — see nix/archive.nix for why not
+          # --info) and produced real control-file output.
           grep -q 'Package:' result
       # Negative case (issue #7 task item 3): archive-hash-mismatch-proof
       # fetches a real pinned deb's URL but with a deliberately WRONG

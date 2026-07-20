@@ -228,9 +228,9 @@ in
     # one line per deb with its name/version/filename plus a sha256sum
     # RECOMPUTED INSIDE THE SANDBOX (not just Nix's own fixed-output
     # verification — an independent proof the bytes are what they claim to
-    # be), and a `dpkg-deb --info` dump of the first fetched deb (proving
-    # the ubuntu-native stdenv can actually parse a real fetched archive,
-    # not just move bytes around). Deterministic by construction — every
+    # be), and the first fetched deb's extracted control file (proving the
+    # ubuntu-native stdenv can actually parse a real fetched archive, not
+    # just move bytes around). Deterministic by construction — every
     # input (the fetched store paths, the lockfile data) is itself
     # deterministic, so there is nothing timestamp- or host-dependent to
     # leak into $out.
@@ -310,10 +310,25 @@ in
               } >> "$out"'')
           indices);
 
-        # `dpkg-deb --info` on just the FIRST fetched deb is enough to prove
-        # the ubuntu-native stdenv can parse a real fetched archive (issue
-        # #7 task item 3); running it on every deb would be pure repetition
-        # of the same proof.
+        # Parsing just the FIRST fetched deb is enough to prove the
+        # ubuntu-native stdenv can handle a real fetched archive (issue #7
+        # task item 3); doing it for every deb would be pure repetition of
+        # the same proof.
+        #
+        # Why `--ctrl-tarfile | tar -xOf - ./control` and not the obvious
+        # `dpkg-deb --info`: `--info` makes dpkg-deb SPAWN `tar` itself
+        # (execvp by bare name), and per nix/stdenv.nix's BOOTSTRAP CAVEAT
+        # a dynamically-linked ubuntu-base binary exec'd by bare name dies
+        # in the sandbox on its missing ELF interpreter — dpkg-deb's child
+        # exec is out of our reach, so no loader pattern can save it (CI
+        # run 29742475984: "unable to execute tar"). `--ctrl-tarfile`
+        # instead decompresses the control tarball INTERNALLY (libdpkg, no
+        # child processes) and streams it to stdout; we then run `tar`
+        # ourselves — through the loader, as the caveat requires — to
+        # extract ./control. Net effect is stronger, not weaker: both
+        # dpkg-deb (real .deb ar/zstd parsing) and tar (real tarball
+        # extraction) demonstrably work on a fetched archive, and the
+        # extracted control file provides the `Package:` line CI asserts.
         firstVarRef = "$" + envName 0;
         firstEntry = entryAt 0;
       in
@@ -328,9 +343,11 @@ in
           } > "$out"
           ${proofLines}
           {
-            echo "== dpkg-deb --info ${firstEntry.name} =="
+            echo "== control (${firstEntry.name}) =="
             "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
-              "$UBX_BASE/usr/bin/dpkg-deb" --info "${firstVarRef}"
+              "$UBX_BASE/usr/bin/dpkg-deb" --ctrl-tarfile "${firstVarRef}" \
+              | "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
+                "$UBX_BASE/usr/bin/tar" -xOf - ./control
           } >> "$out"
         '';
       };

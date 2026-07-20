@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+# bin/ubx-resolve — apt-solver-based archive resolution: declared packages
+# (archive.packages.json) -> pinned archive.lock.json (SPEC.md §4.4, §4.5;
+# GitHub issue #8, milestone M1: "the `ubx update` archive-pins portion").
+#
+# -- Why this lives outside Nix, as a script under bin/ ---------------------
+#
+# Resolution is inherently IMPURE: it asks "what does the declared package
+# set resolve to *right now*, against the archive as it stands at some
+# snapshot", and the whole point of `ubx update` is to let that answer
+# change over time as new snapshots appear. That's the opposite of what a
+# Nix derivation is for (a fixed, hash-verified function of pinned inputs) —
+# nix/archive.nix's job is to CONSUME the lockfile this script PRODUCES
+# (fetch + hash-verify each pinned entry; see that file's header), never to
+# perform the resolution itself. This script is the producer, run by a
+# human/CI *before* committing a new archive.lock.json, exactly like
+# `cargo update`/`npm install --package-lock-only`/`nix flake lock` are run
+# outside their respective build systems for the same reason.
+#
+# `ubx update` (SPEC.md §4.5) will eventually shell out to this script for
+# its archive-pins portion, alongside separate work for flake-input pins and
+# (M3) snap pins — but `bin/ubx update` itself stays the pre-M1 stub for
+# now (tests/unit/020-ubx-cli.sh pins that contract) rather than being
+# partially wired to only one of its three eventual pin sources; a later
+# issue is expected to wire all three together. Until then, this script is
+# invoked directly (by a human, or by a CI job — see the "resolve" job in
+# .github/workflows/ci.yml).
+#
+# -- The declared package set: archive.packages.json ------------------------
+#
+# A committed, plain-JSON file at the repo root (../archive.packages.json
+# from here) — same "readable with no `nix` binary" reasoning
+# nix/archive.nix's header gives for archive.lock.json itself. Its shape:
+#   {
+#     "series": "noble",
+#     "components": ["main", "universe"],   # subset of the four below
+#     "packages": ["ed", "hello", "htop", ...]   # flat deb-name list
+#   }
+# `packages` is intentionally the exact shape SPEC.md §6's
+# `ubuntnix.debs = [ "htop" "postgresql-16" ];` primitive takes: a flat list
+# of declared deb names. That primitive doesn't exist as a real module
+# option yet (M2+ — the module system has nothing to compose into pre-M2),
+# so this file is the interim, obvious, committed stand-in; migrating later
+# just means a module reads/generates this same shape instead of a human
+# editing it by hand, not a format change. `components` is the enabled
+# subset of noble's archive components for THIS declared set: all four
+# (main/universe/restricted/multiverse) are SUPPORTED by this script (SPEC.md
+# §4.4's M1 line item: "all four components supported"), but SPEC.md §5
+# defaults a machine to main+universe, with restricted/multiverse a
+# per-machine opt-in (real system config, M6 scope) this file doesn't yet
+# express a toggle for.
+#
+# -- The isolated apt rootdir -----------------------------------------------
+#
+# Every supported host for this project (the CI ubuntu-24.04 runner; a
+# future on-device Ubuntu machine, SPEC.md §4.5) ships Canonical's own apt —
+# so shelling out to the HOST's real `apt-get`, pointed at a scratch rootdir
+# via `-o Dir=...`, is a legitimate reuse of Canonical's own solver (SPEC.md
+# §2 G2's "maximum reuse of upstream Canonical engineering"), not a
+# violation of the no-nixpkgs-binaries rule (SPEC.md §1.3) — that rule is
+# about the Nix *build graph* never depending on nixpkgs-sourced binaries;
+# this script runs entirely outside any Nix build.
+#
+# Most of apt's `Dir::*` keys nest under `Dir` by default (`Dir::State`
+# defaults to "var/lib/apt/", `Dir::Cache` to "var/cache/apt/", ...), so a
+# single `-o Dir=<scratch dir>` relocates most of apt's state/cache/config
+# universe into the scratch dir. `Dir::State::status` is the one
+# well-documented EXCEPTION (apt.conf(5); the same gotcha every apt-in-a-
+# chroot/sandbox tool — pbuilder, sbuild, mmdebstrap — works around):
+# despite living under the `Dir::State::*` tree, its compiled-in default is
+# the ABSOLUTE path "/var/lib/dpkg/status", not a path relative to
+# `Dir::State`. Left unoverridden, apt would silently read the HOST's real
+# dpkg status db instead of this script's own scratch one — on a CI runner
+# that means whatever happens to be pre-installed on that runner image
+# (unpinned, and liable to change under us as GitHub updates runner
+# images), not the clean slate this script's resolution model depends on.
+# `apt_opts` below therefore sets `Dir::State::status` explicitly, pointed
+# at the scratch dir's own status file, alongside `Dir=<scratch dir>` for
+# everything else. Nothing this script does touches `/etc/apt`,
+# `/var/lib/apt`, `/var/lib/dpkg`, or `/var/cache/apt` on the host, and none
+# of it needs root. An empty `var/lib/dpkg/status` file means apt resolves
+# against a clean slate (no packages considered "already installed"), so the
+# solved closure is the
+# TRUE full dependency closure of the declared set — including base
+# libraries (libc6 and friends) a normal running system would already have.
+# That's deliberately more than the issue #7 hand-built archive.lock.json
+# fixture enumerates (SPEC.md §4.4's M1 line item literally asks for "the
+# full dependency closure from the declared set" via the real solver, not a
+# hand-picked subset) — see archive.packages.json's header for why re-
+# resolving its seed set is expected to grow the package count, not
+# reproduce the old fixture's exact 5 entries.
+#
+# Trust: the `deb [signed-by=<path>] ...` sources.list line points at the
+# HOST's own `ubuntu-archive-keyring.gpg` (installed by the `ubuntu-keyring`
+# package, present on every Ubuntu image including the CI runner) rather
+# than `[trusted=yes]` — real signature verification against Canonical's
+# real archive key, not a blind-trust shortcut.
+#
+# -- Never trust index metadata blindly --------------------------------------
+#
+# `apt-get install --print-uris` runs the REAL solver and reports, per
+# package, the URI it would fetch plus an index-reported size/checksum —
+# but per this issue's guidance, that reported checksum is index metadata,
+# not a verified fact. This script uses `--print-uris` ONLY to learn *which*
+# URIs/filenames the solver picked (the closure), then performs a SEPARATE
+# `apt-get install --download-only` pass to actually fetch the bytes, and
+# computes every emitted `sha256`/`size` from the LOCAL, ACTUALLY-DOWNLOADED
+# file — sha256sum and `stat`, not the index's claims. `dpkg-deb --field`
+# similarly re-derives `name`/`version`/`arch` from the downloaded archive's
+# own control file rather than trusting the solver's filename-derived
+# guess (a `.deb` filename can't even losslessly encode an epoch, e.g.
+# zlib1g's "1:1.3.dfsg-3.1ubuntu2" — dpkg-deb's control file always has the
+# authoritative Version).
+#
+# -- Emission: schema, sort order, and byte-stable formatting ---------------
+#
+# The lockfile-writing step (`emit_lockfile`, below) is factored out as a
+# PURE function of already-resolved package tuples: no network, no apt,
+# just validate + sort-by-name + JSON-serialize with a fixed
+# (indent=2, ensure_ascii=False, trailing newline) format matching the
+# committed archive.lock.json byte-for-byte. It's reachable two ways:
+#   - the real path (this script's default mode): declaration -> apt solve
+#     -> download -> hash -> emit;
+#   - `--emit-lockfile FILE` (a testing hook): skip declaration parsing and
+#     apt entirely, feed a fixture JSON array of already-resolved tuples
+#     straight into the same emission logic. This is what makes "lockfile
+#     emission schema + stable ordering/formatting" and "idempotence"
+#     testable under tests/unit/ with NO network access (SPEC.md's own
+#     "Unit tests must not require root, network, or KVM" rule,
+#     tests/README.md) — the network-dependent parts (declaration ->
+#     resolved tuples) are exercised separately, end-to-end, by CI's
+#     "resolve" job only.
+#
+# Schema emitted (identical to nix/archive.nix's header comment and
+# tests/lib/validate-archive-lockfile.py, the one shared schema
+# definition):
+#   { "version": 1,
+#     "public": { "snapshot": ..., "series": "noble",
+#                 "packages": [ { name, version, arch, component, path,
+#                                 sha256, size }, ... sorted by name ] },
+#     "esm": { "packages": [] } }
+set -euo pipefail
+
+prog_name="ubx-resolve"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<USAGE
+usage: ubx-resolve [options]
+       ubx-resolve --check-declaration [--declaration FILE]
+       ubx-resolve --emit-lockfile FILE --snapshot TIMESTAMP [options]
+
+Resolves the declared package set (default: archive.packages.json) against
+the real apt solver, run against an isolated apt rootdir pointed at a
+snapshot.ubuntu.com timestamp, and writes the resolved (name, version, arch,
+component, path, sha256, size) tuples to an archive lockfile (default:
+archive.lock.json) in the exact schema nix/archive.nix validates.
+
+Every emitted sha256/size is recomputed locally from the actually-downloaded
+.deb bytes — apt's own index-reported checksum is never trusted blindly.
+
+options:
+  --declaration FILE    declaration file to resolve
+                         (default: archive.packages.json)
+  --out FILE             lockfile to write (default: archive.lock.json)
+  --snapshot TIMESTAMP   snapshot.ubuntu.com timestamp, YYYYMMDDThhmmssZ
+                         (default: now, snapped to the current UTC hour --
+                         impure by design, since resolution is meant to
+                         refresh pins; pass an explicit value for a
+                         reproducible run, e.g. from CI)
+  --keyring FILE         archive keyring used to verify the snapshot's
+                         signed Release file (default:
+                         /usr/share/keyrings/ubuntu-archive-keyring.gpg,
+                         the ubuntu-keyring package's own file, present on
+                         every supported host)
+  --work-dir DIR         isolated apt rootdir to use (default: a fresh
+                         directory under mktemp -d, removed on exit)
+  --check-declaration    validate the declaration file and exit 0/1.
+                         No network, no apt.
+  --series SERIES        (only with --emit-lockfile) series to record;
+                         default: noble
+  --emit-lockfile FILE   testing/composition hook: skip declaration parsing
+                         and apt entirely. FILE is a JSON array of
+                         already-resolved package tuples (objects with
+                         name/version/arch/component/path/sha256/size);
+                         emits them through the exact same
+                         validate/sort/format logic real resolution uses.
+                         Requires --snapshot.
+  -h, --help             show this message
+
+Real resolution requires network access to snapshot.ubuntu.com and the
+host's own apt-get/dpkg-deb (present on every supported host — CI's
+ubuntu-24.04 runner, an on-device Ubuntu machine). --check-declaration and
+--emit-lockfile require neither.
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+# -- declaration parsing/validation (no network, no apt) ---------------------
+#
+# On success, prints three lines to stdout (series / space-joined
+# components / space-joined package names) for the caller to `read`. On
+# failure, prints every violation found to stderr (mirrors nix/archive.nix's
+# `validate`: one throw enumerating every problem, not just the first) and
+# returns nonzero.
+validate_declaration() {
+  local file="$1"
+  [ -f "$file" ] || die "declaration file does not exist: $file"
+  python3 - "$file" <<'PYEOF'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+errors = []
+
+
+def fail(msg):
+    errors.append(msg)
+
+
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except OSError as e:
+    print(f"FAIL: could not read {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"FAIL: {path} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    print(f"FAIL: {path} top level is not a JSON object", file=sys.stderr)
+    sys.exit(1)
+
+series = data.get("series")
+if series != "noble":
+    fail(f"'series' must be 'noble', got {series!r}")
+
+VALID_COMPONENTS = {"main", "universe", "restricted", "multiverse"}
+components = data.get("components")
+if not isinstance(components, list) or not components:
+    fail("'components' must be a non-empty list")
+    components = []
+else:
+    bad = [c for c in components if c not in VALID_COMPONENTS]
+    if bad:
+        fail(
+            f"'components' contains unsupported value(s): {bad!r} "
+            f"(valid: {sorted(VALID_COMPONENTS)})"
+        )
+    if len(set(components)) != len(components):
+        fail("'components' contains duplicate entries")
+
+# Debian package names: lowercase alphanumerics plus +-. , must start with
+# an alphanumeric (policy §5.6.7). Validated here so a typo'd declared name
+# fails fast, before ever shelling out to apt.
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+packages = data.get("packages")
+if not isinstance(packages, list) or not packages:
+    fail("'packages' must be a non-empty list")
+    packages = []
+else:
+    seen = set()
+    for i, name in enumerate(packages):
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            fail(f"packages[{i}] is not a valid Debian package name: {name!r}")
+            continue
+        if name in seen:
+            fail(f"duplicate package name in 'packages': {name!r}")
+        seen.add(name)
+
+if errors:
+    print(f"FAIL: {path} failed schema validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+print(series)
+print(" ".join(components))
+print(" ".join(packages))
+PYEOF
+}
+
+# -- lockfile emission (no network, no apt) ---------------------------------
+#
+# emit_lockfile RESOLVED_JSON SNAPSHOT SERIES OUT_FILE
+#
+# RESOLVED_JSON is a JSON array of {name, version, arch, component, path,
+# sha256, size} objects (order and extra fields don't matter — this
+# validates, sorts by name, and re-serializes only the required fields, in
+# the schema's field order, so the output is a pure, deterministic function
+# of the (already-resolved) input data plus snapshot/series). Writes
+# atomically (write to OUT_FILE.tmp, then rename) so a validation failure
+# never leaves a partial/corrupt file at OUT_FILE.
+emit_lockfile() {
+  local resolved_file="$1" snapshot="$2" series="$3" out_file="$4"
+  python3 - "$resolved_file" "$snapshot" "$series" "$out_file" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+resolved_file, snapshot, series, out_file = sys.argv[1:5]
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SNAPSHOT_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+VALID_COMPONENTS = {"main", "universe", "restricted", "multiverse"}
+REQUIRED = ("name", "version", "arch", "component", "path", "sha256", "size")
+
+if not SNAPSHOT_RE.match(snapshot):
+    print(
+        f"error: snapshot {snapshot!r} does not match ^[0-9]{{8}}T[0-9]{{6}}Z$ "
+        "(e.g. 20260715T000000Z)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if series != "noble":
+    print(f"error: series must be 'noble', got {series!r}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    with open(resolved_file, encoding="utf-8") as f:
+        resolved = json.load(f)
+except OSError as e:
+    print(f"error: could not read {resolved_file}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"error: {resolved_file} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(resolved, list) or not resolved:
+    print(
+        f"error: {resolved_file} must contain a non-empty JSON array of "
+        "resolved package tuples",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+errors = []
+seen = set()
+for i, pkg in enumerate(resolved):
+    label = f"resolved[{i}]"
+    if not isinstance(pkg, dict):
+        errors.append(f"{label} is not an object")
+        continue
+
+    missing = [f for f in REQUIRED if f not in pkg]
+    if missing:
+        errors.append(f"{label} missing required field(s): {', '.join(missing)}")
+        continue
+
+    name = pkg["name"]
+    label = f"{label} ({name!r})"
+    if not isinstance(name, str) or not name:
+        errors.append(f"{label} 'name' must be a non-empty string")
+    elif name in seen:
+        errors.append(f"duplicate package name: {name!r}")
+    seen.add(name)
+
+    sha256 = pkg["sha256"]
+    if not isinstance(sha256, str) or not SHA256_RE.match(sha256):
+        errors.append(f"{label} has a malformed sha256 (want 64 lowercase hex chars): {sha256!r}")
+
+    size = pkg["size"]
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        errors.append(f"{label} has an invalid size (want a positive integer): {size!r}")
+
+    path = pkg["path"]
+    if not isinstance(path, str) or not path.startswith("pool/") or not path.endswith(".deb"):
+        errors.append(f"{label} has an invalid path (want pool/....deb): {path!r}")
+
+    if pkg["arch"] != "amd64":
+        errors.append(f"{label} has an unsupported arch (only amd64): {pkg['arch']!r}")
+
+    if pkg["component"] not in VALID_COMPONENTS:
+        errors.append(
+            f"{label} has an unsupported component: {pkg['component']!r} "
+            f"(valid: {sorted(VALID_COMPONENTS)})"
+        )
+
+    version = pkg["version"]
+    if not isinstance(version, str) or not version:
+        errors.append(f"{label} 'version' must be a non-empty string")
+
+if errors:
+    print("error: resolved package data failed validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+# Stable ordering (sort by name) and stable field order (REQUIRED's literal
+# order) so re-running with unchanged inputs emits a byte-identical file.
+packages = sorted(
+    ({k: pkg[k] for k in REQUIRED} for pkg in resolved),
+    key=lambda p: p["name"],
+)
+
+lockfile = {
+    "_comment": (
+        "ubuntnix archive lockfile (SPEC.md §4.4; GitHub issue #8, "
+        "milestone M1). Generated by bin/ubx-resolve: apt-solver-based "
+        "resolution of the declared package set in archive.packages.json, "
+        "run against the real apt solver against an isolated rootdir "
+        "pointed at this snapshot.ubuntu.com timestamp -- see "
+        "bin/ubx-resolve's header for the full mechanism. Two-tier per the "
+        "reproducibility model: `public` pins the snapshot timestamp plus "
+        "resolved (name, version, arch, component, path, sha256, size) "
+        "tuples for the archive.ubuntu.com/security.ubuntu.com pockets the "
+        "snapshot service covers; `esm` uses the identical per-package "
+        "schema but is intentionally an empty list until milestone M4 "
+        "wires up esm.ubuntu.com fetching against a Pro token (no snapshot "
+        "service exists for esm -- SPEC.md §4.4, §8.2, R4). "
+        "Consumed by nix/archive.nix via builtins.fromJSON; see that file "
+        "for fetch mechanics and tests/lib/validate-archive-lockfile.py "
+        "for the schema this file is held to. Every sha256 below was "
+        "recomputed by bin/ubx-resolve from the actually-downloaded .deb "
+        "bytes -- apt's own index-reported checksum is never trusted "
+        "blindly. Packages are sorted by name for a stable diff and a "
+        "byte-identical re-resolution given unchanged inputs."
+    ),
+    "version": 1,
+    "public": {
+        "snapshot": snapshot,
+        "series": series,
+        "packages": packages,
+    },
+    "esm": {
+        "_comment": (
+            "Empty until M4 (SPEC.md §4.4, R4): esm.ubuntu.com has no "
+            "snapshot service, so this tier is pinned directly by (name, "
+            "version, arch, component, path, sha256, size) once M4 wires "
+            "up fetching against a Pro token. esm content is "
+            "subscription-gated and never redistributed publicly."
+        ),
+        "packages": [],
+    },
+}
+
+text = json.dumps(lockfile, indent=2, ensure_ascii=False) + "\n"
+
+tmp_out = out_file + ".tmp"
+with open(tmp_out, "w", encoding="utf-8") as f:
+    f.write(text)
+os.replace(tmp_out, out_file)
+
+print(f"wrote {len(packages)} public package(s) to {out_file} (snapshot {snapshot})")
+PYEOF
+}
+
+# -- real resolution: declaration -> apt solve -> download -> hash ----------
+#
+# build_resolved URIS_FILE CACHE_DIR SNAPSHOT_URL
+#
+# Parses `apt-get install --print-uris` output (URIS_FILE) for the
+# (url, filename) of every package the solver picked, cross-references each
+# against the file apt actually downloaded into CACHE_DIR (a SEPARATE
+# `apt-get install --download-only` pass populates this — see this script's
+# header for why print-uris and download are kept as two distinct steps),
+# and emits a JSON array of resolved tuples to stdout: name/version/arch
+# recomputed via `dpkg-deb --field` against the downloaded archive's own
+# control file, sha256/size recomputed from the downloaded bytes directly.
+build_resolved() {
+  local uris_file="$1" cache_dir="$2" snapshot_url="$3"
+  python3 - "$uris_file" "$cache_dir" "$snapshot_url" <<'PYEOF'
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+uris_file, cache_dir, snapshot_url = sys.argv[1:4]
+
+# apt-get --print-uris lines look like:
+#   'https://.../pool/main/h/htop/htop_3.3.0-4build1_amd64.deb' htop_3.3.0-4build1_amd64.deb 170528 SHA256:...
+# Only lines matching this exact shape are considered; everything else
+# (apt's "Reading package lists..." etc. boilerplate, even under -qq) is
+# ignored rather than assumed absent.
+URI_RE = re.compile(r"^'(?P<url>[^']+)'\s+(?P<filename>\S+)\s+\d+\s+\S+\s*$")
+
+prefix = snapshot_url.rstrip("/") + "/"
+entries = []
+seen_filenames = set()
+
+with open(uris_file, encoding="utf-8") as f:
+    for line in f:
+        m = URI_RE.match(line.rstrip("\n"))
+        if not m:
+            continue
+        url = m.group("url")
+        filename = m.group("filename")
+        if filename in seen_filenames:
+            continue
+        seen_filenames.add(filename)
+
+        if not url.startswith(prefix):
+            print(f"error: URI is not under the pinned snapshot URL: {url}", file=sys.stderr)
+            sys.exit(1)
+        path = url[len(prefix):]
+        if not path.startswith("pool/") or not path.endswith(".deb"):
+            print(f"error: unexpected pool path shape: {path}", file=sys.stderr)
+            sys.exit(1)
+        component = path.split("/")[1]
+
+        local = os.path.join(cache_dir, filename)
+        if not os.path.isfile(local):
+            print(
+                f"error: apt-get install --download-only did not fetch the "
+                f"expected archive: {local}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Never trust the index-reported size/sha256 from --print-uris:
+        # recompute both from the actually-downloaded bytes.
+        with open(local, "rb") as bf:
+            digest = hashlib.sha256(bf.read()).hexdigest()
+        size = os.path.getsize(local)
+
+        # Likewise, don't reverse-engineer name/version/arch from the
+        # filename (lossy: e.g. a Debian epoch like zlib1g's "1:..." is
+        # dropped from the filename by convention) -- ask the downloaded
+        # archive's own control file, via dpkg-deb, which is authoritative.
+        fields = subprocess.check_output(
+            ["dpkg-deb", "--field", local, "Package", "Version", "Architecture"],
+            text=True,
+        ).splitlines()
+        if len(fields) != 3:
+            print(
+                f"error: dpkg-deb --field returned unexpected output for "
+                f"{local}: {fields!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        name, version, arch = fields
+
+        entries.append(
+            {
+                "name": name,
+                "version": version,
+                "arch": arch,
+                "component": component,
+                "path": path,
+                "sha256": digest,
+                "size": size,
+            }
+        )
+
+if not entries:
+    print("error: apt resolved zero packages -- nothing to pin", file=sys.stderr)
+    sys.exit(1)
+
+json.dump(entries, sys.stdout)
+PYEOF
+}
+
+resolve() {
+  local declaration_file="$1" out_file="$2" snapshot="$3" keyring="$4" work_dir_arg="$5"
+
+  command -v apt-get > /dev/null 2>&1 || die "apt-get not found on PATH -- real resolution needs the host's own apt (see this script's header)"
+  command -v dpkg-deb > /dev/null 2>&1 || die "dpkg-deb not found on PATH"
+  [ -f "$keyring" ] || die "archive keyring not found: $keyring (pass --keyring to point at a different one)"
+
+  local decl_tmp resolved_tmp
+  decl_tmp="$(mktemp)"
+  resolved_tmp="$(mktemp)"
+  local work="$work_dir_arg" cleanup_work=0
+  if [ -z "$work" ]; then
+    work="$(mktemp -d)"
+    cleanup_work=1
+  fi
+  # shellcheck disable=SC2064  # intentional: expand the paths/flag now, not at trap time
+  trap "rm -f '$decl_tmp' '$resolved_tmp'; [ '$cleanup_work' = 1 ] && rm -rf '$work'; true" EXIT
+
+  validate_declaration "$declaration_file" > "$decl_tmp" || exit 1
+  local series components_line packages_line
+  { IFS= read -r series; IFS= read -r components_line; IFS= read -r packages_line; } < "$decl_tmp"
+  # Intentional word-splitting: components/packages were space-joined by
+  # validate_declaration specifically so they split back into arrays here.
+  # shellcheck disable=SC2206
+  local components=($components_line)
+  # shellcheck disable=SC2206
+  local packages=($packages_line)
+
+  # -- isolated apt rootdir: see this script's header ("The isolated apt
+  # rootdir") for why `-o Dir=$work` relocates most of apt's state/cache
+  # into the scratch dir, why `Dir::State::status` needs its OWN explicit
+  # override below (its compiled-in default is the absolute path
+  # "/var/lib/dpkg/status", not relative to Dir::State), and why none of
+  # this needs root privileges.
+  mkdir -p \
+    "$work/etc/apt/sources.list.d" \
+    "$work/etc/apt/preferences.d" \
+    "$work/var/lib/apt/lists/partial" \
+    "$work/var/cache/apt/archives/partial" \
+    "$work/var/lib/dpkg"
+  : > "$work/var/lib/dpkg/status"
+
+  mkdir -p "$work/var/log/apt"
+
+  local snapshot_url="https://snapshot.ubuntu.com/ubuntu/${snapshot}"
+  printf 'deb [signed-by=%s] %s %s %s\n' \
+    "$keyring" "$snapshot_url" "$series" "${components[*]}" \
+    > "$work/etc/apt/sources.list"
+
+  local apt_opts=(
+    -o "Dir=$work"
+    # Dir::State::status is NOT relative to Dir::State despite living under
+    # it (apt.conf(5)'s well-documented exception — see this script's
+    # header) — without this explicit override apt would silently consult
+    # the HOST's real dpkg status db instead of this script's scratch one.
+    -o "Dir::State::status=$work/var/lib/dpkg/status"
+    # Belt-and-suspenders: Dir::Log genuinely is relative-by-default, so
+    # this is redundant with `Dir=$work` above, but pinning it explicitly
+    # costs nothing and removes any doubt.
+    -o "Dir::Log=$work/var/log/apt"
+    -o "APT::Architecture=amd64"
+    -o "APT::Architectures::=amd64"
+    -o "Acquire::Languages=none"
+    # Isolated network hiccups on the CI runner shouldn't fail the whole
+    # resolution outright.
+    -o "Acquire::Retries=3"
+    # Never fall back to an unauthenticated fetch: a Release file that
+    # fails signature verification against $keyring must hard-fail, not
+    # silently downgrade to trusting unsigned index data.
+    -o "Acquire::AllowInsecureRepositories=false"
+  )
+
+  echo "$prog_name: updating package indices from $snapshot_url ($series: ${components[*]})..." >&2
+  apt-get "${apt_opts[@]}" update -qq
+
+  echo "$prog_name: solving dependency closure for: ${packages[*]}..." >&2
+  local uris_file="$work/print-uris.txt"
+  apt-get "${apt_opts[@]}" install --print-uris -qq -y "${packages[@]}" > "$uris_file"
+
+  echo "$prog_name: downloading resolved archives..." >&2
+  apt-get "${apt_opts[@]}" install --download-only -qq -y "${packages[@]}"
+
+  build_resolved "$uris_file" "$work/var/cache/apt/archives" "$snapshot_url" > "$resolved_tmp"
+
+  emit_lockfile "$resolved_tmp" "$snapshot" "$series" "$out_file"
+}
+
+main() {
+  local declaration_file="$script_dir/../archive.packages.json"
+  local out_file="$script_dir/../archive.lock.json"
+  local snapshot=""
+  local series="noble"
+  local keyring="/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+  local work_dir=""
+  local check_only=0
+  local emit_from=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --declaration)
+        [ $# -ge 2 ] || die "--declaration requires an argument"
+        declaration_file="$2"
+        shift 2
+        ;;
+      --out)
+        [ $# -ge 2 ] || die "--out requires an argument"
+        out_file="$2"
+        shift 2
+        ;;
+      --snapshot)
+        [ $# -ge 2 ] || die "--snapshot requires an argument"
+        snapshot="$2"
+        shift 2
+        ;;
+      --series)
+        [ $# -ge 2 ] || die "--series requires an argument"
+        series="$2"
+        shift 2
+        ;;
+      --keyring)
+        [ $# -ge 2 ] || die "--keyring requires an argument"
+        keyring="$2"
+        shift 2
+        ;;
+      --work-dir)
+        [ $# -ge 2 ] || die "--work-dir requires an argument"
+        work_dir="$2"
+        shift 2
+        ;;
+      --check-declaration)
+        check_only=1
+        shift
+        ;;
+      --emit-lockfile)
+        [ $# -ge 2 ] || die "--emit-lockfile requires an argument"
+        emit_from="$2"
+        shift 2
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "$prog_name: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [ "$check_only" = 1 ]; then
+    validate_declaration "$declaration_file" > /dev/null
+    echo "$prog_name: $declaration_file: OK"
+    exit 0
+  fi
+
+  if [ -n "$emit_from" ]; then
+    [ -n "$snapshot" ] || die "--emit-lockfile requires --snapshot"
+    [ -f "$emit_from" ] || die "resolved-package file does not exist: $emit_from"
+    emit_lockfile "$emit_from" "$snapshot" "$series" "$out_file"
+    exit 0
+  fi
+
+  # Real resolution refreshes pins by design (this script's whole purpose);
+  # a caller who wants a byte-reproducible run passes --snapshot explicitly
+  # (CI's "resolve" job does exactly this to prove idempotence). Left
+  # unset, snap to the current UTC hour -- coarse enough that back-to-back
+  # invocations within the same hour still land on one snapshot, without
+  # pinning to a stale timestamp indefinitely the way defaulting to a fixed
+  # constant would.
+  if [ -z "$snapshot" ]; then
+    snapshot="$(date -u +%Y%m%dT%H0000Z)"
+  fi
+
+  resolve "$declaration_file" "$out_file" "$snapshot" "$keyring" "$work_dir"
+}
+
+main "$@"

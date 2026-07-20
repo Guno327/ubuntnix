@@ -119,3 +119,62 @@ jobs:
         with:
           name: flake-lock
           path: flake.lock
+
+  resolve:
+    name: Archive resolution (apt solver, end-to-end)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # apt-solver-based resolution (SPEC.md §4.4; GitHub issue #8,
+      # milestone M1: "the `ubx update` archive-pins portion"). Runs
+      # bin/ubx-resolve directly against a real snapshot.ubuntu.com
+      # timestamp, using the runner's own apt-get/dpkg-deb — no `sudo`:
+      # bin/ubx-resolve's isolated apt rootdir (`-o Dir=...`) touches
+      # nothing under /etc/apt, /var/lib/apt, /var/lib/dpkg, or
+      # /var/cache/apt on the runner itself (see bin/ubx-resolve's own
+      # header for the mechanism). The pinned timestamp below is the same
+      # one already proven reachable on snapshot.ubuntu.com by the "flake"
+      # job's archive-fetch-proof step above, so this targets a known-good
+      # snapshot rather than "whatever's current right now".
+      #
+      # This resolves into THIS JOB'S OWN ephemeral checkout's
+      # archive.lock.json only — every job here gets its own isolated
+      # checkout (actions/checkout@v4 above), so overwriting it has zero
+      # effect on the "flake" job's checkout, whose archive-fetch-proof
+      # assertions are pinned to the COMMITTED lockfile's specific
+      # packages/hashes. Nothing in this job pushes any change back to the
+      # repository.
+      - name: Resolve declared packages against a pinned snapshot (run 1)
+        run: |
+          ./bin/ubx-resolve \
+            --declaration archive.packages.json \
+            --snapshot 20260715T000000Z \
+            --out archive.lock.json
+      - name: Validate the emitted lockfile against the shared schema
+        run: python3 tests/lib/validate-archive-lockfile.py archive.lock.json
+      # A real apt solve against an EMPTY dpkg status (bin/ubx-resolve's
+      # isolated rootdir starts with none) pulls in each declared package's
+      # actual runtime dependencies (libc6 and friends) — strictly more
+      # than the 5 bare names archive.packages.json declares, and more than
+      # the issue #7 hand-built fixture enumerated (see
+      # archive.packages.json's own header). tests/lib/check-resolved-
+      # closure.py asserts the resolved set is a proper superset of the
+      # declared one, by count and by name — kept as a standalone script
+      # rather than embedded here so it isn't at the mercy of YAML block-
+      # scalar indentation rules.
+      - name: Sanity-check the resolved closure
+        run: python3 tests/lib/check-resolved-closure.py archive.packages.json archive.lock.json
+      # Idempotence (issue #8's explicit acceptance criterion): re-running
+      # with UNCHANGED inputs (same declaration file, same --snapshot) must
+      # emit a byte-identical lockfile — proves the real, network-driven
+      # apt-solve path is deterministic end-to-end, complementing
+      # tests/unit/051's fixture-driven proof of the same property for the
+      # pure emission logic alone.
+      - name: Re-resolve with unchanged inputs (run 2) and diff for byte-identity
+        run: |
+          cp archive.lock.json /tmp/run1-archive.lock.json
+          ./bin/ubx-resolve \
+            --declaration archive.packages.json \
+            --snapshot 20260715T000000Z \
+            --out archive.lock.json
+          diff -u /tmp/run1-archive.lock.json archive.lock.json

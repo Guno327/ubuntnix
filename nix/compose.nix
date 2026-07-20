@@ -226,6 +226,22 @@ let
         ubxrun "$UBX_BASE/bin/cp" -r --preserve=mode,timestamps,links --no-preserve=ownership \
           "$UBX_BASE/." "$out/"
 
+        # Nix canonicalizes every registered store path read-only: all of
+        # $UBX_BASE's directories are mode 0555 on disk, and the
+        # `--preserve=mode` copy above faithfully stamps that 0555 onto
+        # $out ITSELF -- which the very next (pre-chroot, plain-build-uid)
+        # staging steps must still create `.ubx-compose/` inside. Proven
+        # by CI run 29785021551: `mkdir: cannot create directory
+        # '$out/.ubx-compose': Permission denied`. Restore owner-write on
+        # $out's own top-level mode only: everything DEEPER is either
+        # written in-chroot by namespace-root (whose CAP_DAC_OVERRIDE
+        # covers files owned by the mapped build uid -- i.e. this whole
+        # tree) or touched post-chroot as the owning uid (utimensat needs
+        # ownership, not write bits). The bit is cosmetic in the final
+        # artifact anyway: Nix re-canonicalizes $out read-only at
+        # registration, so this cannot introduce nondeterminism.
+        ubxrun "$UBX_BASE/bin/chmod" u+w "$out"
+
         # Stage every declared package's fetched .deb where the chroot
         # below can still reach it -- nothing outside $out is visible after
         # chroot(2), so anything the maintainer scripts need must already

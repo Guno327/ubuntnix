@@ -51,16 +51,29 @@ check "fetchFromGitHub" 'fetchFromGitHub'
 # `builtins.fetchurl` — a Nix LANGUAGE PRIMITIVE, always built into Nix
 # itself, not a nixpkgs fetcher — to pin Canonical's ubuntu-base tarball,
 # the project's one deliberate trust root besides Nix (SPEC.md §1.3/§4.1).
-# Only that exact spelling is allowed; any OTHER shape (bare `fetchurl`,
-# `pkgs.fetchurl`, an aliased/`with`-imported `fetchurl`, ...) still trips
-# this guard, since those shapes indicate a nixpkgs fetcher rather than the
-# builtin.
+#
+# A SECOND, equally narrow carve-out (SPEC.md §4.4 / issue #7):
+# nix/archive.nix legitimately calls `import <nix/fetchurl.nix>` — the
+# plain-Nix-expression sibling of the same `builtins.fetchurl` primitive,
+# shipped INSIDE NIX'S OWN source tree (`src/libexpr/fetchurl.nix`,
+# historically `corepkgs/fetchurl.nix`) and resolved via Nix's built-in
+# `<nix/...>` search path, which points at Nix's own data directory — NOT
+# `NIX_PATH`, not a channel, not nixpkgs. It's used instead of
+# `builtins.fetchurl` there specifically because it accepts an explicit
+# `name` argument (needed to sanitize deb filenames for the Nix store name
+# grammar), which the C++ `builtins.fetchurl` primitive does not expose.
+#
+# Only these two exact spellings are allowed; any OTHER shape (bare
+# `fetchurl`, `pkgs.fetchurl`, an aliased/`with`-imported `fetchurl`, a
+# nixpkgs-channel `<nixpkgs/...>`-style path, ...) still trips this guard,
+# since those shapes indicate a nixpkgs fetcher rather than one of Nix's
+# own two built-in fetchurl forms.
 check_fetchurl() {
   local f matches
   for f in "${files[@]}"; do
-    matches="$(grep -nE 'fetchurl' "$f" 2>/dev/null | grep -vE 'builtins\.fetchurl')"
+    matches="$(grep -nE 'fetchurl' "$f" 2>/dev/null | grep -vE 'builtins\.fetchurl|<nix/fetchurl\.nix>')"
     if [ -n "$matches" ]; then
-      echo "FAIL: $f references forbidden pattern (fetchurl, non-builtins spelling) — a no-nixpkgs-binaries violation (SPEC.md §1.3)" >&2
+      echo "FAIL: $f references forbidden pattern (fetchurl, non-builtin spelling) — a no-nixpkgs-binaries violation (SPEC.md §1.3)" >&2
       echo "$matches" >&2
       fails=$((fails + 1))
     fi

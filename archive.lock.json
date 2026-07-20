@@ -1,0 +1,59 @@
+{
+  "_comment": "ubuntnix archive lockfile (SPEC.md §4.4; GitHub issue #7, milestone M1). Two-tier per the reproducibility model: `public` pins a snapshot.ubuntu.com timestamp plus resolved (name, version, arch, component, path, sha256, size) tuples for the archive.ubuntu.com/security.ubuntu.com pockets the snapshot service covers; `esm` uses the identical per-package schema but is intentionally an empty list until milestone M4 wires up esm.ubuntu.com fetching against a Pro token (no snapshot service exists for esm -- SPEC.md §4.4, §8.2, R4). Consumed by nix/archive.nix via builtins.fromJSON; see that file for fetch mechanics and tests/unit/040-archive-lockfile.sh for the schema this file is held to. Every sha256 below was independently verified by downloading the .deb from snapshot.ubuntu.com and hashing it locally -- the resolved index value was not trusted blindly (see the Engineer's report for issue #7).",
+  "version": 1,
+  "public": {
+    "snapshot": "20260715T000000Z",
+    "series": "noble",
+    "packages": [
+      {
+        "name": "ed",
+        "version": "1.20.1-1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/e/ed/ed_1.20.1-1_amd64.deb",
+        "sha256": "c26e577a24cc784d678b0b2b960db8a154fb7138fc1aa7ad1ffe504698432a43",
+        "size": 56062
+      },
+      {
+        "name": "hello",
+        "version": "2.10-3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/h/hello/hello_2.10-3build1_amd64.deb",
+        "sha256": "e68cf4365b7aa9c4e2af4af6eee1710d6f967059b7b4af62786e8870d7366333",
+        "size": 26006
+      },
+      {
+        "name": "htop",
+        "version": "3.3.0-4build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/h/htop/htop_3.3.0-4build1_amd64.deb",
+        "sha256": "ee0e9cffc789788164214bac9b6e285a5127c07be1815129875c6c538ba849c6",
+        "size": 170528
+      },
+      {
+        "name": "jq",
+        "version": "1.7.1-3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/j/jq/jq_1.7.1-3build1_amd64.deb",
+        "sha256": "36276dcac711c742776377001886f5a72293391446b5d5e7646541336f2234aa",
+        "size": 65538
+      },
+      {
+        "name": "zlib1g",
+        "version": "1:1.3.dfsg-3.1ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2_amd64.deb",
+        "sha256": "0b93d16d7498f092fa3070fbbad28cdbc6b3d640f1a7681b96fc37f20d1219f1",
+        "size": 62784
+      }
+    ]
+  },
+  "esm": {
+    "_comment": "Empty until M4 (SPEC.md §4.4, R4): esm.ubuntu.com has no snapshot service, so this tier is pinned directly by (name, version, arch, component, path, sha256, size) once M4 wires up fetching against a Pro token. esm content is subscription-gated and never redistributed publicly.",
+    "packages": []
+  }
+}

@@ -348,6 +348,27 @@ let
         # R1 normalization (see this file's header): dpkg's own action log
         # is a literal timestamp transcript of this build.
         rm -f /var/log/dpkg.log /var/log/dpkg.log.*
+
+        # R1 mtime normalization, IN-CHROOT by necessity: `find -exec
+        # touch` spawns touch as a child by absolute path, which outside
+        # this chroot dies on the missing /lib64 ELF interpreter (the
+        # BOOTSTRAP CAVEAT; proven by CI run 29786396413's
+        # "find: '.../usr/bin/touch': No such file or directory" from the
+        # previous, post-chroot placement of this step). In here every
+        # child exec resolves against this rootfs's own real loader. The
+        # /dev bind mounts and /proc must be unmounted FIRST (dev binds
+        # before /proc -- umount needs /proc/self/mountinfo to look
+        # mounts up) so touch reaches the underlying regular mountpoint
+        # files rather than the outer sandbox's (unmapped-owner, EPERM)
+        # device nodes, and so no live mount's mtime leaks into the
+        # comparison. `-h`: touch symlinks themselves, never their
+        # targets. Nothing after this point may redirect to /dev/null --
+        # its bind mount is gone.
+        for d in null zero full random urandom tty; do
+          umount "/dev/$d" || true
+        done
+        umount /proc
+        find / -exec touch -h -d @0 {} +
         UBX_INNER_EOF
         ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/configure.sh"
 
@@ -447,14 +468,11 @@ let
         # in case that step was ever skipped/failed partway).
         ubxrun "$UBX_BASE/bin/rm" -rf "$out/.ubx-compose"
 
-        # R1 normalization (see this file's header): reset every mtime to
-        # the Unix epoch so two independent builds of an identical package
-        # set are directly comparable with `diff -r`, and so a later
-        # squashfs image built from this tree does not embed real build
-        # timestamps either. `-h`: touch symlinks themselves, not their
-        # targets (ubuntu-base's own top-level lib/lib64/bin/sbin symlinks
-        # must not be dereferenced here).
-        ubxrun "$UBX_BASE/usr/bin/find" "$out" -exec "$UBX_BASE/usr/bin/touch" -h -d @0 {} +
+        # R1 mtime normalization (reset every mtime to the Unix epoch so
+        # two independent builds are directly comparable with `diff -r`)
+        # happens at the END of configure.sh, inside the chroot -- see the
+        # comment there for why it cannot run out here (find -exec's child
+        # touch cannot exec without a real /lib64).
       '';
     };
 

@@ -123,8 +123,12 @@ for i, pkg in enumerate(packages):
 
     if "arch" in pkg:
         arch = pkg["arch"]
-        if arch != "amd64":
-            fail(f"{label} 'arch' must be 'amd64', got {arch!r}")
+        # "all" is a legitimate Debian archive architecture (arch-independent
+        # packages, e.g. tzdata -- added for issue #9's compose work) in
+        # addition to this project's native "amd64" target; anything else
+        # would be a real schema violation.
+        if arch not in ("amd64", "all"):
+            fail(f"{label} 'arch' must be 'amd64' or 'all', got {arch!r}")
 
     for str_field in ("version", "component"):
         if str_field in pkg and (

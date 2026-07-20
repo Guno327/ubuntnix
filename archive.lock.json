@@ -49,6 +49,36 @@
         "path": "pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2_amd64.deb",
         "sha256": "0b93d16d7498f092fa3070fbbad28cdbc6b3d640f1a7681b96fc37f20d1219f1",
         "size": 62784
+      },
+      {
+        "_comment": "Added for issue #9 (rootfs composition): a minimal-dependency (Depends: debconf only, already present in ubuntu-base) package whose postinst provably consumes a debconf answer -- tzdata/Areas + tzdata/Zones/<Area> select the /etc/timezone content and the /etc/localtime symlink target. Used by nix/compose.nix's compose-preseed-proof to demonstrate SPEC.md §6's ubuntnix.debconf preseed primitive actually reaches a maintainer script.",
+        "name": "tzdata",
+        "version": "2024a-2ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/t/tzdata/tzdata_2024a-2ubuntu1_all.deb",
+        "sha256": "f5bca0c788a4fc465c435f7e8a54b2594e9cbf1a22abb263a59e393f1cb666e1",
+        "size": 273318
+      },
+      {
+        "_comment": "Added for issue #9 (rootfs composition, image-artifact step): provides /usr/bin/mksquashfs, the archive-sourced tool nix/compose.nix uses to produce the read-only squashfs rootfs image (all-Canonical rule -- SPEC.md §1.3 -- forbids sourcing this from nixpkgs). Needs liblzo2-2 below (its only runtime dependency not already present in ubuntu-base; libc6/liblz4-1/liblzma5/libzstd1/zlib1g are already part of ubuntu-base's own base package set).",
+        "name": "squashfs-tools",
+        "version": "1:4.6.1-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/s/squashfs-tools/squashfs-tools_4.6.1-1build1_amd64.deb",
+        "sha256": "87fae263846bab255d4a51ad9fc623685497ad830db60758dde39589c9fdadcb",
+        "size": 189326
+      },
+      {
+        "_comment": "squashfs-tools' only runtime dependency not already shipped inside ubuntu-base -- see the squashfs-tools entry above.",
+        "name": "liblzo2-2",
+        "version": "2.10-2build4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/lzo2/liblzo2-2_2.10-2build4_amd64.deb",
+        "sha256": "e0d13be155013138b8db4cfe68212b866080af661c78302c2eab0d2f9d0d454e",
+        "size": 54148
       }
     ]
   },

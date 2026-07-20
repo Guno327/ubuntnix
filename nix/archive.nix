@@ -291,13 +291,22 @@ in
               # the actual derivation outputs.
               varRef = "$" + envName i;
             in
+            # Per nix/stdenv.nix's BOOTSTRAP CAVEAT, dynamically-linked
+            # ubuntu-base binaries may only be invoked through the
+            # "$UBX_LD" loader pattern — a bare `basename`/`cut` here
+            # fails with "cannot execute: required file not found" (CI
+            # run 29742349438 caught exactly that). Rather than paying
+            # two more loader invocations, both are replaced with bash
+            # parameter expansion (`''${var##*/}`, `''${var%% *}`) —
+            # shell builtins are explicitly unaffected by the caveat.
             ''
               {
+                debpath="${varRef}"
                 echo "deb name=${entry.name} version=${entry.version} store=${varRef}"
-                echo "deb filename=$(basename "${varRef}")"
-                printf 'deb sha256sum='
-                "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
-                  "$UBX_BASE/usr/bin/sha256sum" "${varRef}" | cut -d' ' -f1
+                echo "deb filename=''${debpath##*/}"
+                sumline=$("$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
+                  "$UBX_BASE/usr/bin/sha256sum" "${varRef}")
+                echo "deb sha256sum=''${sumline%% *}"
               } >> "$out"'')
           indices);
 

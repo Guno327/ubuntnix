@@ -276,16 +276,18 @@ let
         export DEBCONF_NONINTERACTIVE_SEEN=true
         export LC_ALL=C LANG=C
 
-        # A minimal /dev -- ubuntu-base ships dev/ EMPTY (a real system's
-        # devtmpfs populates it at boot; there is no boot here). Device
-        # nodes need CAP_MKNOD, which namespace-root has within this
-        # private mount namespace (see HARDENING below for how we got it).
-        [ -e /dev/null ]    || mknod -m 666 /dev/null    c 1 3
-        [ -e /dev/zero ]    || mknod -m 666 /dev/zero    c 1 5
-        [ -e /dev/full ]    || mknod -m 666 /dev/full    c 1 7
-        [ -e /dev/random ]  || mknod -m 666 /dev/random  c 1 8
-        [ -e /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9
-        [ -e /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
+        # /dev was prepared BEFORE this chroot, by enter.sh (see below):
+        # bind mounts of the outer build sandbox's own device nodes onto
+        # plain-file mountpoints under $out/dev. mknod is NOT an option
+        # here, twice over: namespace-root's CAP_MKNOD does not extend to
+        # filesystems whose superblock is owned by the INITIAL user
+        # namespace (proven by CI run 29785721098: 'mknod: /dev/null:
+        # Operation not permitted'), and even a successful mknod would be
+        # fatal later -- Nix refuses to register device nodes in store
+        # paths, so only the empty regular-file mountpoints (which the
+        # bind mounts cover for the duration of this mount namespace, and
+        # a real system's devtmpfs covers at boot) are storable in $out.
+        [ -e /dev/null ] || { echo "enter.sh failed to prepare /dev" >&2; exit 1; }
 
         # A fresh /proc for THIS pid namespace -- several maintainer
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
@@ -342,6 +344,36 @@ let
         UBX_INNER_EOF
         ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/configure.sh"
 
+        # enter.sh -- runs INSIDE the fresh user+mount+pid namespaces but
+        # BEFORE chroot(2): the only vantage point that can still see BOTH
+        # the outer build sandbox's /dev (bind-mount sources) and $out
+        # (bind-mount targets). Namespace-root's CAP_SYS_ADMIN covers
+        # `mount --bind` within its own private mount namespace; the
+        # mounts live exactly as long as that namespace and never reach
+        # the registered store path -- only the empty regular-file
+        # mountpoints do (see the /dev note inside configure.sh above for
+        # why bind mounts, not mknod). The touch creating each mountpoint
+        # runs as namespace-root too, so CAP_DAC_OVERRIDE (over this
+        # mapped-uid-owned tree) lets it write into the store-canonical
+        # 0555 dev/ directory. Env note: $out and the UBX_* variables are
+        # ordinary builder environment variables, inherited across
+        # unshare, so this quoted heredoc leaves them for ENTER.SH's own
+        # runtime to expand. `exec` must spell the loader invocation out
+        # literally -- exec cannot target a shell function.
+        ubxrun "$UBX_BASE/bin/cat" > "$out/.ubx-compose/enter.sh" <<'UBX_ENTER_EOF'
+        set -eu
+        ubxrun() {
+          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"
+        }
+        for d in null zero full random urandom tty; do
+          [ -e "$out/dev/$d" ] || ubxrun "$UBX_BASE/usr/bin/touch" "$out/dev/$d"
+          ubxrun "$UBX_BASE/usr/bin/mount" --bind "/dev/$d" "$out/dev/$d"
+        done
+        exec "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$UBX_BASE/usr/sbin/chroot" "$out" \
+          /bin/sh /.ubx-compose/configure.sh
+        UBX_ENTER_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/enter.sh"
+
         # -- HARDENING (issue #9; follow-up to nix/stdenv.nix's HARDENING
         # NOTE) -----------------------------------------------------------
         #
@@ -386,9 +418,11 @@ let
         # took several real CI iterations to get right (see that file's
         # "BOOTSTRAP CAVEAT" and its git-blame for the CI run numbers).
         #
-        # The `unshare`/`chroot` invocation itself still needs `ubxrun`
-        # (both are dynamically-linked ubuntu-base binaries, invoked
-        # BEFORE the chroot happens) -- but `/.ubx-compose/configure.sh`
+        # The `unshare`/`bash enter.sh`/`chroot` chain itself still needs
+        # `ubxrun`-style loader wrapping (all dynamically-linked
+        # ubuntu-base binaries, invoked BEFORE the chroot happens; enter.sh
+        # bind-mounts /dev in between -- see its staging comment above) --
+        # but `/.ubx-compose/configure.sh`
         # runs AFTER chroot(2) has already repointed the process's root at
         # $out, so ITS dynamic loader lookups (/lib64/ld-linux-...)
         # resolve inside $out's own copy of ubuntu-base, same as a real
@@ -397,8 +431,8 @@ let
         # step, and the concrete difference from nix/stdenv.nix's raw-
         # loader approach.
         ubxrun "$UBX_BASE/usr/bin/unshare" --user --map-root-user --mount --pid --fork -- \
-          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$UBX_BASE/usr/sbin/chroot" "$out" \
-          /bin/sh /.ubx-compose/configure.sh
+          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$UBX_BASE/bin/bash" \
+          "$out/.ubx-compose/enter.sh"
 
         # Compose-time staging is not part of the composed system (the
         # chrooted script above already removes it from ITS OWN view of

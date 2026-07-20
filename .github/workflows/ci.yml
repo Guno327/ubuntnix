@@ -4,6 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # regen-lockfile (below) only: manual lockfile regeneration for issue #20
+  # -- the PM's own host has no apt (snap confinement), so the resolver can
+  # only run here; the PM downloads the artifact and commits it verbatim.
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: "snapshot.ubuntu.com timestamp (YYYYMMDDThhmmssZ) to resolve against"
+        required: false
+        default: "20260715T000000Z"
 
 jobs:
   test:
@@ -297,3 +306,31 @@ jobs:
             --snapshot 20260715T000000Z \
             --out archive.lock.json
           diff -u /tmp/run1-archive.lock.json archive.lock.json
+
+  regen-lockfile:
+    name: Regenerate archive.lock.json (manual, issue #20)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Same mechanism as the `resolve` job above (see its comments), but
+      # its OUTPUT is the deliverable: the emitted lockfile is uploaded as
+      # an artifact for the PM to download, review, and commit -- the
+      # committed archive.lock.json then becomes byte-identical to a fresh
+      # resolver run at the pinned snapshot (issue #20's acceptance).
+      # Nothing here pushes anything back to the repository.
+      - name: Resolve declared packages against the requested snapshot
+        run: |
+          ./bin/ubx-resolve \
+            --declaration archive.packages.json \
+            --snapshot "${{ inputs.snapshot }}" \
+            --out archive.lock.json
+      - name: Validate against the shared schema
+        run: python3 tests/lib/validate-archive-lockfile.py archive.lock.json
+      - name: Sanity-check the resolved closure
+        run: python3 tests/lib/check-resolved-closure.py archive.packages.json archive.lock.json
+      - name: Upload the regenerated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive.lock.json
+          path: archive.lock.json

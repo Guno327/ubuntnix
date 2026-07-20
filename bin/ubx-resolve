@@ -640,6 +640,14 @@ resolve() {
     -o "APT::Architecture=amd64"
     -o "APT::Architectures::=amd64"
     -o "Acquire::Languages=none"
+    # The declared set -- not apt's Recommends graph -- controls what a
+    # ubuntnix system contains (SPEC.md §5's minimal-by-default posture;
+    # same posture debootstrap takes). Without this, declaring a kernel
+    # meta-package drags in Recommends like firmware blobs that the spec
+    # never asked for; anything genuinely needed must be declared (or be a
+    # hard Depends of something declared).
+    -o "APT::Install-Recommends=false"
+    -o "APT::Install-Suggests=false"
     # Isolated network hiccups on the CI runner shouldn't fail the whole
     # resolution outright.
     -o "Acquire::Retries=3"

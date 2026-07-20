@@ -119,11 +119,19 @@ else
     fail "$compose_nix does not debconf-set-selections (line $selections_line) BEFORE dpkg --configure (line $configure_line) — preseed answers would not be in place before maintainer scripts run"
 fi
 
-# debconf-set-selections must be guarded on the 3-field input being
-# non-empty (an all-empty preseed, e.g. compose-proof's, must not invoke it
-# on an empty/missing file).
-grep -q 'if \[ -s /.ubx-compose/preseed.txt \]' "$configure_sh" ||
-  fail "$compose_nix does not guard debconf-set-selections on a non-empty preseed.txt"
+# debconf-set-selections must be guarded on the 3-field input containing
+# real (non-whitespace) content -- NOT merely `[ -s ]`: the staging heredoc
+# writes a trailing newline even for an empty preseed set, so a size check
+# alone let compose-proof's blank line reach the awk expansion and produce
+# a degenerate record debconf-set-selections rejects (CI run 29785981711,
+# "parse error on line 1").
+grep -q "if grep -q '\[\^\[:space:\]\]' /.ubx-compose/preseed.txt" "$configure_sh" ||
+  fail "$compose_nix does not guard debconf-set-selections on non-whitespace preseed.txt content"
+
+# ... and the awk expansion itself must skip blank lines for the same
+# reason (stray blank lines between records).
+grep -q '/\^\[\[:space:\]\]\*\$/ { next }' "$configure_sh" ||
+  fail "$compose_nix's preseed awk expansion does not skip blank lines"
 
 # -- 3-field -> 4-field expansion: real Type lookup, string fallback -------
 grep -q 'templates' "$configure_sh" ||

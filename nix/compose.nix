@@ -311,9 +311,16 @@ let
         # just registered; default to "string" for a question with no
         # known template (debconf itself falls back the same way when
         # asked to store an answer for an unregistered question).
-        if [ -s /.ubx-compose/preseed.txt ]; then
+        # `grep [^[:space:]]`, not `[ -s ]`: the staging heredoc writes a
+        # trailing newline even for an EMPTY preseed set (proven by CI run
+        # 29785981711: that lone blank line became a degenerate
+        # "<TAB>string<TAB>" record debconf-set-selections rejects with
+        # "parse error on line 1"), and awk skips any other blank line for
+        # the same reason.
+        if grep -q '[^[:space:]]' /.ubx-compose/preseed.txt; then
           awk -F'\t' '
             BEGIN { OFS = "\t" }
+            /^[[:space:]]*$/ { next }
             {
               pkg = $1; q = $2; v = $3
               type = "string"

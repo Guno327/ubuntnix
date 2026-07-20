@@ -2,5 +2,24 @@
   "_comment": "ubuntnix declared archive package set (SPEC.md §4.4, §6; GitHub issue #8, milestone M1). This is the committed input bin/ubx-resolve (the `ubx update` archive-pins portion) resolves against the real apt solver to produce archive.lock.json. 'packages' is exactly the flat deb-name list shape SPEC.md §6's `ubuntnix.debs = [ ... ]` primitive takes -- kept here as a plain JSON file (readable by tooling with no `nix` binary, same reasoning as archive.lock.json itself: see nix/archive.nix's header) until a real `ubuntnix.debs` module option exists to declare it from instead (M2+, once the module system has something to compose into; see bin/ubx-resolve's header for the migration note). 'components' is the enabled subset of noble's four archive components that bin/ubx-resolve's sources.list generation and validation cover -- main/universe/restricted/multiverse are all SUPPORTED by the resolver, but SPEC.md §5 defaults a machine to main+universe only, with restricted/multiverse a per-machine opt-in toggle that is real system config (M6 scope, not expressible here yet). Seeded 2026-07-20 with the exact package names already pinned in archive.lock.json (issue #7), so the first real `bin/ubx-resolve` run resolves a declared set whose closure is a superset of that lockfile's -- see bin/ubx-resolve's header for why a real apt solve necessarily pulls in more than these 5 names (their actual runtime library dependencies, which the issue #7 hand-built fixture did not attempt to enumerate).",
   "series": "noble",
   "components": ["main", "universe"],
-  "packages": ["ed", "hello", "htop", "jq", "liblzo2-2", "libnl-3-200", "libnl-genl-3-200", "squashfs-tools", "tzdata", "zlib1g"]
+  "packages": [
+    "dosfstools",
+    "e2fsprogs",
+    "ed",
+    "grub-common",
+    "grub-pc-bin",
+    "hello",
+    "htop",
+    "initramfs-tools",
+    "jq",
+    "liblzo2-2",
+    "libnl-3-200",
+    "libnl-genl-3-200",
+    "linux-image-virtual",
+    "mtools",
+    "parted",
+    "squashfs-tools",
+    "tzdata",
+    "zlib1g"
+  ]
 }

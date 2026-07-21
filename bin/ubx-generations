@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+# bin/ubx-generations — the generation model: on-disk layout, numbering,
+# retention/GC planning (SPEC.md §4.2, §4.3; GitHub issue #25, milestone
+# M2: "the generation model").
+#
+# -- Scope -------------------------------------------------------------------
+#
+# This is DATA MODEL + PURE PLANNER tooling only: it allocates generation
+# directories, writes/reads their manifests, maintains the current/previous
+# pointers, and computes retention/GC plans. It never activates anything
+# (no /etc generation, no unit restarts, no soft-reboot, no bootloader
+# install) and never deletes a generation directory or a store artifact —
+# `prune-plan`/`gc-plan` print what WOULD happen, nothing more. Activation
+# and real deletion are `ubx` verb work for a later issue (#29), which is
+# expected to shell out to this script the same way `ubx update`'s
+# archive-pins portion shells out to bin/ubx-resolve.
+#
+# -- On-disk layout (SPEC.md §4.2) -------------------------------------------
+#
+#   $ROOT/
+#     <N>/                  one directory per generation, N a plain
+#       manifest             non-negative integer (see "Numbering" below)
+#     .next-index            persistent allocation counter (see "Numbering")
+#     current -> <N>         symlink: the generation this tooling last
+#                             created (see "current vs. booted" below)
+#     previous -> <N>        symlink: whatever `current` pointed at just
+#                             before the most recent `create`
+#
+# $ROOT defaults to /ubx/var/generations (SPEC.md §4.2's "writable state
+# ... /ubx"), overridable via --root or UBX_GEN_ROOT (--root wins) so every
+# subcommand is testable against a fixture directory with no privileges and
+# no /ubx present — every subcommand below does exactly that; nothing here
+# ever assumes /ubx exists.
+#
+# Directory naming: plain integers ("3", not "003"). A zero-padded scheme
+# needs a width decided up front and either wraps or needs migration once
+# generation numbers exceed it (issue: what happens at generation 1000 with
+# width 3?); plain integers have no such ceiling. Nothing here relies on
+# lexicographic directory ordering (globs are always numerically re-sorted
+# via `sort -n` before use), so the usual "ls sorts strings, not numbers"
+# footgun does not apply.
+#
+# Numbering: a persistent monotonic counter file (.next-index), NOT
+# max(existing dirs) + 1. The latter reuses a number if a future GC
+# implementation (issue #29) ever deletes the highest-numbered generation
+# directory while a lower-numbered one survives -- which SPEC.md §4.3's
+# retention rule allows: booted/previous are exempt BY NUMBER, not by
+# recency, and a machine can be booted into an old generation (after a
+# rollback) while a newer, never-booted generation is neither booted nor
+# previous and so is a valid prune candidate even though its number is the
+# highest on disk. In the common case (nothing above the current max is
+# ever pruned) the counter and max(existing)+1 agree exactly; the counter
+# additionally holds in the uncommon case, which is why it's used here.
+# (This is the one place this design deviates from plain NixOS profile-
+# generation numbering, which does scan for the max on disk -- NixOS
+# profiles are not subject to the booted/previous-by-number exemption this
+# project's retention policy has, so the reuse footgun doesn't arise for
+# it the same way.)
+#
+# -- current vs. booted -------------------------------------------------------
+#
+# `current`/`previous` here are bookkeeping pointers this tooling
+# maintains itself (updated only by `create`, today): `current` is "the
+# generation the last `create` produced", `previous` is "whatever
+# `current` pointed at right before that". They are NOT the same thing as
+# "the generation the running kernel actually booted" -- this script has
+# no privileged way to determine that (it would mean reading /proc/cmdline
+# or a GRUB environment block, which belongs to activation tooling, #29)
+# and deliberately doesn't try. That's why `prune-plan`/`gc-plan` take
+# `--booted` as an EXPLICIT caller-supplied argument rather than reading
+# it off disk: the real booted generation is activation's business to
+# know, this script's business to plan retention around once told.
+# `rollback-target` defaults `--booted`/`--previous` to the on-disk
+# current/previous pointers ONLY as a convenience for callers that have
+# nothing better (e.g. ad hoc/manual use); a real `ubx rollback` (#29) is
+# expected to pass its own observed booted generation explicitly.
+#
+# -- Manifest format (SPEC.md §4.2) ------------------------------------------
+#
+# Flat `KEY=value`, one field per line, no jq -- chosen over the repo's
+# other convention (JSON, as in archive.lock.json) because these files are
+# meant to be `grep`/`sed`/`awk`-able by both this script and, later,
+# activation tooling running in a minimal on-device environment where a
+# JSON parser is a dependency to justify (this script and its runtime
+# dependency, later, on the composed image use only coreutils + awk/sed --
+# see "Dependencies" below). It is deliberately NOT the repo's other
+# convention (bin/ubx-gen-grub-cfg's/emit-grub-list's TSV, see below)
+# because a manifest is a field:value map with an open-ended, extensible
+# set of keys (see "Extensible sections" below), where TSV's fixed
+# positional-column contract is the wrong fit; TSV is reserved here for
+# the one shape that genuinely IS fixed-arity (the GRUB generation-list
+# line).
+#
+# Values are unquoted and MUST be single-line (no embedded TAB/newline) --
+# `create` validates this at write time. This format is intentionally
+# `source`-able (it's valid POSIX shell variable assignment) but every
+# reader in this script deliberately parses it with `manifest_get` (sed/
+# awk) instead of `source`-ing it: a corrupted or tampered-with manifest
+# then can't execute arbitrary code just by existing, only fail to parse
+# as expected. (Same posture as bin/ubx-resolve never trusting index-
+# reported checksums: don't trust file contents beyond what they claim to
+# be data.)
+#
+# Fields (GEN_INDEX is redundant with the directory name -- kept anyway so
+# a manifest is self-describing if ever inspected/copied out of context):
+#   GEN_INDEX            the generation number (matches the directory name)
+#   GEN_TITLE             human label, e.g. "generation 3" or a caller-given one
+#   GEN_CREATED           ISO-8601 UTC creation timestamp
+#   GEN_ROOTFS_IMAGE      store path of the rootfs image (SPEC.md §4.2)
+#   GEN_KERNEL_PATH       store path of the kernel
+#   GEN_INITRD_PATH       store path of the initrd
+#   GEN_ROOT_DEVICE       root device spec passed to the kernel
+#   GEN_KERNEL_PARAMS     kernel command line (verbatim; the GRUB list's
+#                         last field -- see emit-grub-list below)
+#   GEN_ETC_REF           store path of the generated /etc tree
+#   GEN_USERS_MANIFEST    store path of the users/passwd manifest
+#   GEN_SNAP_MANIFEST     store path of the snap manifest
+#
+# The last three are the "extensible section" SPEC.md §4.2 describes for
+# domains this milestone doesn't implement yet (generated /etc lands
+# alongside M2's activation work in #29; users is also M2 but interim/SSH-
+# key-only per SPEC.md §11; snaps are M3) -- present as fields, legally
+# empty today (`create` defaults them to "" and every consumer here treats
+# empty as "no reference"), so a later milestone starts populating an
+# existing field instead of changing the manifest shape.
+#
+# GC_REF_FIELDS below is the authoritative, honest list of which manifest
+# fields name store paths gc-plan must treat as artifact references --
+# GEN_ROOT_DEVICE (a device spec, not a store path) and GEN_KERNEL_PARAMS
+# (a command-line string) are deliberately excluded.
+#
+# -- Interface with bin/ubx-gen-grub-cfg (issue #10) -------------------------
+#
+# `emit-grub-list` renders EXACTLY the shape that script's header
+# documents it consumes: a plain file, one generation per line, six
+# TAB-separated fields in this fixed order -- index, title, kernelPath,
+# initrdPath, rootDevice, kernelParams (last field, verbatim to end of
+# line) -- '#'-prefixed and blank lines skipped, and the renderer never
+# reorders. This script is therefore the one place ordering policy lives;
+# see emit-grub-list's own comment for the ordering this picks.
+#
+# -- Dependencies --------------------------------------------------------
+#
+# coreutils (mkdir/mv/ln/mktemp/sort/date/basename/printf/cat) + awk/sed +
+# bash builtins only -- no python3, no jq (unlike bin/ubx-resolve, which
+# needs a real JSON parser for its JSON lockfile; this script's flat
+# KEY=value manifest format was chosen in part so it never needs one).
+# This matters because, unlike bin/ubx-resolve (a pre-boot/CI-only tool),
+# this script's logic is meant to keep running natively on-device, inside
+# the composed image, for the lifetime of the machine (SPEC.md §4.5).
+set -euo pipefail
+
+prog_name="ubx-generations"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+usage: ubx-generations <command> [options]
+
+commands:
+  create           allocate the next generation, write its manifest,
+                    update current/previous
+  list              list generations (human table, or --porcelain TSV)
+  emit-grub-list     render a generation-list file for bin/ubx-gen-grub-cfg
+  prune-plan         print which generations a retention policy would drop
+  gc-plan            print which store-path references would be
+                      kept alive vs. collected under a retention policy
+  rollback-target     resolve "previous" or an explicit N to a concrete,
+                      retained generation number
+  -h, --help          show this message
+
+Every command takes --root DIR (default: \$UBX_GEN_ROOT, else
+/ubx/var/generations). Run 'ubx-generations <command> --help' for a
+command's own options.
+
+See this script's header comment for the on-disk layout, manifest format,
+numbering, and retention/GC semantics (SPEC.md §4.2, §4.3).
+USAGE
+}
+
+default_root() {
+  echo "${UBX_GEN_ROOT:-/ubx/var/generations}"
+}
+
+# -- generic helpers ----------------------------------------------------
+
+is_uint() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# existing_gens ROOT — ascending (numeric) list of generation numbers that
+# have both a numeric directory name and a manifest file, one per line.
+existing_gens() {
+  local root="$1" d base
+  [ -d "$root" ] || return 0
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    base="$(basename "$d")"
+    is_uint "$base" || continue
+    [ -f "${d}manifest" ] || continue
+    printf '%s\n' "$base"
+  done | sort -n
+}
+
+gen_dir() { # ROOT GEN
+  echo "$1/$2"
+}
+
+gen_exists() { # ROOT GEN
+  [ -f "$(gen_dir "$1" "$2")/manifest" ]
+}
+
+# manifest_get FILE KEY — prints the single-line value for KEY, or "" if
+# absent. Never `source`s the manifest (see this script's header).
+manifest_get() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || { echo ""; return 0; }
+  awk -v key="$key" '
+    BEGIN { prefix = key "=" ; found = 0 }
+    index($0, prefix) == 1 { print substr($0, length(prefix) + 1); found = 1; exit }
+    END { if (!found) print "" }
+  ' "$file"
+}
+
+# read_link_target ROOT NAME — prints the numeric target of a
+# current/previous symlink, or "" if it doesn't exist / isn't numeric.
+read_link_target() {
+  local root="$1" name="$2" link target
+  link="$root/$name"
+  [ -L "$link" ] || { echo ""; return 0; }
+  target="$(basename "$(readlink "$link")")"
+  is_uint "$target" && echo "$target" || echo ""
+}
+
+# atomic_symlink ROOT NAME TARGET — points $ROOT/$NAME at $TARGET (a
+# generation number, relative symlink) atomically: create a new symlink
+# at a temp path in the same directory, then rename over the final name.
+# A bare `ln -sfn` is NOT atomic (it unlinks then links); `mv -T` of a
+# freshly created symlink is, because rename(2) is.
+atomic_symlink() {
+  local root="$1" name="$2" target="$3" tmp
+  tmp="$(mktemp -u "$root/.${name}.XXXXXX")"
+  ln -s "$target" "$tmp"
+  mv -T "$tmp" "$root/$name"
+}
+
+# -- numbering ------------------------------------------------------------
+
+# next_index ROOT — the next generation number to allocate, from the
+# persistent counter (see header: "Numbering"). Does not consume it.
+next_index() {
+  local root="$1" counter
+  counter="$root/.next-index"
+  if [ -f "$counter" ]; then
+    cat "$counter"
+  else
+    echo 1
+  fi
+}
+
+# bump_index ROOT NEW — atomically records NEW as the next value to
+# allocate.
+bump_index() {
+  local root="$1" new="$2" counter tmp
+  counter="$root/.next-index"
+  tmp="$(mktemp "$root/.next-index.XXXXXX")"
+  printf '%s\n' "$new" > "$tmp"
+  mv -f "$tmp" "$counter"
+}
+
+# -- retention (SPEC.md §4.3) ---------------------------------------------
+#
+# validate_retain STR — "all" or a non-negative integer.
+validate_retain() {
+  case "$1" in
+    all) return 0 ;;
+    *) is_uint "$1" || die "--retain must be a non-negative integer or 'all', got: $1" ;;
+  esac
+}
+
+# compute_retained ROOT RETAIN BOOTED PREVIOUS — ascending list of
+# retained generation numbers, one per line. RETAIN is a count or "all";
+# BOOTED/PREVIOUS may be empty (no exemption applied for an empty one).
+# Algorithm (SPEC.md §4.3): the newest RETAIN generations, UNION booted,
+# UNION previous — booted/previous are exempt regardless of whether they
+# fall inside the newest-RETAIN window, and regardless of RETAIN's size
+# (including RETAIN=0: still keeps booted/previous, nothing else).
+compute_retained() {
+  local root="$1" retain="$2" booted="$3" previous="$4"
+  local -a existing=()
+  while IFS= read -r g; do [ -n "$g" ] && existing+=("$g"); done < <(existing_gens "$root")
+
+  if [ "$retain" = all ]; then
+    printf '%s\n' "${existing[@]}"
+    return 0
+  fi
+
+  local n=${#existing[@]} keep_n="$retain"
+  [ "$keep_n" -gt "$n" ] && keep_n="$n"
+
+  local -A retained=()
+  local i
+  for ((i = n - keep_n; i < n; i++)); do
+    retained["${existing[$i]}"]=1
+  done
+
+  local g
+  if [ -n "$booted" ]; then
+    for g in "${existing[@]}"; do [ "$g" = "$booted" ] && retained["$booted"]=1; done
+  fi
+  if [ -n "$previous" ]; then
+    for g in "${existing[@]}"; do [ "$g" = "$previous" ] && retained["$previous"]=1; done
+  fi
+
+  [ "${#retained[@]}" -eq 0 ] && return 0
+  printf '%s\n' "${!retained[@]}" | sort -n
+}
+
+# compute_dropped ROOT RETAIN BOOTED PREVIOUS — existing minus retained,
+# ascending. Implemented as an explicit associative-array membership
+# check rather than `comm` deliberately: `comm` requires both streams
+# sorted in the SAME order it compares with (plain lexical), but this
+# script sorts numerically (`sort -n`) — lexical vs. numeric order
+# diverge as soon as a generation number reaches two digits (e.g. "10"
+# sorts before "2" lexically), which would make `comm` silently misbehave
+# on any fixture past generation 9.
+compute_dropped() {
+  local root="$1" retain="$2" booted="$3" previous="$4"
+  local -A retained=()
+  local g
+  while IFS= read -r g; do [ -n "$g" ] && retained["$g"]=1; done \
+    < <(compute_retained "$root" "$retain" "$booted" "$previous")
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    [ -n "${retained[$g]:-}" ] || printf '%s\n' "$g"
+  done < <(existing_gens "$root")
+}
+
+# -- GC reference fields (see header) --------------------------------------
+
+GC_REF_FIELDS=(GEN_ROOTFS_IMAGE GEN_KERNEL_PATH GEN_INITRD_PATH GEN_ETC_REF GEN_USERS_MANIFEST GEN_SNAP_MANIFEST)
+
+# gen_refs ROOT GEN — sorted, deduplicated store-path references named by
+# GEN's manifest (only the fields in GC_REF_FIELDS; empty fields skipped).
+gen_refs() {
+  local root="$1" gen="$2" f val
+  for f in "${GC_REF_FIELDS[@]}"; do
+    val="$(manifest_get "$(gen_dir "$root" "$gen")/manifest" "$f")"
+    [ -n "$val" ] && printf '%s\n' "$val"
+  done | sort -u
+}
+
+# -- field validation (shared by create and emit-grub-list) ---------------
+#
+# A manifest field, and every one of the six emit-grub-list TSV columns,
+# must be single-line: TAB would corrupt the TSV shape bin/ubx-gen-grub-cfg
+# parses, and a literal newline can't round-trip through a one-field-per-
+# line manifest at all.
+check_single_line() { # LABEL VALUE
+  case "$2" in
+    *$'\t'* | *$'\n'*) die "$1 must not contain a TAB or newline: $2" ;;
+  esac
+}
+
+# =====================================================================
+# create
+# =====================================================================
+
+cmd_create_usage() {
+  cat <<USAGE
+usage: ubx-generations create [--root DIR] [--title TITLE]
+         --rootfs-image PATH --kernel PATH --initrd PATH --root-device DEV
+         [--kernel-params PARAMS] [--etc-ref PATH] [--users-manifest PATH]
+         [--snap-manifest PATH] [--created TIMESTAMP] [--stdin]
+
+Allocates the next generation number (persistent counter, never reused —
+see this script's header), writes its manifest atomically (temp dir +
+rename), and repoints current/previous (current := the new generation,
+previous := whatever current pointed at before).
+
+--stdin reads additional KEY=value lines (manifest field names, e.g.
+GEN_TITLE=...) from stdin before flags are applied; flags always win over
+stdin values. This is a scripting hook — most callers just pass flags.
+
+--created overrides the creation timestamp (default: now, UTC,
+ISO-8601) — a testing hook for reproducible fixtures, mirroring
+bin/ubx-resolve's --snapshot.
+
+Prints the new generation number to stdout on success.
+USAGE
+}
+
+cmd_create() {
+  local root
+  root="$(default_root)"
+  local title="" rootfs_image="" kernel="" initrd="" root_device=""
+  local kernel_params="" etc_ref="" users_manifest="" snap_manifest=""
+  local created="" use_stdin=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --title) [ $# -ge 2 ] || die "--title requires an argument"; title="$2"; shift 2 ;;
+      --rootfs-image) [ $# -ge 2 ] || die "--rootfs-image requires an argument"; rootfs_image="$2"; shift 2 ;;
+      --kernel) [ $# -ge 2 ] || die "--kernel requires an argument"; kernel="$2"; shift 2 ;;
+      --initrd) [ $# -ge 2 ] || die "--initrd requires an argument"; initrd="$2"; shift 2 ;;
+      --root-device) [ $# -ge 2 ] || die "--root-device requires an argument"; root_device="$2"; shift 2 ;;
+      --kernel-params) [ $# -ge 2 ] || die "--kernel-params requires an argument"; kernel_params="$2"; shift 2 ;;
+      --etc-ref) [ $# -ge 2 ] || die "--etc-ref requires an argument"; etc_ref="$2"; shift 2 ;;
+      --users-manifest) [ $# -ge 2 ] || die "--users-manifest requires an argument"; users_manifest="$2"; shift 2 ;;
+      --snap-manifest) [ $# -ge 2 ] || die "--snap-manifest requires an argument"; snap_manifest="$2"; shift 2 ;;
+      --created) [ $# -ge 2 ] || die "--created requires an argument"; created="$2"; shift 2 ;;
+      --stdin) use_stdin=1; shift ;;
+      -h | --help) cmd_create_usage; exit 0 ;;
+      *) echo "$prog_name: create: unknown option: $1" >&2; cmd_create_usage >&2; exit 2 ;;
+    esac
+  done
+
+  # stdin values are applied first, so flags (parsed above) always win —
+  # implemented by only using an stdin value when the flag left the local
+  # var empty at this point would be wrong (a flag set to "" on purpose
+  # couldn't be distinguished); instead apply stdin BEFORE flags are read
+  # would need re-ordering the parse. Simpler and equally correct: stdin
+  # only fills fields the flags never touched, tracked via presence, not
+  # value emptiness.
+  if [ "$use_stdin" = 1 ]; then
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      key="${line%%=*}"
+      value="${line#*=}"
+      case "$key" in
+        GEN_TITLE) [ -n "$title" ] || title="$value" ;;
+        GEN_ROOTFS_IMAGE) [ -n "$rootfs_image" ] || rootfs_image="$value" ;;
+        GEN_KERNEL_PATH) [ -n "$kernel" ] || kernel="$value" ;;
+        GEN_INITRD_PATH) [ -n "$initrd" ] || initrd="$value" ;;
+        GEN_ROOT_DEVICE) [ -n "$root_device" ] || root_device="$value" ;;
+        GEN_KERNEL_PARAMS) [ -n "$kernel_params" ] || kernel_params="$value" ;;
+        GEN_ETC_REF) [ -n "$etc_ref" ] || etc_ref="$value" ;;
+        GEN_USERS_MANIFEST) [ -n "$users_manifest" ] || users_manifest="$value" ;;
+        GEN_SNAP_MANIFEST) [ -n "$snap_manifest" ] || snap_manifest="$value" ;;
+        *) die "create: unrecognized field on stdin: $key" ;;
+      esac
+    done
+  fi
+
+  [ -n "$rootfs_image" ] || die "create: --rootfs-image is required (or GEN_ROOTFS_IMAGE on stdin)"
+  [ -n "$kernel" ] || die "create: --kernel is required (or GEN_KERNEL_PATH on stdin)"
+  [ -n "$initrd" ] || die "create: --initrd is required (or GEN_INITRD_PATH on stdin)"
+  [ -n "$root_device" ] || die "create: --root-device is required (or GEN_ROOT_DEVICE on stdin)"
+
+  mkdir -p "$root"
+
+  local idx
+  idx="$(next_index "$root")"
+  [ -n "$title" ] || title="generation $idx"
+  [ -n "$created" ] || created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  for pair in "title:$title" "rootfs-image:$rootfs_image" "kernel:$kernel" \
+    "initrd:$initrd" "root-device:$root_device" "kernel-params:$kernel_params" \
+    "etc-ref:$etc_ref" "users-manifest:$users_manifest" "snap-manifest:$snap_manifest"; do
+    check_single_line "${pair%%:*}" "${pair#*:}"
+  done
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d "$root/.create.XXXXXX")"
+  {
+    printf 'GEN_INDEX=%s\n' "$idx"
+    printf 'GEN_TITLE=%s\n' "$title"
+    printf 'GEN_CREATED=%s\n' "$created"
+    printf 'GEN_ROOTFS_IMAGE=%s\n' "$rootfs_image"
+    printf 'GEN_KERNEL_PATH=%s\n' "$kernel"
+    printf 'GEN_INITRD_PATH=%s\n' "$initrd"
+    printf 'GEN_ROOT_DEVICE=%s\n' "$root_device"
+    printf 'GEN_KERNEL_PARAMS=%s\n' "$kernel_params"
+    printf 'GEN_ETC_REF=%s\n' "$etc_ref"
+    printf 'GEN_USERS_MANIFEST=%s\n' "$users_manifest"
+    printf 'GEN_SNAP_MANIFEST=%s\n' "$snap_manifest"
+  } > "$tmp_dir/manifest"
+
+  # Atomic publish: the generation only appears at $root/$idx (visible to
+  # every other subcommand) once this rename completes — a crash mid-write
+  # leaves an orphaned .create.XXXXXX dir, never a half-written $idx/.
+  mv -T "$tmp_dir" "$root/$idx"
+
+  bump_index "$root" $((idx + 1))
+
+  local old_current
+  old_current="$(read_link_target "$root" current)"
+  if [ -n "$old_current" ]; then
+    atomic_symlink "$root" previous "$old_current"
+  fi
+  atomic_symlink "$root" current "$idx"
+
+  echo "$idx"
+}
+
+# =====================================================================
+# list
+# =====================================================================
+
+cmd_list_usage() {
+  cat <<USAGE
+usage: ubx-generations list [--root DIR] [--porcelain]
+
+Lists every generation under --root, oldest first.
+
+--porcelain prints TAB-separated fields, one generation per line:
+  index  title  created  rootfsImage  current(yes/no)  previous(yes/no)
+
+Without --porcelain, prints an aligned human table with the same
+information plus a "(current)"/"(previous)" annotation.
+USAGE
+}
+
+cmd_list() {
+  local root
+  root="$(default_root)"
+  local porcelain=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --porcelain) porcelain=1; shift ;;
+      -h | --help) cmd_list_usage; exit 0 ;;
+      *) echo "$prog_name: list: unknown option: $1" >&2; cmd_list_usage >&2; exit 2 ;;
+    esac
+  done
+
+  local current previous
+  current="$(read_link_target "$root" current)"
+  previous="$(read_link_target "$root" previous)"
+
+  local g title created image is_current is_previous
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    title="$(manifest_get "$(gen_dir "$root" "$g")/manifest" GEN_TITLE)"
+    created="$(manifest_get "$(gen_dir "$root" "$g")/manifest" GEN_CREATED)"
+    image="$(manifest_get "$(gen_dir "$root" "$g")/manifest" GEN_ROOTFS_IMAGE)"
+    is_current=no; [ "$g" = "$current" ] && is_current=yes
+    is_previous=no; [ "$g" = "$previous" ] && is_previous=yes
+
+    if [ "$porcelain" = 1 ]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$g" "$title" "$created" "$image" "$is_current" "$is_previous"
+    else
+      local marker=""
+      [ "$is_current" = yes ] && marker=" (current)"
+      [ "$is_previous" = yes ] && marker="$marker (previous)"
+      printf '%-6s %-24s %-24s%s\n' "$g" "$title" "$created" "$marker"
+    fi
+  done < <(existing_gens "$root")
+}
+
+# =====================================================================
+# emit-grub-list
+# =====================================================================
+
+cmd_emit_grub_list_usage() {
+  cat <<USAGE
+usage: ubx-generations emit-grub-list [--root DIR] --out FILE
+         (--select N[,N...] | --retain COUNT|all --booted N [--previous N])
+
+Renders the selected generations into the exact six-TAB-field shape
+bin/ubx-gen-grub-cfg consumes (index, title, kernelPath, initrdPath,
+rootDevice, kernelParams — kernelParams verbatim to end of line). --out -
+writes to stdout.
+
+Selection is either an explicit --select list, or computed the same way
+prune-plan computes retention (--retain/--booted/--previous — see that
+command's help for the retention algorithm).
+
+Ordering: the on-disk "current" generation (see this script's header for
+what "current" means here) first if it is part of the selection, then the
+rest of the selection newest-first (descending by index). This puts the
+generation this tooling most recently produced at the top of the GRUB
+menu (the natural default-highlighted entry) with everything else in
+reverse-chronological order beneath it — bin/ubx-gen-grub-cfg itself never
+reorders (see its header), so this script is the sole place this policy
+is expressed.
+USAGE
+}
+
+cmd_emit_grub_list() {
+  local root
+  root="$(default_root)"
+  local out="" select="" retain="" booted="" previous=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      --select) [ $# -ge 2 ] || die "--select requires an argument"; select="$2"; shift 2 ;;
+      --retain) [ $# -ge 2 ] || die "--retain requires an argument"; retain="$2"; shift 2 ;;
+      --booted) [ $# -ge 2 ] || die "--booted requires an argument"; booted="$2"; shift 2 ;;
+      --previous) [ $# -ge 2 ] || die "--previous requires an argument"; previous="$2"; shift 2 ;;
+      -h | --help) cmd_emit_grub_list_usage; exit 0 ;;
+      *) echo "$prog_name: emit-grub-list: unknown option: $1" >&2; cmd_emit_grub_list_usage >&2; exit 2 ;;
+    esac
+  done
+
+  [ -n "$out" ] || die "emit-grub-list: --out is required"
+  if [ -n "$select" ] && [ -n "$retain" ]; then
+    die "emit-grub-list: --select and --retain are mutually exclusive"
+  fi
+  if [ -z "$select" ] && [ -z "$retain" ]; then
+    die "emit-grub-list: one of --select or --retain is required"
+  fi
+
+  local -a selected=()
+  if [ -n "$select" ]; then
+    local IFS=,
+    read -r -a selected <<< "$select"
+    unset IFS
+    local g
+    for g in "${selected[@]}"; do
+      is_uint "$g" || die "emit-grub-list: --select entries must be non-negative integers, got: $g"
+      gen_exists "$root" "$g" || die "emit-grub-list: selected generation does not exist: $g"
+    done
+  else
+    [ -n "$booted" ] || die "emit-grub-list: --retain requires --booted"
+    validate_retain "$retain"
+    gen_exists "$root" "$booted" || die "emit-grub-list: --booted generation does not exist: $booted"
+    if [ -n "$previous" ]; then
+      gen_exists "$root" "$previous" || die "emit-grub-list: --previous generation does not exist: $previous"
+    fi
+    while IFS= read -r g; do [ -n "$g" ] && selected+=("$g"); done \
+      < <(compute_retained "$root" "$retain" "$booted" "$previous")
+  fi
+
+  local current
+  current="$(read_link_target "$root" current)"
+
+  # Order: current first (if selected), then the rest descending.
+  local -a ordered=()
+  local in_selection=0 g
+  for g in "${selected[@]}"; do [ "$g" = "$current" ] && in_selection=1; done
+  [ "$in_selection" = 1 ] && ordered+=("$current")
+  local -a rest_desc=()
+  while IFS= read -r g; do [ -n "$g" ] && rest_desc+=("$g"); done \
+    < <(printf '%s\n' "${selected[@]}" | sort -rn)
+  for g in "${rest_desc[@]}"; do
+    [ "$g" = "$current" ] && [ "$in_selection" = 1 ] && continue
+    ordered+=("$g")
+  done
+
+  render_line() {
+    local gen="$1" mf title kernel initrd device params
+    mf="$(gen_dir "$root" "$gen")/manifest"
+    title="$(manifest_get "$mf" GEN_TITLE)"
+    kernel="$(manifest_get "$mf" GEN_KERNEL_PATH)"
+    initrd="$(manifest_get "$mf" GEN_INITRD_PATH)"
+    device="$(manifest_get "$mf" GEN_ROOT_DEVICE)"
+    params="$(manifest_get "$mf" GEN_KERNEL_PARAMS)"
+    for v in "$gen" "$title" "$kernel" "$initrd" "$device" "$params"; do
+      check_single_line "generation $gen field" "$v"
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$gen" "$title" "$kernel" "$initrd" "$device" "$params"
+  }
+
+  if [ "$out" = - ]; then
+    for g in "${ordered[@]}"; do render_line "$g"; done
+  else
+    local tmp
+    tmp="$(mktemp "$(dirname "$out")/.emit-grub-list.XXXXXX")"
+    for g in "${ordered[@]}"; do render_line "$g"; done > "$tmp"
+    mv -f "$tmp" "$out"
+  fi
+}
+
+# =====================================================================
+# prune-plan
+# =====================================================================
+
+cmd_prune_plan_usage() {
+  cat <<USAGE
+usage: ubx-generations prune-plan [--root DIR] --retain COUNT|all
+         --booted N [--previous N]
+
+Prints the generation numbers a retention policy would DROP, one per
+line, ascending — planning only, nothing is deleted.
+
+Retention (SPEC.md §4.3): keep the newest COUNT generations, plus booted
+and previous, ALWAYS, regardless of count (including COUNT=0, and
+regardless of whether booted/previous are among the newest COUNT).
+COUNT=all keeps everything (nothing is ever dropped).
+
+--previous may be omitted (e.g. only one generation has ever existed).
+USAGE
+}
+
+cmd_prune_plan() {
+  local root
+  root="$(default_root)"
+  local retain="" booted="" previous=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --retain) [ $# -ge 2 ] || die "--retain requires an argument"; retain="$2"; shift 2 ;;
+      --booted) [ $# -ge 2 ] || die "--booted requires an argument"; booted="$2"; shift 2 ;;
+      --previous) [ $# -ge 2 ] || die "--previous requires an argument"; previous="$2"; shift 2 ;;
+      -h | --help) cmd_prune_plan_usage; exit 0 ;;
+      *) echo "$prog_name: prune-plan: unknown option: $1" >&2; cmd_prune_plan_usage >&2; exit 2 ;;
+    esac
+  done
+
+  [ -n "$retain" ] || die "prune-plan: --retain is required"
+  [ -n "$booted" ] || die "prune-plan: --booted is required"
+  validate_retain "$retain"
+  gen_exists "$root" "$booted" || die "prune-plan: --booted generation does not exist: $booted"
+  if [ -n "$previous" ]; then
+    gen_exists "$root" "$previous" || die "prune-plan: --previous generation does not exist: $previous"
+  fi
+
+  compute_dropped "$root" "$retain" "$booted" "$previous"
+}
+
+# =====================================================================
+# gc-plan
+# =====================================================================
+
+cmd_gc_plan_usage() {
+  cat <<USAGE
+usage: ubx-generations gc-plan [--root DIR]
+         (--select N[,N...] | --retain COUNT|all --booted N [--previous N])
+
+Enumerates every store-path reference named by ANY existing generation's
+manifest (the GEN_ROOTFS_IMAGE/GEN_KERNEL_PATH/GEN_INITRD_PATH/GEN_ETC_REF/
+GEN_USERS_MANIFEST/GEN_SNAP_MANIFEST fields — see this script's header for
+why exactly these), cross-references each against the RETAINED set (same
+selection as emit-grub-list: explicit --select, or computed via
+--retain/--booted/--previous), and prints one line per reference:
+
+  STATUS<TAB>PATH<TAB>REFERRING_GENERATIONS
+
+STATUS is KEEP if any retained generation's manifest references PATH
+(the artifact stays alive — including when a generation ABOUT to be
+dropped shares it with a retained one), else COLLECT.
+REFERRING_GENERATIONS is a comma-joined, ascending list of every existing
+generation (retained or not) that references PATH — planning only,
+nothing is deleted.
+USAGE
+}
+
+cmd_gc_plan() {
+  local root
+  root="$(default_root)"
+  local select="" retain="" booted="" previous=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --select) [ $# -ge 2 ] || die "--select requires an argument"; select="$2"; shift 2 ;;
+      --retain) [ $# -ge 2 ] || die "--retain requires an argument"; retain="$2"; shift 2 ;;
+      --booted) [ $# -ge 2 ] || die "--booted requires an argument"; booted="$2"; shift 2 ;;
+      --previous) [ $# -ge 2 ] || die "--previous requires an argument"; previous="$2"; shift 2 ;;
+      -h | --help) cmd_gc_plan_usage; exit 0 ;;
+      *) echo "$prog_name: gc-plan: unknown option: $1" >&2; cmd_gc_plan_usage >&2; exit 2 ;;
+    esac
+  done
+
+  if [ -n "$select" ] && [ -n "$retain" ]; then
+    die "gc-plan: --select and --retain are mutually exclusive"
+  fi
+  if [ -z "$select" ] && [ -z "$retain" ]; then
+    die "gc-plan: one of --select or --retain is required"
+  fi
+
+  # Named retained_list (not "retained") deliberately: compute_retained/
+  # compute_dropped above each have their OWN function-scoped `local -A
+  # retained` (associative) — a same-named indexed array here is harmless
+  # at runtime (bash's `local` is scoped per function invocation) but
+  # confuses shellcheck's cross-function static analysis into flagging
+  # `retained+=(...)` as if it might be associative (SC2190).
+  local -a retained_list=()
+  if [ -n "$select" ]; then
+    local IFS=,
+    read -r -a retained_list <<< "$select"
+    unset IFS
+    local g
+    for g in "${retained_list[@]}"; do
+      is_uint "$g" || die "gc-plan: --select entries must be non-negative integers, got: $g"
+      gen_exists "$root" "$g" || die "gc-plan: selected generation does not exist: $g"
+    done
+  else
+    [ -n "$booted" ] || die "gc-plan: --retain requires --booted"
+    validate_retain "$retain"
+    gen_exists "$root" "$booted" || die "gc-plan: --booted generation does not exist: $booted"
+    if [ -n "$previous" ]; then
+      gen_exists "$root" "$previous" || die "gc-plan: --previous generation does not exist: $previous"
+    fi
+    while IFS= read -r g; do [ -n "$g" ] && retained_list+=("$g"); done \
+      < <(compute_retained "$root" "$retain" "$booted" "$previous")
+  fi
+
+  local -A retained_set=()
+  local g
+  for g in "${retained_list[@]}"; do retained_set["$g"]=1; done
+
+  # path -> space-separated ascending list of every referencing generation
+  local -A referrers=()
+  local path
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      referrers["$path"]="${referrers[$path]:-} $g"
+    done < <(gen_refs "$root" "$g")
+  done < <(existing_gens "$root")
+
+  for path in $(printf '%s\n' "${!referrers[@]}" | sort); do
+    local refs="${referrers[$path]}" status=COLLECT r
+    for r in $refs; do
+      [ -n "${retained_set[$r]:-}" ] && { status=KEEP; break; }
+    done
+    local joined
+    # shellcheck disable=SC2086  # intentional word-splitting to trim/rejoin
+    joined="$(echo $refs | tr ' ' '\n' | sort -n | paste -sd, -)"
+    printf '%s\t%s\t%s\n' "$status" "$path" "$joined"
+  done
+}
+
+# =====================================================================
+# rollback-target
+# =====================================================================
+
+cmd_rollback_target_usage() {
+  cat <<USAGE
+usage: ubx-generations rollback-target (previous|N) [--root DIR]
+         [--retain COUNT|all] [--booted N] [--previous N]
+
+Resolves "previous" (the on-disk previous pointer) or an explicit N to a
+concrete generation number, validating that it exists AND is retained
+under the given (or defaulted) retention policy — a generation that
+exists on disk but is no longer retained may already have had its store
+artifacts GC'd, so rolling back to it is not guaranteed to work offline.
+
+Defaults (convenience for ad hoc/manual use — see this script's header,
+"current vs. booted", for why these are defaults and not the real booted
+generation): --retain defaults to 5 (SPEC.md §4.3's default);
+--booted/--previous default to the on-disk current/previous pointers.
+
+Prints the resolved generation number to stdout on success.
+USAGE
+}
+
+cmd_rollback_target() {
+  local root
+  root="$(default_root)"
+  local target_arg="" retain=5 booted="" previous=""
+  local booted_set=0 previous_set=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --retain) [ $# -ge 2 ] || die "--retain requires an argument"; retain="$2"; shift 2 ;;
+      --booted) [ $# -ge 2 ] || die "--booted requires an argument"; booted="$2"; booted_set=1; shift 2 ;;
+      --previous) [ $# -ge 2 ] || die "--previous requires an argument"; previous="$2"; previous_set=1; shift 2 ;;
+      -h | --help) cmd_rollback_target_usage; exit 0 ;;
+      *)
+        if [ -z "$target_arg" ]; then
+          target_arg="$1"
+          shift
+        else
+          echo "$prog_name: rollback-target: unknown option: $1" >&2
+          cmd_rollback_target_usage >&2
+          exit 2
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$target_arg" ] || { cmd_rollback_target_usage >&2; exit 2; }
+  validate_retain "$retain"
+
+  local target
+  if [ "$target_arg" = previous ]; then
+    target="$(read_link_target "$root" previous)"
+    [ -n "$target" ] || die "rollback-target: no previous generation recorded at $root/previous"
+  else
+    is_uint "$target_arg" || die "rollback-target: target must be 'previous' or a non-negative integer, got: $target_arg"
+    target="$target_arg"
+  fi
+
+  gen_exists "$root" "$target" || die "rollback-target: generation does not exist: $target"
+
+  [ "$booted_set" = 1 ] || booted="$(read_link_target "$root" current)"
+  [ "$previous_set" = 1 ] || previous="$(read_link_target "$root" previous)"
+  if [ "$booted_set" = 1 ] && [ -n "$booted" ]; then
+    gen_exists "$root" "$booted" || die "rollback-target: --booted generation does not exist: $booted"
+  fi
+  if [ "$previous_set" = 1 ] && [ -n "$previous" ]; then
+    gen_exists "$root" "$previous" || die "rollback-target: --previous generation does not exist: $previous"
+  fi
+
+  local -A retained_set=()
+  local g
+  while IFS= read -r g; do [ -n "$g" ] && retained_set["$g"]=1; done \
+    < <(compute_retained "$root" "$retain" "$booted" "$previous")
+
+  [ -n "${retained_set[$target]:-}" ] || die "rollback-target: generation $target exists but is not retained (retain=$retain, booted=${booted:-<none>}, previous=${previous:-<none>}) — its store artifacts may already be gone"
+
+  echo "$target"
+}
+
+# =====================================================================
+# main
+# =====================================================================
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    -h | --help | "" | help)
+      usage
+      [ "$cmd" = "" ] && exit 2
+      exit 0
+      ;;
+    create) shift; cmd_create "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    emit-grub-list) shift; cmd_emit_grub_list "$@" ;;
+    prune-plan) shift; cmd_prune_plan "$@" ;;
+    gc-plan) shift; cmd_gc_plan "$@" ;;
+    rollback-target) shift; cmd_rollback_target "$@" ;;
+    *)
+      echo "$prog_name: unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

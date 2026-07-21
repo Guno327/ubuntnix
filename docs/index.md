@@ -44,6 +44,9 @@ milestone plan.
 - {doc}`guards` — the apt/dpkg/snap mutation guards: what they block, what
   they pass through, and why (guard scripts implemented and unit-tested in
   M2; wiring them into the composed image is separate, deferred work).
+- {doc}`generations` — the generation model: on-disk layout, numbering,
+  retention, and GC planning (planner implemented in M2; activation and
+  deletion land later).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -57,5 +60,6 @@ modules
 workflows
 archive
 guards
+generations
 reference/index
 ```

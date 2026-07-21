@@ -227,26 +227,123 @@ jobs:
       # redo the build (ignoring the already-valid output from the step
       # above) and fails loudly with a diff-bearing error if the two
       # outputs differ. Per R1 and this issue's own guidance, byte-identical
-      # reproducibility is a goal this file works toward (mtime
-      # normalization, dpkg.log removal, single-threaded mksquashfs) but has
-      # NOT been independently verified byte-for-byte here before now --
-      # this step is what actually proves or disproves it. If it diverges,
-      # document the divergence and keep the job green rather than block M1
-      # on a risk SPEC.md already tracks as open; a future issue should
-      # follow up on any divergence this surfaces.
+      # reproducibility is a goal nix/compose.nix works toward (mtime
+      # normalization, dpkg.log removal, single-threaded mksquashfs,
+      # deterministic dpkg --unpack ordering, PERL_HASH_SEED pinning, a
+      # canonical final ldconfig run, and cache-file deletion -- see that
+      # file's own R1 inventory comment) but has NOT been independently
+      # verified byte-for-byte here before now -- this step is what
+      # actually proves or disproves it. If it diverges, capture and upload
+      # a precise recursive diff (issue #22) and keep the job green rather
+      # than block M1 on a risk SPEC.md already tracks as open; a future
+      # issue should follow up on any divergence this surfaces, and the PM
+      # is expected to flip this step from warn-only to failing once a
+      # clean run lands.
+      #
+      # `--keep-failed` (`-K`): per the Nix reference manual's "Verifying
+      # Build Reproducibility" page, a `--rebuild` (new CLI) of an
+      # already-valid output is the same "rebuild + compare" mechanism the
+      # legacy `nix-build --check` documents -- when the rebuilt output
+      # differs from the original AND `-K` is given, Nix leaves the
+      # differing second build's result at "<original-output-path>.check"
+      # rather than discarding it, instead of the generic "failed build's
+      # /tmp directory" `-K` gives an ordinary build failure. That
+      # documented ".check" path is the PRIMARY thing this step looks for
+      # below. Treated as a documented assumption, not a certainty, for the
+      # same reason nix/compose.nix's own HARDENING comment treats its
+      # user-namespace assumption that way: this repository's dev harness
+      # cannot run `nix` at all (see nix/compose.nix's header), so this
+      # exact `nix build --rebuild -K` (as opposed to the legacy
+      # `nix-build --check -K` the manual actually documents) has not been
+      # observed in this project's own CI before now. If Nix instead keeps
+      # the differing build somewhere else, the fallback `grep` over
+      # determinism.log's own text below is what catches that case instead.
       - name: Two-run determinism check (compose-proof --rebuild)
         run: |
           set +e
-          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-proof --rebuild -L >determinism.log 2>&1
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#compose-proof --rebuild --keep-failed -L >determinism.log 2>&1
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
             echo "compose-proof rebuilt bit-for-bit identically across two independent builds (SPEC.md §12 R1: no divergence observed this run)."
-          else
-            echo "::warning::compose-proof did NOT reproduce bit-for-bit across two independent builds (SPEC.md §12 R1 tracked risk)."
-            echo "-- documenting the divergence per this issue's CI guidance rather than failing the job --"
-            cat determinism.log
+            exit 0
           fi
+
+          echo "::warning::compose-proof did NOT reproduce bit-for-bit across two independent builds (SPEC.md §12 R1 tracked risk)."
+          echo "-- documenting the divergence per this issue's CI guidance rather than failing the job --"
+          cat determinism.log
+
+          # The FIRST build's own output path: the `-o result-compose-proof`
+          # symlink the "Build compose-proof" step above created still
+          # points at it -- a failed --rebuild determinism check never
+          # replaces the already-registered valid path with the differing
+          # one, so this symlink is unaffected by the failure above.
+          orig=""
+          if [ -e result-compose-proof ]; then
+            orig=$(readlink -f result-compose-proof || true)
+          fi
+
+          # Where the differing SECOND build's output might be:
+          #   1. the documented -K "<orig>.check" path (primary case, see
+          #      this step's own header comment);
+          #   2. anything determinism.log itself names, parsed defensively
+          #      in case (1)'s exact naming doesn't hold on this Nix
+          #      version/runner.
+          candidate=""
+          if [ -n "$orig" ] && sudo test -e "${orig}.check"; then
+            candidate="${orig}.check"
+          fi
+          if [ -z "$candidate" ]; then
+            candidate=$(grep -oE "/nix/store/[^[:space:]'\"]+\.check" determinism.log | head -1)
+          fi
+          if [ -z "$candidate" ] && [ -n "$orig" ]; then
+            # Last resort: any /nix/store/... path mentioned in the log
+            # that ISN'T the original output path itself -- covers a kept
+            # /tmp build directory being reported some other way, or a
+            # differently-named ".check"-less kept path.
+            candidate=$(grep -oE "/nix/store/[^[:space:]'\"]+" determinism.log | grep -vF "$orig" | sort -u | tail -1)
+          fi
+
+          if [ -n "$candidate" ] && [ -n "$orig" ] && sudo test -e "$candidate" && sudo test -e "$orig"; then
+            echo "-- determinism divergence: comparing $orig (build 1) vs $candidate (build 2) --"
+            {
+              echo "build 1 (first, already-registered): $orig"
+              echo "build 2 (second, differing rebuild):  $candidate"
+              echo
+              echo "-- file-level summary (diff -rq) --"
+              sudo diff -rq --no-dereference "$orig" "$candidate"
+            } >determinism-summary.txt 2>&1 || true
+            sudo diff -r --no-dereference "$orig" "$candidate" >determinism-full.diff 2>&1 || true
+            sudo chown "$USER" determinism-summary.txt determinism-full.diff || true
+            echo "-- summary (see uploaded determinism-diff artifact for the full recursive diff) --"
+            cat determinism-summary.txt
+          else
+            echo "could not locate the second (differing) build's output path to diff -- see determinism.log above for whatever Nix itself reported." \
+              | tee determinism-summary.txt
+          fi
+          exit 0
+      # Uploaded regardless of the outcome above (`if: always()`): the log
+      # is useful even on a clean run (confirms `-K` didn't change
+      # anything observable), and the diff files only exist at all when a
+      # divergence was actually captured -- `if-no-files-found: ignore` on
+      # both keeps that expected "nothing to upload" case from itself
+      # becoming a spurious failure.
+      - name: Upload determinism log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-log
+          path: determinism.log
+          if-no-files-found: ignore
+      - name: Upload determinism diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-diff
+          path: |
+            determinism-summary.txt
+            determinism-full.diff
+          if-no-files-found: ignore
 
   resolve:
     name: Archive resolution (apt solver, end-to-end)

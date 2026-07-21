@@ -103,15 +103,32 @@ sed -n "/<<'UBX_INNER_EOF'\$/,/UBX_INNER_EOF\$/p" "$compose_nix" | sed '1d;$d' >
 # in prose (e.g. "... the template file dpkg --unpack just registered") —
 # a bare `grep 'dpkg --unpack'` would find the comment first and report a
 # too-early line number, defeating the ordering check entirely.
+#
+# Since GitHub issue #22 (R1 determinism), the unpack step is no longer a
+# literal `for deb in *.deb; do dpkg --unpack "$deb"; done` glob loop
+# inline in this heredoc — it's the single interpolated placeholder
+# `${unpackLines}`, a Nix `let` binding (defined alongside `debCopyLines`
+# in nix/compose.nix, exercised separately in tests/unit/062) that
+# expands, at EVAL time, to one explicit `dpkg --unpack ".../N.deb"` line
+# per declared package in declaration order — see that file's own inline
+# R1 comment for why (pinning unpack order off Nix's own list, not shell/
+# filesystem glob-matching behavior). This static extraction only ever
+# sees the un-evaluated Nix source text, so it must look for the
+# placeholder itself, not its expansion.
 # shellcheck disable=SC2016 # single-quoted on purpose: matching a literal
-# "$deb" shell-variable-looking substring in the extracted script text, not
+# Nix ${...} interpolation substring in the extracted script text, not
 # expanding it in THIS (the test's own) shell.
-unpack_line=$(grep -n 'dpkg --unpack "\$deb"' "$configure_sh" | head -1 | cut -d: -f1)
+unpack_line=$(grep -n '\${unpackLines}' "$configure_sh" | head -1 | cut -d: -f1)
 selections_line=$(grep -n 'debconf-set-selections /.ubx-compose/preseed.selections' "$configure_sh" | head -1 | cut -d: -f1)
-configure_line=$(grep -n 'dpkg --configure -a' "$configure_sh" | head -1 | cut -d: -f1)
+# Anchored on end-of-line ($): nix/compose.nix's own R1 comment (issue
+# #22) now mentions "dpkg --configure -a" in PROSE too (of the ldconfig
+# re-run's rationale) — an unanchored match would find that comment first
+# and report a too-early line number, same class of bug this whole block
+# already guards the unpack/selections lines against.
+configure_line=$(grep -n 'dpkg --configure -a$' "$configure_sh" | head -1 | cut -d: -f1)
 
 if [ -z "$unpack_line" ] || [ -z "$selections_line" ] || [ -z "$configure_line" ]; then
-  fail "$compose_nix's in-chroot script is missing one of: dpkg --unpack, debconf-set-selections, dpkg --configure"
+  fail "$compose_nix's in-chroot script is missing one of: \${unpackLines}, debconf-set-selections, dpkg --configure"
 else
   [ "$unpack_line" -lt "$selections_line" ] ||
     fail "$compose_nix does not dpkg --unpack (line $unpack_line) BEFORE debconf-set-selections (line $selections_line) — preseeding would run before any package's templates are registered"

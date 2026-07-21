@@ -41,7 +41,11 @@
 #
 # Maintainer-script nondeterminism is a TRACKED RISK (R1), not a solved
 # problem — this file normalizes what is reasonably normalizable at
-# compose time and documents what it cannot:
+# compose time and documents what it cannot. GitHub issue #22 (`nix build
+# --rebuild .#compose-proof` observed non-reproducible) re-audited every
+# suspect below individually; each decision's reasoning also lives inline
+# at the point in `composeRootfs`'s script where it's implemented, so this
+# list is a summary/index, not the only copy of the reasoning.
 #
 #   NORMALIZED here:
 #     - every file/directory mtime in the composed tree is reset to the
@@ -56,16 +60,70 @@
 #       `-processors 1` (mksquashfs's parallel block-compression path is a
 #       documented source of nondeterministic block ordering with >1
 #       worker — this is standard practice for reproducible squashfs
-#       builds, e.g. Debian's live-build).
+#       builds, e.g. Debian's live-build);
+#     - (issue #22) `dpkg --unpack` runs in an EXPLICIT order generated
+#       from the Nix-side `packages` list (see `unpackLines` below),
+#       rather than a shell glob over `/.ubx-compose/debs/*.deb` — a glob
+#       is deterministic FOR A FIXED SET OF FILENAMES, but is a needless
+#       dependency on filesystem/locale globbing behavior for something
+#       Nix already knows the intended order of, and does not sort
+#       numerically past 9 entries (`10.deb` < `2.deb` lexically). Since
+#       dpkg appends each newly-unpacked package's stanza to
+#       /var/lib/dpkg/status (and creates /var/lib/dpkg/info/<pkg>.* ) in
+#       unpack order, pinning this order also pins those files' content —
+#       likely fixing several of the suspects issue #22 enumerated (status
+#       ordering, info database) as a side effect of fixing just this one
+#       thing;
+#     - (issue #22) `PERL_HASH_SEED=0 PERL_PERTURB_KEYS=0` is exported for
+#       the whole in-chroot configuration run — Perl (since 5.18) randomizes
+#       hash-key iteration order per process by default specifically to
+#       harden against algorithmic-complexity attacks; any Perl program
+#       that serializes `keys %hash` without an explicit sort (debconf's
+#       own DbDriver::File config/templates writer is the leading suspect
+#       here, and the `debconf` package IS present in this project's
+#       locked archive set — see archive.lock.json) can therefore write
+#       differently-ordered output across independent process invocations
+#       even given byte-identical input. Pinning the seed is a standard,
+#       safe mitigation for exactly this reproducibility class (used by
+#       Debian's own reproducible-builds effort) — it changes iteration
+#       ORDER only, never a correct Perl program's externally observable
+#       behavior;
+#     - (issue #22) a canonical, explicit final `ldconfig` re-run, plus
+#       deletion of `/var/cache/ldconfig/aux-cache` (a pure stat()-time
+#       change-detection cache — see the inline comment at its `rm -f` for
+#       why its very existence embeds this build's own real, pre-epoch-
+#       reset directory timestamps) and `/var/cache/debconf/*.dat-old`
+#       (debconf's own crash-recovery backups of files this same build
+#       already wrote, read by nothing at runtime).
 #   NOT normalized, DOCUMENTED as a known residual risk:
 #     - /var/cache/debconf/{config,templates}.dat — debconf's own on-disk
 #       database. Content should be a deterministic function of the
-#       packages unpacked and the preseed answers given, but this file has
-#       not verified byte-for-byte stability of ITS internal record
-#       ordering (a Perl-hash-iteration-order question) across independent
-#       builds; the two-run CI comparison (SPEC.md R1's own mitigation) is
-#       what actually proves or disproves this in practice, not this
+#       packages unpacked and the preseed answers given, and issue #22's
+#       PERL_HASH_SEED pinning above is a real (if unproven) attempt at
+#       fixing its most likely nondeterminism source, but this file still
+#       has NOT independently verified byte-for-byte stability of its
+#       on-disk record ordering across two independent builds; the two-run
+#       CI comparison (SPEC.md R1's own mitigation, now with a precise
+#       recursive-diff artifact on failure — see .github/workflows/ci.yml)
+#       is what actually proves or disproves this in practice, not this
 #       comment.
+#     - /etc/ld.so.cache — regenerated deterministically-if-achievable by
+#       the explicit final `ldconfig` re-run above, but whether that
+#       actually yields byte-identical output across two independent
+#       builds depends on whether this Ubuntu release's `ldconfig` sorts
+#       its cache entries before writing (a known, Debian-patched fix for
+#       exactly this reproducibility class) versus still reflecting raw
+#       directory-scan order (which this file's own dev harness cannot
+#       verify either way — no `nix` binary, see this file's header).
+#       DELIBERATELY NOT DELETED here even though `glibc` falls back to a
+#       slower-but-correct path search when the cache is absent (a real,
+#       always-available fallback): deleting a file every real Ubuntu
+#       install ships is a bigger behavioral step than re-running the tool
+#       that already writes it, so this file tries the smaller step first.
+#       Loud flag for whoever picks this up next: if the CI determinism
+#       diff artifact keeps naming /etc/ld.so.cache after this change,
+#       switch to deleting it here instead (that one-line follow-up is the
+#       documented fallback, not a mystery to re-derive).
 #     - any maintainer script that embeds genuinely random or
 #       machine-specific data into a file it manages (SSH host keys,
 #       D-Bus/systemd machine-id generation, ...) is categorically outside
@@ -188,6 +246,24 @@ let
           in ''ubxrun "$UBX_BASE/bin/cp" "${varRef}" "$out/.ubx-compose/debs/${toString i}.deb"'')
         indices);
 
+      # unpackLines — R1 determinism (issue #22): the in-chroot
+      # `dpkg --unpack` sequence, spelled out explicitly in the SAME order
+      # as `checked`/`debCopyLines` above, one absolute-path invocation per
+      # declared package, rather than a shell `for deb in
+      # /.ubx-compose/debs/*.deb` glob loop. A glob over these
+      # index-named files is deterministic for a FIXED set of filenames,
+      # but ties unpack order to filesystem/locale glob-matching behavior
+      # (and sorts lexically, not numerically, past 9 packages —
+      # "10.deb" < "2.deb") for something Nix already knows the intended
+      # order of. This is spliced into configure.sh's `UBX_INNER_EOF`
+      # heredoc body exactly like `debCopyLines`/`preseedText` are spliced
+      # into the outer pre-chroot script — Nix's `${...}` interpolation
+      # doesn't care that the surrounding shell text happens to be a
+      # quoted heredoc; only the value of this Nix `let` binding matters.
+      unpackLines = builtins.concatStringsSep "\n" (map
+        (i: ''dpkg --unpack "/.ubx-compose/debs/${toString i}.deb"'')
+        indices);
+
       preseedText = renderPreseed preseed;
     in
     runInUbuntuBase {
@@ -276,6 +352,24 @@ let
         export DEBCONF_NONINTERACTIVE_SEEN=true
         export LC_ALL=C LANG=C
 
+        # R1 determinism (issue #22): pin Perl's per-process hash-iteration
+        # randomization (perlsec(1); default since Perl 5.18, a
+        # hardening measure against algorithmic-complexity attacks, not a
+        # correctness feature). Any Perl program below that serializes
+        # `keys %hash` without an explicit sort — debconf's own
+        # DbDriver::File config/templates writer (`debconf` is in this
+        # project's locked archive set) is the leading suspect — can
+        # otherwise write differently-ordered records across independent
+        # process invocations even given byte-identical input. Exported
+        # here, at the top of this whole in-chroot run, so it also covers
+        # every maintainer script `dpkg --configure -a` (below) invokes,
+        # not just the explicit `debconf-set-selections` call — none of
+        # those scripts re-export it themselves. This changes hash
+        # ITERATION ORDER only; it can never change what a correct Perl
+        # program computes or writes as DATA, only the order in which
+        # order-insensitive data (hash keys) comes out.
+        export PERL_HASH_SEED=0 PERL_PERTURB_KEYS=0
+
         # /dev was prepared BEFORE this chroot, by enter.sh (see below):
         # bind mounts of the outer build sandbox's own device nodes onto
         # plain-file mountpoints under $out/dev. mknod is NOT an option
@@ -300,10 +394,17 @@ let
         # the template the package itself just registered. This mirrors
         # the standard debootstrap/provisioning idiom: unpack everything,
         # seed debconf, THEN configure everything.
-        for deb in /.ubx-compose/debs/*.deb; do
-          [ -e "$deb" ] || continue
-          dpkg --unpack "$deb"
-        done
+        #
+        # R1 determinism (issue #22): this is an EXPLICIT, Nix-generated
+        # list of `dpkg --unpack` invocations (`unpackLines`, defined
+        # alongside `debCopyLines` above), in exactly the order `packages`
+        # was declared — not a `for deb in *.deb` shell glob. dpkg appends
+        # each newly-unpacked package's stanza to /var/lib/dpkg/status (and
+        # creates /var/lib/dpkg/info/<pkg>.*) in unpack order, so pinning
+        # this order also pins those files' content, independent of
+        # whatever filesystem/locale glob-matching behavior would
+        # otherwise apply.
+        ${unpackLines}
 
         # Expand the 3-field preseed records into debconf-set-selections'
         # required 4-field form ("owner question type value") by looking
@@ -341,6 +442,48 @@ let
         fi
 
         dpkg --configure -a
+
+        # R1 determinism (issue #22): canonical final `ldconfig`
+        # regeneration. libc6's own postinst/triggers already invoke
+        # ldconfig automatically, one or more times, as part of
+        # `dpkg --configure -a` above; an extra, explicit, LAST invocation
+        # here collapses that into one canonical run over the fully-
+        # configured tree's final library set — the closest this file can
+        # get to a reproducible /etc/ld.so.cache without reimplementing
+        # ldconfig's own cache-writing logic. Unconditionally SAFE (cannot
+        # change composed-system behavior): ldconfig is explicitly designed
+        # to be re-run at any time and is idempotent over a fixed library
+        # set. It is a best-EFFORT fix, not a proof — see this file's
+        # header "NOT normalized" note on /etc/ld.so.cache for the
+        # documented fallback (delete it) if the two-run CI comparison
+        # still flags this file afterward.
+        ldconfig
+
+        # R1 determinism (issue #22): ldconfig's OWN change-detection cache
+        # (distinct from /etc/ld.so.cache above) — a pure performance
+        # optimization recording the mtime/inode metadata ldconfig observed
+        # on its library search-path directories, consulted only to decide
+        # whether a FUTURE ldconfig run can skip rescanning them. Its
+        # content is therefore literally a transcript of THIS build's own
+        # real (pre-epoch-reset) directory stat() results — exactly the
+        # kind of build-specific data R1 targets — and it carries no
+        # configuration-relevant information: deleting it just means the
+        # next ldconfig invocation (at first real boot, or an admin's) does
+        # one full rescan instead of a skip, which is what every fresh
+        # Ubuntu install already does anyway (the cache doesn't exist until
+        # ldconfig has run once). `-f`: present or not depending on exactly
+        # which triggers ran above.
+        rm -f /var/cache/ldconfig/aux-cache
+
+        # R1 determinism (issue #22): debconf's OWN backup copies of
+        # config.dat/templates.dat (written before debconf overwrites the
+        # live file, for crash recovery) — pure backups of a database this
+        # same build just wrote moments earlier, read by nothing at
+        # runtime. The live *.dat files themselves are NOT touched here —
+        # see this file's header "NOT normalized" note for why (accepted
+        # residual risk, mitigated but not proven by the PERL_HASH_SEED
+        # pin above).
+        rm -f /var/cache/debconf/*.dat-old
 
         # Compose-time staging is not part of the composed system.
         rm -rf /.ubx-compose

@@ -51,6 +51,8 @@ milestone plan.
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands
   later).
+- {doc}`boot` — kernel selection, GRUB generation machinery, and the
+  bootable disk image (implemented in M1).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -67,5 +69,6 @@ guards
 generations
 users
 etc
+boot
 reference/index
 ```

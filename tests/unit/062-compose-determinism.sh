@@ -31,9 +31,10 @@
 #
 # And on the CI side (.github/workflows/ci.yml's compose job):
 #
-#   - the determinism step still never fails the job outright (warn-only,
-#     per this issue's explicit ACCEPTANCE criterion — the PM flips it to
-#     strict later);
+#   - the determinism step is STRICT (flipped from warn-only after the
+#     first verifiably clean two-run rebuild landed with PR #34 — issue
+#     #22's own exit condition): a clean rebuild exits 0, a divergence
+#     captures its diff artifacts and then fails the job;
 #   - it now captures a recursive diff of the two build outputs on
 #     divergence and uploads it as a named CI artifact, via
 #     actions/upload-artifact@v4, alongside determinism.log itself.
@@ -152,7 +153,7 @@ grep -q '/etc/ld.so.cache' "$compose_nix" ||
   fail "$compose_nix's header comment does not document /etc/ld.so.cache's determinism status"
 
 # -- .github/workflows/ci.yml: the determinism step captures a diff on
-# divergence and uploads it, while staying warn-only -----------------------
+# divergence and uploads it, then fails the job (strict) -------------------
 grep -qE -- '--keep-failed|-K\b' "$ci_yml" ||
   fail "$ci_yml's determinism step does not pass --keep-failed/-K to nix build --rebuild"
 
@@ -174,8 +175,9 @@ grep -qE 'name: determinism-diff' "$ci_yml" ||
   fail "$ci_yml does not upload a determinism-diff artifact"
 
 # Both upload steps must run unconditionally (the divergence files only
-# exist SOMETIMES, but the upload step itself must not be skipped just
-# because the determinism-check step "succeeded" in the warn-only sense).
+# exist SOMETIMES, and now that the determinism-check step FAILS the job
+# on divergence, if: always() is what keeps the diagnosis artifacts
+# flowing on exactly the runs that need them most).
 determinism_log_block=$(awk '/- name: Upload determinism log/{p=1} p{print} p && /if-no-files-found:/{exit}' "$ci_yml")
 echo "$determinism_log_block" | grep -q 'if: always()' ||
   fail "the 'Upload determinism log' step is not guarded with if: always()"
@@ -188,22 +190,24 @@ echo "$determinism_diff_block" | grep -q 'if: always()' ||
 echo "$determinism_diff_block" | grep -q 'if-no-files-found: ignore' ||
   fail "the 'Upload determinism diff' step does not set if-no-files-found: ignore"
 
-# -- still warn-only: the determinism-check step's own run: block must not
-# contain a bare non-zero exit on the divergence path (the ONLY `exit 0`s
-# are expected; anything else ending the script on failure would flip this
-# step from warn-only to job-failing, contradicting this issue's own
-# ACCEPTANCE criterion). --------------------------------------------------
+# -- STRICT: the determinism-check step must exit 0 on the clean path AND
+# exit non-zero on the divergence path (issue #22's exit condition: the
+# step flipped from warn-only to failing once a clean two-run rebuild
+# landed; a step that could no longer fail would silently regress R1
+# coverage, and one that could no longer pass would block every PR). ------
 determinism_step_block=$(awk '
   /- name: Two-run determinism check/ { p = 1 }
   p { print }
   p && /- name: Upload determinism log/ { exit }
 ' "$ci_yml")
 
-if echo "$determinism_step_block" | grep -qE '^\s*exit\s+[1-9]'; then
-  fail "$ci_yml's determinism-check step appears to exit non-zero on some path — it must stay warn-only per this issue's ACCEPTANCE criterion"
-fi
+echo "$determinism_step_block" | grep -qE '^\s*exit\s+[1-9]' ||
+  fail "$ci_yml's determinism-check step never exits non-zero — divergence must fail the job (strict mode, issue #22)"
 
 echo "$determinism_step_block" | grep -q 'exit 0' ||
-  fail "$ci_yml's determinism-check step does not explicitly exit 0 (warn-only)"
+  fail "$ci_yml's determinism-check step does not explicitly exit 0 on the clean path"
+
+echo "$determinism_step_block" | grep -q '::error::' ||
+  fail "$ci_yml's determinism-check step does not emit a ::error:: annotation on divergence"
 
 exit "$fails"

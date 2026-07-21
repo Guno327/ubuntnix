@@ -19,7 +19,7 @@ fails=0
 fail() { echo "FAIL: $1" >&2; fails=$((fails + 1)); }
 
 work="$(mktemp -d)"
-# shellcheck disable=SC2329  # invoked indirectly via 'trap cleanup EXIT' below;
+# shellcheck disable=SC2329,SC2317  # invoked indirectly via 'trap cleanup EXIT' below;
 # a false positive in shellcheck 0.11's reachability analysis when a later
 # helper function also mutates a variable read by a trailing 'exit "$var"'.
 cleanup() { rm -rf "$work"; }

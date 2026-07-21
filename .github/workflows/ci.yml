@@ -233,12 +233,12 @@ jobs:
       # canonical final ldconfig run, and cache-file deletion -- see that
       # file's own R1 inventory comment) but has NOT been independently
       # verified byte-for-byte here before now -- this step is what
-      # actually proves or disproves it. If it diverges, capture and upload
-      # a precise recursive diff (issue #22) and keep the job green rather
-      # than block M1 on a risk SPEC.md already tracks as open; a future
-      # issue should follow up on any divergence this surfaces, and the PM
-      # is expected to flip this step from warn-only to failing once a
-      # clean run lands.
+      # actually proves or disproves it. STRICT MODE (issue #22, flipped
+      # after the first verifiably clean two-run rebuild landed with
+      # PR #34's normalizations — run 29799497402): a divergence now FAILS
+      # this job, after capturing and uploading a precise recursive diff
+      # so the failure is immediately diagnosable from the
+      # determinism-diff artifact alone.
       #
       # `--keep-failed` (`-K`): per the Nix reference manual's "Verifying
       # Build Reproducibility" page, a `--rebuild` (new CLI) of an
@@ -269,8 +269,8 @@ jobs:
             exit 0
           fi
 
-          echo "::warning::compose-proof did NOT reproduce bit-for-bit across two independent builds (SPEC.md §12 R1 tracked risk)."
-          echo "-- documenting the divergence per this issue's CI guidance rather than failing the job --"
+          echo "::error::compose-proof did NOT reproduce bit-for-bit across two independent builds (SPEC.md §12 R1 — strict since issue #22 closed)."
+          echo "-- capturing the divergence for the determinism-diff artifact, then failing the job --"
           cat determinism.log
 
           # The FIRST build's own output path: the `-o result-compose-proof`
@@ -321,7 +321,9 @@ jobs:
             echo "could not locate the second (differing) build's output path to diff -- see determinism.log above for whatever Nix itself reported." \
               | tee determinism-summary.txt
           fi
-          exit 0
+          # STRICT (issue #22): the artifacts above carry the diagnosis;
+          # the divergence itself is now a hard failure.
+          exit 1
       # Uploaded regardless of the outcome above (`if: always()`): the log
       # is useful even on a clean run (confirms `-K` didn't change
       # anything observable), and the diff files only exist at all when a

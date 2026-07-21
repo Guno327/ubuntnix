@@ -38,7 +38,15 @@ jobs:
               grep -rlIE --exclude-dir=.git '^#!(/usr)?/bin/(env +)?(ba)?sh' . || true
             } | sort -u
           )
-          [ -z "$files" ] || shellcheck $files
+          # -x: follow local `. file` sources (e.g. bin/ubx-guard-apt,
+          # -dpkg, -snap each `# shellcheck source=`-tag and `.` in
+          # bin/ubx-guard-lib -- a shared, non-executable, no-shebang file
+          # that intentionally never appears in $files itself, since it is
+          # sourced, never run directly; see its own header). Without -x
+          # every one of those three otherwise-clean scripts trips SC1091
+          # ("not following"), failing this job on a false positive
+          # (GitHub issue #31).
+          [ -z "$files" ] || shellcheck -x $files
 
   flake:
     name: Flake evaluation

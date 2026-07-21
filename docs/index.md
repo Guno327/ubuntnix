@@ -41,6 +41,9 @@ milestone plan.
   verbs, generations and rollback, secrets, and updates.
 - {doc}`archive` — the archive lockfile: two-tier pinning of the deb
   universe and snapshot-pinned fetching (implemented in M1).
+- {doc}`guards` — the apt/dpkg/snap mutation guards: what they block, what
+  they pass through, and why (guard scripts implemented and unit-tested in
+  M2; wiring them into the composed image is separate, deferred work).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -53,5 +56,6 @@ install
 modules
 workflows
 archive
+guards
 reference/index
 ```

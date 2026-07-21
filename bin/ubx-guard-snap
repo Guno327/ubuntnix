@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# bin/ubx-guard-snap — snap mutation guard (SPEC.md §7; GitHub issue #31,
+# milestone M2). Intended to be installed, inside the composed runtime
+# image only, in place of `snap` (see bin/ubx-guard-lib's header for the
+# full install contract, deferred to a later issue). SPEC.md §4.3 makes
+# snaps a live-converged domain (`ubuntnix.snaps` -> snapd's API, vendored
+# signed sideloads) -- this guard closes the gap where a human runs `snap
+# install`/`snap remove` by hand instead, which would drift the running
+# snap set out from under the flake's manifest exactly like a manual `apt
+# install` would drift the deb set (SPEC.md §3, §7).
+#
+# -- Verb matrix (SPEC.md §7, issue #31) -------------------------------------
+#
+# BLOCK (mutates installed snaps, their persisted config, or the
+# assertion/interface state that governs them):
+#   install remove refresh revert enable disable set unset connect
+#   disconnect ack alias unalias prefer switch
+#
+#   Reasoned addition: `try` (installs a local directory as a snap in
+#   try-mode) is exactly as mutating as `install` and isn't called out by
+#   name in the issue's list, but falls squarely under its "anything else
+#   mutating" catch-all -- included here explicitly rather than left to
+#   the unknown-verb fallback so the intent is documented, not incidental.
+#
+# PASS (read/query only, forwarded untouched):
+#   list info find version connections interfaces services changes tasks
+#   warnings get known model whoami help
+#
+# CONDITIONAL (`start`, `stop`, `restart`): plain service start/stop/
+#   restart is transient runtime control -- like `systemctl start` on a
+#   unit that stays enabled/disabled as declared, it does not survive a
+#   reboot or a reconverge and does not change what the flake would
+#   reproduce, so it PASSES. But each of these three subcommands also
+#   accepts a persistence flag (`--enable` / `--disable`) that changes
+#   whether the service starts on boot GOING FORWARD -- that IS a
+#   declarative-adjacent, persistent mutation (drift), so its presence
+#   anywhere in the remaining arguments forces a BLOCK for that
+#   invocation. This is the one place this guard inspects arguments past
+#   the verb; everywhere else, only the verb itself is classified.
+#
+# Unknown/unlisted verbs (e.g. `run`, `save`, `restore`, `forget`, `debug`,
+# a typo) FAIL CLOSED with the same refusal as a blocked verb -- per this
+# issue, unrecognized input is never assumed safe, even for verbs that
+# might turn out to be harmless on inspection. `run` in particular might
+# seem obviously safe (it launches an already-installed snap's app, same
+# as any other program), but is deliberately left unlisted for now rather
+# than reasoned about hastily; a future issue can add it with its own
+# documented rationale the same way `try` and the start/stop/restart
+# carve-out were added here.
+#
+# -- Option parsing -----------------------------------------------------------
+#
+# snap's global surface (options valid before the subcommand) is much
+# smaller than apt's or dpkg's: just -h/--help and -v/--version, neither
+# taking a value. find_verb walks argv skipping those; the first other
+# token is the subcommand. As with the other two guards, an unrecognized
+# `-`-prefixed token before the subcommand fails closed rather than being
+# assumed harmless.
+set -u
+
+prog="snap"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/ubx-guard-lib
+. "$script_dir/ubx-guard-lib"
+
+readonly BLOCK_VERBS=(
+  install remove refresh revert enable disable set unset connect
+  disconnect ack alias unalias prefer switch try
+)
+readonly PASS_VERBS=(
+  list info find version connections interfaces services changes tasks
+  warnings get known model whoami help
+)
+readonly SERVICE_VERBS=(start stop restart)
+
+is_in() {
+  local needle="$1"
+  shift
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# find_verb ARG...
+#
+# Prints the subcommand to stdout and returns 0 if one was found; returns
+# 2 if every argument was a recognized no-subcommand-needed option (bare
+# `snap`, `snap --version`, `snap -h`) -- pass through, same reasoning as
+# apt's bare-invocation case; returns 1 if an unrecognized option was hit
+# first (fail closed).
+find_verb() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h | --help | -v | --version)
+        shift
+        ;;
+      -*)
+        return 1
+        ;;
+      *)
+        printf '%s\n' "$1"
+        return 0
+        ;;
+    esac
+  done
+  return 2
+}
+
+# has_persistence_flag ARG...
+#
+# True if --enable or --disable appears anywhere in the remaining
+# arguments -- used only for the start/stop/restart carve-out above.
+has_persistence_flag() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --enable | --disable) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+main() {
+  local verb rc
+  verb="$(find_verb "$@")"
+  rc=$?
+
+  if [ "$rc" -eq 2 ]; then
+    ubx_guard_exec_real "$prog" "$@"
+    exit $?
+  fi
+  if [ "$rc" -eq 1 ]; then
+    ubx_guard_refuse "$prog" "could not confidently classify this invocation as a read-only operation -- refusing to guess."
+    exit 1
+  fi
+
+  if is_in "$verb" "${SERVICE_VERBS[@]}"; then
+    if has_persistence_flag "$@"; then
+      ubx_guard_refuse "$prog" "'$verb' with --enable/--disable persists across reboots and is blocked on this system (SPEC.md §7: drift prevention); plain '$verb' (no persistence flag) is allowed."
+      exit 1
+    fi
+    ubx_guard_exec_real "$prog" "$@"
+    exit $?
+  fi
+
+  if is_in "$verb" "${BLOCK_VERBS[@]}"; then
+    ubx_guard_refuse "$prog" "'$verb' is blocked on this system (SPEC.md §7: drift prevention)."
+    exit 1
+  fi
+  if is_in "$verb" "${PASS_VERBS[@]}"; then
+    ubx_guard_exec_real "$prog" "$@"
+    exit $?
+  fi
+
+  ubx_guard_refuse "$prog" "'$verb' is not a recognized read-only operation -- unlisted verbs fail closed."
+  exit 1
+}
+
+main "$@"

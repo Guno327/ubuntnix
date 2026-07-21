@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# bin/ubx-guard-apt — apt/apt-get mutation guard (SPEC.md §7; GitHub issue
+# #31, milestone M2). Intended to be installed, inside the composed runtime
+# image only, in place of BOTH `apt` and `apt-get` (see bin/ubx-guard-lib's
+# header for the full install contract — that part is deferred to a later
+# issue; this script is a standalone, unit-tested deliverable). Compose-time
+# apt/dpkg in the build sandbox (SPEC.md §4.1) is never guarded.
+#
+# One script fronts both commands because their mutating/query surfaces
+# overlap almost entirely -- `apt` is documented (apt(8)) as the unified
+# successor to `apt-get`/`apt-cache`/`apt-config` for interactive use, and
+# every verb below is defined identically for both from this guard's point
+# of view (if a verb happens not to exist on one of the two -- e.g. classic
+# `apt-get` has no `madison` -- the REAL binary rejects it once passed
+# through; this guard only ever decides block/pass, never behavior).
+#
+# -- Verb matrix (SPEC.md §7, issue #31) -------------------------------------
+#
+# BLOCK (mutates the installed system, or the config that drives it):
+#   install remove purge autoremove upgrade full-upgrade dist-upgrade
+#   dselect-upgrade reinstall build-dep satisfy edit-sources
+#
+#   Plus `source`: `apt[-get] source` fetches a source package into the
+#   current directory, and with `--build` also runs `dpkg-buildpackage`
+#   (arbitrary maintainer-supplied build code). The fetch alone is
+#   arguably read-only, but this guard can't see whether `--build` is
+#   present without re-implementing option parsing per-flag-combination
+#   for a rarely-used verb -- so `source` is blocked outright rather than
+#   conditionally, per this guard's general fail-closed posture. Use the
+#   flake / `ubx rebuild` for anything that needs a source package.
+#
+# PASS (read/query only, forwarded untouched):
+#   list search show showpkg policy madison depends rdepends download
+#   changelog moo help check indextargets
+#
+#   Reasoned additions beyond the issue's literal list, same rationale in
+#   each case -- forwarded because none of them touch the INSTALLED
+#   package set, only apt's own index/cache metadata under /var (a
+#   writable state path per SPEC.md §4.2, not store- or flake-managed):
+#     - `update`  — refreshes apt's package index cache. Blocking it would
+#       make every query verb above silently work against a stale index
+#       forever (worse than useless -- `apt search`/`apt list` degrade
+#       quietly rather than failing loud), while it never changes what is
+#       actually installed. Deliberately decided PASS, not the fail-closed
+#       default, precisely because the issue calls this one out as
+#       requiring a considered decision either way.
+#     - `clean` / `autoclean` — delete cached .deb files from
+#       /var/cache/apt; same "cache maintenance, not installed-system
+#       mutation" reasoning as `update`.
+#
+# Anything else (e.g. `gencaches`, `pkgnames`, `unmet`, or a typo) is
+# UNKNOWN and FAILS CLOSED with the same refusal as a blocked verb, per
+# SPEC.md §7 and this issue: unrecognized input is never assumed safe.
+#
+# -- Option parsing -----------------------------------------------------------
+#
+# apt/apt-get accept global options *before* the verb (`apt -q list`,
+# `apt-get -o Dir::Cache=/tmp update`, `apt --version`). find_verb() below
+# walks argv, skipping every option this guard *recognizes* as taking no
+# argument or a self-contained `--opt=value` argument, and skipping a
+# further argv slot for the handful of known options that take a separate
+# value argument (`-o`/`--option`, `-c`/`--config-file`, `-t`/
+# `--target-release`, `--host-architecture`). `--` ends option parsing (the
+# next token, if any, is the verb). The first token that is neither a
+# recognized option nor `--` is taken as the verb.
+#
+# Anything starting with `-` that find_verb doesn't recognize stops the
+# scan and fails closed (return 1: "can't confidently classify") rather
+# than guessing it's harmless -- an apt version with a global flag this
+# list hasn't seen yet must not be silently treated as safe to skip past.
+set -u
+
+prog="apt"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/ubx-guard-lib
+. "$script_dir/ubx-guard-lib"
+
+readonly BLOCK_VERBS=(
+  install remove purge autoremove upgrade full-upgrade dist-upgrade
+  dselect-upgrade reinstall build-dep satisfy edit-sources source
+)
+readonly PASS_VERBS=(
+  list search show showpkg policy madison depends rdepends download
+  changelog moo help check indextargets update clean autoclean
+)
+
+# find_verb ARG...
+#
+# Prints the verb to stdout and returns 0 if one was found; returns 2 if
+# every argument was a recognized no-verb-needed option (e.g. bare
+# `apt -q`, `apt --version`, or no arguments at all -- the caller should
+# pass these straight through and let the real binary print its own
+# usage/version, since none of that mutates anything); returns 1 if an
+# unrecognized option was hit before any verb (fail closed).
+find_verb() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        if [ $# -gt 0 ]; then
+          printf '%s\n' "$1"
+          return 0
+        fi
+        return 2
+        ;;
+      --*=*)
+        shift
+        ;;
+      -o | --option | -c | --config-file | -t | --target-release | --host-architecture)
+        [ $# -ge 2 ] || return 1
+        shift 2
+        ;;
+      -h | --help | -v | --version | -q | -qq | --quiet | -s | --simulate \
+        | --just-print | --dry-run | --recon | --no-act | -y | --yes \
+        | --assume-yes | --assume-no | -f | --fix-broken | -m \
+        | --ignore-missing | --fix-missing | -u | --show-upgraded | -b \
+        | --compile | --build | -V | --verbose-versions | -d \
+        | --download-only | --print-uris | --purge | --reinstall \
+        | --list-cleanup | --trivial-only | --no-remove | --only-source \
+        | --diff-only | --dsc-only | --tar-only | --arch-only \
+        | --auto-remove | --no-auto-remove | --install-recommends \
+        | --no-install-recommends | --install-suggests \
+        | --no-install-suggests | --allow-unauthenticated \
+        | --allow-downgrades | --allow-remove-essential \
+        | --allow-change-held-packages)
+        shift
+        ;;
+      -*)
+        return 1
+        ;;
+      *)
+        printf '%s\n' "$1"
+        return 0
+        ;;
+    esac
+  done
+  return 2
+}
+
+is_in() {
+  local needle="$1"
+  shift
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+main() {
+  local verb rc
+  verb="$(find_verb "$@")"
+  rc=$?
+
+  if [ "$rc" -eq 2 ]; then
+    ubx_guard_exec_real "$prog" "$@"
+    exit $?
+  fi
+  if [ "$rc" -eq 1 ]; then
+    ubx_guard_refuse "$prog" "could not confidently classify this invocation as a read-only operation -- refusing to guess."
+    exit 1
+  fi
+
+  if is_in "$verb" "${BLOCK_VERBS[@]}"; then
+    ubx_guard_refuse "$prog" "'$verb' is blocked on this system (SPEC.md §7: drift prevention)."
+    exit 1
+  fi
+  if is_in "$verb" "${PASS_VERBS[@]}"; then
+    ubx_guard_exec_real "$prog" "$@"
+    exit $?
+  fi
+
+  ubx_guard_refuse "$prog" "'$verb' is not a recognized read-only operation -- unlisted verbs fail closed."
+  exit 1
+}
+
+main "$@"

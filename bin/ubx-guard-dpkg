@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# bin/ubx-guard-dpkg — dpkg mutation guard (SPEC.md §7; GitHub issue #31,
+# milestone M2). Intended to be installed, inside the composed runtime
+# image only, in place of `dpkg` (see bin/ubx-guard-lib's header for the
+# full install contract, deferred to a later issue). Compose-time dpkg in
+# the build sandbox (SPEC.md §4.1) is never guarded -- it has to unpack
+# debs and run maintainer scripts to build the image in the first place.
+#
+# Also covers `dpkg-divert` and `dpkg-statoverride`: the issue's dpkg
+# matrix explicitly calls out blocking "divert additions" and "statoverride
+# additions", and both commands mutate parts of dpkg's own database in the
+# same way the core dpkg actions do (a diversion or override survives
+# independently of any package install/remove, and is exactly the kind of
+# state a rebuilt image wouldn't know to reproduce) -- so rather than a
+# fourth standalone script, this one script also fronts those two commands.
+# Mode is picked by `basename "$0"` (the name this script is diverted to,
+# in production) and overridable via UBX_GUARD_DPKG_MODE=dpkg|divert|
+# statoverride for testing without needing three separately-named copies of
+# the same file on disk.
+#
+# -- Verb matrix: `dpkg` itself (SPEC.md §7, issue #31) ---------------------
+#
+# dpkg is action-flag based, not verb based: exactly one ACTION flag is
+# expected per invocation (the rest of argv are that action's own
+# arguments -- package names, filenames, etc. -- never re-scanned).
+#
+# BLOCK actions (mutate installed package state):
+#   -i/--install --unpack --configure -r/--remove -P/--purge
+#   --set-selections --clear-selections --update-avail --merge-avail
+#   --clear-avail -A/--record-avail --add-architecture
+#   --remove-architecture --triggers-only
+#
+# PASS actions (read/query, or write ONLY to a location the caller names
+# explicitly rather than to managed system state):
+#   -l/--list -L/--listfiles -s/--status -p/--print-avail -S/--search
+#   --get-selections --print-architecture --print-foreign-architectures
+#   --compare-versions -C/--audit --version --help/-h --license/--licence
+#
+#   Reasoned additions -- the "dpkg-deb passthrough" actions (dpkg forwards
+#   these to dpkg-deb(1) when given a .deb file; see dpkg(1)):
+#   -c/--contents -e/--control -x/--extract -X/--vextract -I/--info
+#   -f/--field --fsys-tarfile -W/--show -b/--build. Every one of these
+#   reads an existing .deb (or, for --build, a source directory) and
+#   writes ONLY to a path the caller supplies on the command line -- never
+#   to dpkg's status database or the live filesystem the way --install
+#   does. Extraction/build are therefore treated like `apt download`: a
+#   read of the archive, not a mutation of the managed system.
+#
+# Unknown/unrecognized actions FAIL CLOSED, same as apt/snap.
+#
+# Modifier options (never the action themselves; skipped while scanning
+# for the action): --root, --instdir, --admindir, --path-exclude,
+# --path-include, --log, --status-fd, --status-logfd, --command-fd (all
+# take a value, `--opt=value` or `--opt value`); --force-*, --no-force-*,
+# --refuse-* (glob -- dpkg has dozens of these), --no-debsig, -R/
+# --recursive, -G, --auto-deconfigure, --no-triggers, --triggers,
+# -a/--pending, -O/--selected-only, -D* (debug level, attached form only,
+# e.g. `-D077` -- NOT `-D 077`; the space-separated form is intentionally
+# unsupported and falls through to fail-closed, see below).
+#
+# Unlike apt (where a bare invocation with only known flags safely passes
+# through to the real binary's own usage/version output), dpkg ALWAYS
+# requires an action -- there is no such thing as a harmless bare `dpkg`
+# invocation. So here, "no action found" fails closed rather than passing
+# through. Likewise a non-option argument encountered before any action is
+# found (which shouldn't happen with well-formed dpkg invocations, since
+# the action always comes first) is treated as unparseable and fails
+# closed, rather than guessing what was meant.
+#
+# -- Verb matrix: `dpkg-divert` --------------------------------------------
+#
+# BLOCK: --add --remove. Per dpkg-divert(1), --add is also the DEFAULT
+#   action when none of --add/--remove/--list/--truename is given
+#   explicitly -- so an invocation with no action flag at all (e.g. just
+#   `--rename --divert ... --package ... /path`) is treated as an implicit
+#   --add and blocked too, not passed through.
+# PASS: --list --truename --help --version
+#
+# -- Verb matrix: `dpkg-statoverride` ----------------------------------------
+#
+# BLOCK: --add --remove
+# PASS: --list --help --version
+set -u
+
+self_name="$(basename "${BASH_SOURCE[0]}")"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/ubx-guard-lib
+. "$script_dir/ubx-guard-lib"
+
+mode="${UBX_GUARD_DPKG_MODE:-}"
+if [ -z "$mode" ]; then
+  case "$self_name" in
+    dpkg-divert) mode="divert" ;;
+    dpkg-statoverride) mode="statoverride" ;;
+    *) mode="dpkg" ;;
+  esac
+fi
+
+case "$mode" in
+  divert) prog="dpkg-divert" ;;
+  statoverride) prog="dpkg-statoverride" ;;
+  *) prog="dpkg" ;;
+esac
+
+is_in() {
+  local needle="$1"
+  shift
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# -- dpkg proper --------------------------------------------------------------
+
+readonly DPKG_BLOCK_ACTIONS=(
+  -i --install --unpack --configure -r --remove -P --purge
+  --set-selections --clear-selections --update-avail --merge-avail
+  --clear-avail -A --record-avail --add-architecture --remove-architecture
+  --triggers-only
+)
+readonly DPKG_PASS_ACTIONS=(
+  -l --list -L --listfiles -s --status -p --print-avail -S --search
+  --get-selections --print-architecture --print-foreign-architectures
+  --compare-versions -C --audit --version --help -h --license --licence
+  -c --contents -e --control -x --extract -X --vextract -I --info
+  -f --field --fsys-tarfile -W --show -b --build
+)
+
+# find_dpkg_action ARG...
+#
+# Prints the action to stdout and returns 0 if a recognized action flag
+# was found; returns 1 otherwise (no action, an unrecognized option, or a
+# bare positional argument before any action -- all fail closed for dpkg,
+# per this file's header).
+find_dpkg_action() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root | --instdir | --admindir | --path-exclude | --path-include \
+        | --log | --status-fd | --status-logfd | --command-fd)
+        [ $# -ge 2 ] || return 1
+        shift 2
+        ;;
+      --*=*)
+        shift
+        ;;
+      --force-* | --no-force-* | --refuse-*)
+        shift
+        ;;
+      -D*)
+        shift
+        ;;
+      -R | --recursive | -G | --auto-deconfigure | --no-triggers \
+        | --triggers | -a | --pending | -O | --selected-only)
+        shift
+        ;;
+      *)
+        if is_in "$1" "${DPKG_BLOCK_ACTIONS[@]}" || is_in "$1" "${DPKG_PASS_ACTIONS[@]}"; then
+          printf '%s\n' "$1"
+          return 0
+        fi
+        return 1
+        ;;
+    esac
+  done
+  return 1
+}
+
+run_dpkg() {
+  local action
+  if ! action="$(find_dpkg_action "$@")"; then
+    ubx_guard_refuse "$prog" "could not confidently classify this invocation as a read-only operation -- refusing to guess (dpkg always requires a recognized action)."
+    exit 1
+  fi
+
+  if is_in "$action" "${DPKG_BLOCK_ACTIONS[@]}"; then
+    ubx_guard_refuse "$prog" "'$action' is blocked on this system (SPEC.md §7: drift prevention)."
+    exit 1
+  fi
+  # find_dpkg_action only ever returns a token from one of the two arrays,
+  # so reaching here means it was a PASS action.
+  ubx_guard_exec_real "$prog" "$@"
+  exit $?
+}
+
+# -- dpkg-divert / dpkg-statoverride ------------------------------------------
+#
+# Both tools take at most one action flag. dpkg-divert is unusual in that
+# an entirely action-flag-free invocation is still meaningful: --add is
+# its documented DEFAULT action when neither --add, --remove, --list, nor
+# --truename is given (dpkg-divert(1)) -- so find_satellite_action prints
+# "--add" if none was ever seen, in divert mode only. dpkg-statoverride has
+# no such default; a bare invocation there is unparseable and fails closed.
+readonly DIVERT_VALUE_OPTS=(--admindir --instdir --root --divert --package)
+readonly DIVERT_FLAG_OPTS=(--local --rename --no-rename --test --quiet)
+readonly DIVERT_PASS_ACTIONS=(--list --truename --help --version)
+readonly DIVERT_BLOCK_ACTIONS=(--add --remove)
+
+readonly STATOVERRIDE_VALUE_OPTS=(--admindir --instdir --root)
+readonly STATOVERRIDE_FLAG_OPTS=(--force --update --quiet)
+readonly STATOVERRIDE_PASS_ACTIONS=(--list --help --version)
+readonly STATOVERRIDE_BLOCK_ACTIONS=(--add --remove)
+
+find_satellite_action() {
+  local value_opts=("${DIVERT_VALUE_OPTS[@]}") flag_opts=("${DIVERT_FLAG_OPTS[@]}")
+  local pass_actions=("${DIVERT_PASS_ACTIONS[@]}") block_actions=("${DIVERT_BLOCK_ACTIONS[@]}")
+  if [ "$mode" = statoverride ]; then
+    value_opts=("${STATOVERRIDE_VALUE_OPTS[@]}")
+    flag_opts=("${STATOVERRIDE_FLAG_OPTS[@]}")
+    pass_actions=("${STATOVERRIDE_PASS_ACTIONS[@]}")
+    block_actions=("${STATOVERRIDE_BLOCK_ACTIONS[@]}")
+  fi
+
+  while [ $# -gt 0 ]; do
+    if is_in "$1" "${value_opts[@]}"; then
+      [ $# -ge 2 ] || return 1
+      shift 2
+      continue
+    fi
+    if is_in "$1" "${flag_opts[@]}"; then
+      shift
+      continue
+    fi
+    case "$1" in
+      --*=*)
+        shift
+        continue
+        ;;
+      -*)
+        if is_in "$1" "${pass_actions[@]}" || is_in "$1" "${block_actions[@]}"; then
+          printf '%s\n' "$1"
+          return 0
+        fi
+        return 1
+        ;;
+      *)
+        # A bare positional argument. Both tools' action flags are always
+        # `--long-form` (never a bare word), so this can only be the
+        # filename/package-name/pattern argument these commands take
+        # (dpkg-divert's <file>, dpkg-statoverride's <path>, `--list`'s
+        # optional glob, ...) -- never itself an action. Skip it and keep
+        # scanning; do NOT treat it as unparseable. Without this, every
+        # real-world invocation that omits an explicit action flag (the
+        # normal case for dpkg-divert, which relies on the documented
+        # implicit --add default below) would hit the fail-closed `return
+        # 1` here purely because of its trailing filename, never reaching
+        # that default -- still safe (both paths refuse), but it defeats
+        # the specific, documented implicit---add handling for divert.
+        shift
+        continue
+        ;;
+    esac
+  done
+
+  if [ "$mode" = divert ]; then
+    printf '%s\n' "--add"
+    return 0
+  fi
+  return 1
+}
+
+run_satellite() {
+  local block_actions=("${DIVERT_BLOCK_ACTIONS[@]}") action
+  [ "$mode" = statoverride ] && block_actions=("${STATOVERRIDE_BLOCK_ACTIONS[@]}")
+
+  if ! action="$(find_satellite_action "$@")"; then
+    ubx_guard_refuse "$prog" "could not confidently classify this invocation as a read-only operation -- refusing to guess."
+    exit 1
+  fi
+
+  if is_in "$action" "${block_actions[@]}"; then
+    ubx_guard_refuse "$prog" "'$action' is blocked on this system (SPEC.md §7: drift prevention)."
+    exit 1
+  fi
+  ubx_guard_exec_real "$prog" "$@"
+  exit $?
+}
+
+main() {
+  case "$mode" in
+    divert | statoverride) run_satellite "$@" ;;
+    *) run_dpkg "$@" ;;
+  esac
+}
+
+main "$@"

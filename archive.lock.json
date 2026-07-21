@@ -15,6 +15,15 @@
         "size": 100872
       },
       {
+        "name": "bash-static",
+        "version": "5.2.21-2ubuntu4",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/b/bash/bash-static_5.2.21-2ubuntu4_amd64.deb",
+        "sha256": "684691928e746a29d4b97c3b58069666a3cdd73104c90b217501f5c1ae7cbd64",
+        "size": 1174720
+      },
+      {
         "name": "busybox-initramfs",
         "version": "1:1.36.1-6ubuntu3",
         "arch": "amd64",
@@ -22,6 +31,15 @@
         "path": "pool/main/b/busybox/busybox-initramfs_1.36.1-6ubuntu3_amd64.deb",
         "sha256": "57242e0e63f276a07cb7c794c65dd647ce9f4bf17310cd163003e146cbddb950",
         "size": 188172
+      },
+      {
+        "name": "bzip2",
+        "version": "1.0.8-5.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/b/bzip2/bzip2_1.0.8-5.1_amd64.deb",
+        "sha256": "82f56d9cfd3d2c1daa9c8df5a58f8ac076f56581bd3b5e4bf1f607d6eaf84929",
+        "size": 34526
       },
       {
         "name": "coreutils",
@@ -42,6 +60,15 @@
         "size": 82668
       },
       {
+        "name": "curl",
+        "version": "8.5.0-2ubuntu10",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/curl/curl_8.5.0-2ubuntu10_amd64.deb",
+        "sha256": "af7af42226d21bcbf87cf62a9e158bd5dfbd051ebbde8818ca441dc8085f67af",
+        "size": 226572
+      },
+      {
         "name": "debconf",
         "version": "1.5.86ubuntu1",
         "arch": "all",
@@ -49,6 +76,15 @@
         "path": "pool/main/d/debconf/debconf_1.5.86ubuntu1_all.deb",
         "sha256": "bb390da466a7461bfc87aa3e6b7cd145dae84af3e26bf437f2c0c218ba226294",
         "size": 124096
+      },
+      {
+        "name": "debianutils",
+        "version": "5.17build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/d/debianutils/debianutils_5.17build1_amd64.deb",
+        "sha256": "1047a9a57018e18531f76e5b00e226a68554b6f1d147f2a5c1b32518c7b20636",
+        "size": 89890
       },
       {
         "name": "dhcpcd-base",
@@ -258,6 +294,15 @@
         "size": 985310
       },
       {
+        "name": "libarchive13t64",
+        "version": "3.7.2-2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/liba/libarchive/libarchive13t64_3.7.2-2_amd64.deb",
+        "sha256": "90f7f4692ac6b2ce1755c0f2e67f9655e288d764ef9d70dba7c3f7ae8b8a5b4b",
+        "size": 381452
+      },
+      {
         "name": "libargon2-1",
         "version": "0~20190702+dfsg-4build1",
         "arch": "amd64",
@@ -303,6 +348,15 @@
         "size": 122562
       },
       {
+        "name": "libboost-context1.83.0",
+        "version": "1.83.0-2.1ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/b/boost1.83/libboost-context1.83.0_1.83.0-2.1ubuntu3_amd64.deb",
+        "sha256": "865bdbc5953c68ef92db3b2b7d4ed8af34a27763c2e8efb2116a1e237d6d6cc2",
+        "size": 236958
+      },
+      {
         "name": "libbrotli1",
         "version": "1.1.0-2build2",
         "arch": "amd64",
@@ -310,6 +364,15 @@
         "path": "pool/main/b/brotli/libbrotli1_1.1.0-2build2_amd64.deb",
         "sha256": "74492419b8fda803774b8c9acef6afc5d2f9ff31782635aae212906adae7b277",
         "size": 330730
+      },
+      {
+        "name": "libbsd0",
+        "version": "0.12.1-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libb/libbsd/libbsd0_0.12.1-1build1_amd64.deb",
+        "sha256": "8e97b7d541416512a81e7845c5f21910344c9c5c610893cf265d3298e0caad6b",
+        "size": 41194
       },
       {
         "name": "libbz2-1.0",
@@ -357,6 +420,15 @@
         "size": 22808
       },
       {
+        "name": "libcpuid16",
+        "version": "0.6.4+repack1-1",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/libc/libcpuid/libcpuid16_0.6.4%2brepack1-1_amd64.deb",
+        "sha256": "6e32e62306b8dd2520efdb4666bff43db24482a006fbf7f21271ff6a2762f3e4",
+        "size": 38032
+      },
+      {
         "name": "libcrypt1",
         "version": "1:4.4.36-4build1",
         "arch": "amd64",
@@ -375,6 +447,24 @@
         "size": 265966
       },
       {
+        "name": "libcurl3t64-gnutls",
+        "version": "8.5.0-2ubuntu10",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/curl/libcurl3t64-gnutls_8.5.0-2ubuntu10_amd64.deb",
+        "sha256": "6a5463c3acb9a5a8e1756ba7953a694cc4eb1c02b960f4faf4aa84d1ae7a00c5",
+        "size": 332530
+      },
+      {
+        "name": "libcurl4t64",
+        "version": "8.5.0-2ubuntu10",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/curl/libcurl4t64_8.5.0-2ubuntu10_amd64.deb",
+        "sha256": "1c597ce8778ced5ff37fcb767968ffc9fb75944d96b9e6c06e63cc611846878e",
+        "size": 340458
+      },
+      {
         "name": "libdb5.3t64",
         "version": "5.3.28+dfsg2-7",
         "arch": "amd64",
@@ -382,6 +472,24 @@
         "path": "pool/main/d/db5.3/libdb5.3t64_5.3.28%2bdfsg2-7_amd64.deb",
         "sha256": "a78a25c8fad8fdd0b7bc6b297da5d5685579be1e57732aa47870830e4a13161e",
         "size": 734100
+      },
+      {
+        "name": "libdbd-sqlite3-perl",
+        "version": "1.74-1build3",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/libd/libdbd-sqlite3-perl/libdbd-sqlite3-perl_1.74-1build3_amd64.deb",
+        "sha256": "a0df7eb867b3dfe37130225f4fcdfb258d7ef4aa13c7b496de58538ddb57cb17",
+        "size": 161176
+      },
+      {
+        "name": "libdbi-perl",
+        "version": "1.643-4build3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libd/libdbi-perl/libdbi-perl_1.643-4build3_amd64.deb",
+        "sha256": "173b4eaed8ee6413446cf98f48d3324acdaa5ede13c8195db81ffc27c44af0bc",
+        "size": 720722
       },
       {
         "name": "libdevmapper1.02.1",
@@ -465,6 +573,15 @@
         "size": 83124
       },
       {
+        "name": "libgc1",
+        "version": "1:8.2.6-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libg/libgc/libgc1_8.2.6-1build1_amd64.deb",
+        "sha256": "67d4d83f1c7f3bc240d44f4d9133e08d0da3e5069e50e6dd15ea998af7bccd06",
+        "size": 90274
+      },
+      {
         "name": "libgcc-s1",
         "version": "14-20240412-0ubuntu1",
         "arch": "amd64",
@@ -483,6 +600,24 @@
         "size": 532180
       },
       {
+        "name": "libgdbm-compat4t64",
+        "version": "1.23-5.1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/gdbm/libgdbm-compat4t64_1.23-5.1build1_amd64.deb",
+        "sha256": "fb8564afd7b7d74d55207070ba50339478e22d29a39ec740dc482f069ac7ee65",
+        "size": 6710
+      },
+      {
+        "name": "libgdbm6t64",
+        "version": "1.23-5.1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/gdbm/libgdbm6t64_1.23-5.1build1_amd64.deb",
+        "sha256": "18d6d74a5c038b458d95ba0c0909e0f086cd50bb9a0fee32697902724fc5645e",
+        "size": 34440
+      },
+      {
         "name": "libgmp10",
         "version": "2:6.3.0+dfsg-2ubuntu6",
         "arch": "amd64",
@@ -492,6 +627,15 @@
         "size": 253448
       },
       {
+        "name": "libgnutls30t64",
+        "version": "3.8.3-1.1ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/gnutls28/libgnutls30t64_3.8.3-1.1ubuntu3_amd64.deb",
+        "sha256": "fdaa2c2fd34d7ac4ebd7d62e5b5d94c3cf9322b1fa1760d70b8e86425e9f6c36",
+        "size": 998156
+      },
+      {
         "name": "libgpg-error0",
         "version": "1.47-3build2",
         "arch": "amd64",
@@ -499,6 +643,42 @@
         "path": "pool/main/libg/libgpg-error/libgpg-error0_1.47-3build2_amd64.deb",
         "sha256": "81a30b5888e0af43b72bfdbdb44209b82e521eadf8848ff201542e6d258f6a1f",
         "size": 69990
+      },
+      {
+        "name": "libgssapi-krb5-2",
+        "version": "1.20.1-6ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/krb5/libgssapi-krb5-2_1.20.1-6ubuntu2_amd64.deb",
+        "sha256": "0e22fb29a907ef6deeb56543bcbf9f736500cb37da2e3a6257c1bedf7c0783db",
+        "size": 142366
+      },
+      {
+        "name": "libhogweed6t64",
+        "version": "3.9.1-2.2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/nettle/libhogweed6t64_3.9.1-2.2build1_amd64.deb",
+        "sha256": "594a82d7b70ecff393753ee0ab6611b0b18226c4f922d27ccb3f66caeae3d5d1",
+        "size": 198540
+      },
+      {
+        "name": "libicu74",
+        "version": "74.2-1ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/icu/libicu74_74.2-1ubuntu3_amd64.deb",
+        "sha256": "d29c97a21a3e3254731cfac186e4d4e611e5e67d2c9a0430f6acfbd9acaefa2e",
+        "size": 10860410
+      },
+      {
+        "name": "libidn2-0",
+        "version": "2.3.7-2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libi/libidn2/libidn2-0_2.3.7-2build1_amd64.deb",
+        "sha256": "f1be32391a2fabf06c27618a2000ae8f9a26c30fad1b482a007049ae8156d19c",
+        "size": 66158
       },
       {
         "name": "libjq1",
@@ -519,6 +699,24 @@
         "size": 35340
       },
       {
+        "name": "libk5crypto3",
+        "version": "1.20.1-6ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/krb5/libk5crypto3_1.20.1-6ubuntu2_amd64.deb",
+        "sha256": "212318ab9c98e151cfd331b9310827d43316dcf33e1e0e8d3d9fc2b3fbd88cfb",
+        "size": 81730
+      },
+      {
+        "name": "libkeyutils1",
+        "version": "1.6.3-3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/keyutils/libkeyutils1_1.6.3-3build1_amd64.deb",
+        "sha256": "0679f198b0128179e46cdf956fb2022c23c758664c00bc8efa0382d509683a8a",
+        "size": 9490
+      },
+      {
         "name": "libklibc",
         "version": "2.0.13-4",
         "arch": "amd64",
@@ -535,6 +733,42 @@
         "path": "pool/main/k/kmod/libkmod2_31%2b20240202-2ubuntu7_amd64.deb",
         "sha256": "43858c80a67c3a8a5a10d8e6769e7d92614d9eb19cb14e159b4311a16b9cf54b",
         "size": 51658
+      },
+      {
+        "name": "libkrb5-3",
+        "version": "1.20.1-6ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/krb5/libkrb5-3_1.20.1-6ubuntu2_amd64.deb",
+        "sha256": "10ab284396a94349aa319c7c0a59cc747c5d75ba8b81e0ffcbdae96d8d8a2a78",
+        "size": 347324
+      },
+      {
+        "name": "libkrb5support0",
+        "version": "1.20.1-6ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/krb5/libkrb5support0_1.20.1-6ubuntu2_amd64.deb",
+        "sha256": "5a6aa4d7f11ccad8f4bdfbce5e718827875d9440b1fb3d40c82dff0d9edb6e9b",
+        "size": 33476
+      },
+      {
+        "name": "libldap2",
+        "version": "2.6.7+dfsg-1~exp1ubuntu8",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/o/openldap/libldap2_2.6.7%2bdfsg-1%7eexp1ubuntu8_amd64.deb",
+        "sha256": "35294f2750d3601b3f134eb90500e4b542b0f60c7f411e0b024bd00018c80c24",
+        "size": 195254
+      },
+      {
+        "name": "liblowdown1",
+        "version": "1.1.0-1",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/l/lowdown/liblowdown1_1.1.0-1_amd64.deb",
+        "sha256": "e6158e344120ac049850c63177f86745afacb2d4edee5b16c0cce345357b6095",
+        "size": 100880
       },
       {
         "name": "liblz4-1",
@@ -591,6 +825,24 @@
         "size": 147842
       },
       {
+        "name": "libnettle8t64",
+        "version": "3.9.1-2.2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/nettle/libnettle8t64_3.9.1-2.2build1_amd64.deb",
+        "sha256": "4cac2064e2984c4bc5a31659d4f00c7efe0c4b691559d536dd726c05d3632a57",
+        "size": 181546
+      },
+      {
+        "name": "libnghttp2-14",
+        "version": "1.59.0-1build4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/nghttp2/libnghttp2-14_1.59.0-1build4_amd64.deb",
+        "sha256": "4273c0501841461ab24a5a09017e084c558e5fadc6dc68aee91b6c8fbcb4092f",
+        "size": 73936
+      },
+      {
         "name": "libnl-3-200",
         "version": "3.7.0-0.3build1",
         "arch": "amd64",
@@ -616,6 +868,15 @@
         "path": "pool/main/libo/libonig/libonig5_6.9.9-1build1_amd64.deb",
         "sha256": "605f42287d2bcb6c84f5a02377c7cd777090c5e857259a4030a571989f19dde2",
         "size": 172336
+      },
+      {
+        "name": "libp11-kit0",
+        "version": "0.25.3-4ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/p11-kit/libp11-kit0_0.25.3-4ubuntu2_amd64.deb",
+        "sha256": "2496ec055ee1660b8733e267fa0aa27068869548bc7a898773607024f2df50c3",
+        "size": 299468
       },
       {
         "name": "libpam-modules",
@@ -663,6 +924,15 @@
         "size": 226574
       },
       {
+        "name": "libperl5.38t64",
+        "version": "5.38.2-3.2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/perl/libperl5.38t64_5.38.2-3.2build2_amd64.deb",
+        "sha256": "a6f23b73bf1e68f0e0fc759b82c74f22899ca7cf814d3ea8b60a54d4462b3ef3",
+        "size": 4873204
+      },
+      {
         "name": "libpng16-16t64",
         "version": "1.6.43-5build1",
         "arch": "amd64",
@@ -670,6 +940,15 @@
         "path": "pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5build1_amd64.deb",
         "sha256": "128d505038cc19dfc218658562ca5917ec242b79e6e2bbfb65ee27f297a53924",
         "size": 186690
+      },
+      {
+        "name": "libpsl5t64",
+        "version": "0.21.2-1.1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libp/libpsl/libpsl5t64_0.21.2-1.1build1_amd64.deb",
+        "sha256": "a6c85d1303ae90b6a3209d73c4f047f82c27cdc963c48adfd95dd7abca64f039",
+        "size": 57072
       },
       {
         "name": "libpython3-stdlib",
@@ -706,6 +985,33 @@
         "path": "pool/main/r/readline/libreadline8t64_8.2-4build1_amd64.deb",
         "sha256": "563977a16df03b611f5239cc1e9a0426e86479fcc616b5c9e200ea32063119e5",
         "size": 152856
+      },
+      {
+        "name": "librtmp1",
+        "version": "2.4+20151223.gitfa8646d.1-2build7",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/r/rtmpdump/librtmp1_2.4%2b20151223.gitfa8646d.1-2build7_amd64.deb",
+        "sha256": "967a39dbc14236d1580ede01d80fd78444668572e716734e1ac66c175052594e",
+        "size": 56342
+      },
+      {
+        "name": "libsasl2-2",
+        "version": "2.1.28+dfsg1-5ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/cyrus-sasl2/libsasl2-2_2.1.28%2bdfsg1-5ubuntu3_amd64.deb",
+        "sha256": "9a5b0cf88b19de419e585b91b3837c4d7621df229f78a0a58935761866ca1f4d",
+        "size": 53194
+      },
+      {
+        "name": "libsasl2-modules-db",
+        "version": "2.1.28+dfsg1-5ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/cyrus-sasl2/libsasl2-modules-db_2.1.28%2bdfsg1-5ubuntu3_amd64.deb",
+        "sha256": "490d4c86d1212021ed3ff3ce0146cfb902ac4c98db9907c0da7c8a9b4bf3a93c",
+        "size": 20254
       },
       {
         "name": "libseccomp2",
@@ -762,6 +1068,15 @@
         "size": 64792
       },
       {
+        "name": "libsodium23",
+        "version": "1.0.18-1build3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libs/libsodium/libsodium23_1.0.18-1build3_amd64.deb",
+        "sha256": "0bd5072c20e1de04155d7a68c61aa04edccda4f4fe6c60c072a94fae8fbcc1b1",
+        "size": 161498
+      },
+      {
         "name": "libsqlite3-0",
         "version": "3.45.1-1ubuntu2",
         "arch": "amd64",
@@ -778,6 +1093,15 @@
         "path": "pool/main/e/e2fsprogs/libss2_1.47.0-2.4%7eexp1ubuntu4_amd64.deb",
         "sha256": "8f92822ee17d280c721012491bc3a06cddbfb933febdeb816edd203562da65b3",
         "size": 17038
+      },
+      {
+        "name": "libssh-4",
+        "version": "0.10.6-2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libs/libssh/libssh-4_0.10.6-2build2_amd64.deb",
+        "sha256": "c0867b203887064777d677e18d4006f9b068a9ff98d361189cb941ab409326dd",
+        "size": 187694
       },
       {
         "name": "libssl3t64",
@@ -816,6 +1140,15 @@
         "size": 429022
       },
       {
+        "name": "libtasn1-6",
+        "version": "4.19.0-3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libt/libtasn1-6/libtasn1-6_4.19.0-3build1_amd64.deb",
+        "sha256": "e30d8b4b7769966185b5acb40ac81205467022c96d7b1688bf06a3eaded2b98c",
+        "size": 43870
+      },
+      {
         "name": "libtinfo6",
         "version": "6.4+20240113-1ubuntu2",
         "arch": "amd64",
@@ -834,6 +1167,15 @@
         "size": 174402
       },
       {
+        "name": "libunistring5",
+        "version": "1.1-2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libu/libunistring/libunistring5_1.1-2build1_amd64.deb",
+        "sha256": "78acc4c141a499e0c1e4cc47ca8e9082996f3972662c4d92337669ecc9b0a519",
+        "size": 535478
+      },
+      {
         "name": "libuuid1",
         "version": "2.39.3-9ubuntu6",
         "arch": "amd64",
@@ -841,6 +1183,24 @@
         "path": "pool/main/u/util-linux/libuuid1_2.39.3-9ubuntu6_amd64.deb",
         "sha256": "4ba2c3a10469d1ab8e01a9af8e39093ed43addada658c04737287c5f91a1645b",
         "size": 35248
+      },
+      {
+        "name": "libwww-curl-perl",
+        "version": "4.17-10build4",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/libw/libwww-curl-perl/libwww-curl-perl_4.17-10build4_amd64.deb",
+        "sha256": "60ac003eaa7808a1f825d36fdfc78eccd81457eecb5e19c7e850d694ec524172",
+        "size": 55678
+      },
+      {
+        "name": "libxml2",
+        "version": "2.9.14+dfsg-1.3ubuntu3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libx/libxml2/libxml2_2.9.14%2bdfsg-1.3ubuntu3_amd64.deb",
+        "sha256": "8c4efd7abe155df3cf0f9b64d659f2d866215785f8e8c44234fbb341d58cc967",
+        "size": 762198
       },
       {
         "name": "libxxhash0",
@@ -951,6 +1311,15 @@
         "size": 13112
       },
       {
+        "name": "nix-bin",
+        "version": "2.18.1+dfsg-1ubuntu5",
+        "arch": "amd64",
+        "component": "universe",
+        "path": "pool/universe/n/nix/nix-bin_2.18.1%2bdfsg-1ubuntu5_amd64.deb",
+        "sha256": "1aecc4a6435e75791dcd3f0b43992361cfa0f56eaa99ea165a3299725c330947",
+        "size": 2684388
+      },
+      {
         "name": "parted",
         "version": "3.6-4build1",
         "arch": "amd64",
@@ -967,6 +1336,33 @@
         "path": "pool/main/s/shadow/passwd_4.13%2bdfsg1-4ubuntu3_amd64.deb",
         "sha256": "48c36fd38b43a074d746d88eb34808fc06129b9a8864a65f869fbf17639c42c9",
         "size": 844854
+      },
+      {
+        "name": "perl",
+        "version": "5.38.2-3.2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/perl/perl_5.38.2-3.2build2_amd64.deb",
+        "sha256": "a59f3d152ed767cf3be0924890e64d1f9424ac75f4124672ba6830d2ac587e03",
+        "size": 231370
+      },
+      {
+        "name": "perl-base",
+        "version": "5.38.2-3.2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/perl/perl-base_5.38.2-3.2build2_amd64.deb",
+        "sha256": "82a75783b5b63b92d83c3f022e98dba9542e30d3a228b3e381d9c302b14df095",
+        "size": 1822564
+      },
+      {
+        "name": "perl-modules-5.38",
+        "version": "5.38.2-3.2build2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/perl/perl-modules-5.38_5.38.2-3.2build2_all.deb",
+        "sha256": "540b64b1be061236e50f617badc2b96e1af92766f106302b2fc84ba790d39610",
+        "size": 3110036
       },
       {
         "name": "python-apt-common",
@@ -1059,6 +1455,15 @@
         "size": 103640
       },
       {
+        "name": "systemd-sysv",
+        "version": "255.4-1ubuntu8",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/s/systemd/systemd-sysv_255.4-1ubuntu8_amd64.deb",
+        "sha256": "0b50a7fdcd3df99cce37206d0440f961a397eb27dfafde37e4262a9e779abd5c",
+        "size": 11876
+      },
+      {
         "name": "sysvinit-utils",
         "version": "3.08-6ubuntu3",
         "arch": "amd64",
@@ -1093,6 +1498,15 @@
         "path": "pool/main/s/systemd/udev_255.4-1ubuntu8_amd64.deb",
         "sha256": "7958d57390c3fe122ecd58ad353f3f0dea4233cbc53da2434ec8fa0396f9df89",
         "size": 1873456
+      },
+      {
+        "name": "xz-utils",
+        "version": "5.6.1+really5.4.5-1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/x/xz-utils/xz-utils_5.6.1%2breally5.4.5-1_amd64.deb",
+        "sha256": "e9b203a056be748bf343812c5527b27ddbef0b57b2b925eee2e07d4f08452e5f",
+        "size": 267416
       },
       {
         "name": "zlib1g",

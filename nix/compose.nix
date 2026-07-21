@@ -260,8 +260,26 @@ let
       # into the outer pre-chroot script — Nix's `${...}` interpolation
       # doesn't care that the surrounding shell text happens to be a
       # quoted heredoc; only the value of this Nix `let` binding matters.
+      #
+      # `--force-depends` (PR #36, first full-locked-set compose): dpkg
+      # enforces Pre-Depends AT UNPACK TIME against whatever is installed
+      # at that moment — which, mid-sequence, is a MIXTURE of the
+      # ubuntu-base tarball's own package versions and the already-
+      # unpacked pinned ones. A strictly-versioned Pre-Depends
+      # (e2fsprogs's `Pre-Depends: libext2fs2t64 (= <version>)` was the
+      # first real instance: ubuntu-base carries a NEWER point release
+      # than the snapshot pin, and 'e' unpacks before 'l' in the pinned
+      # order) can therefore fail against the TRANSIENT state even though
+      # the FINAL pinned set is perfectly consistent. `--force-depends`
+      # is the standard debootstrap idiom for exactly this
+      # (debootstrap(8) unpacks its required set the same way):
+      # dependency errors at unpack become warnings, while the final
+      # tree's consistency is still strictly enforced — `dpkg
+      # --configure -a` below runs WITHOUT any force flag, and configures
+      # in real dependency order, so a genuinely inconsistent locked set
+      # still fails the build there, loudly.
       unpackLines = builtins.concatStringsSep "\n" (map
-        (i: ''dpkg --unpack "/.ubx-compose/debs/${toString i}.deb"'')
+        (i: ''dpkg --unpack --force-depends "/.ubx-compose/debs/${toString i}.deb"'')
         indices);
 
       preseedText = renderPreseed preseed;

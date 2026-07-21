@@ -17,7 +17,7 @@
     "libnl-genl-3-200",
     "linux-image-virtual",
     "mtools",
-    "nix",
+    "nix-bin",
     "parted",
     "squashfs-tools",
     "systemd-sysv",

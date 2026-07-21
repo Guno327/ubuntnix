@@ -1,0 +1,106 @@
+# bin/ubx-guard-lib — shared core for the apt/dpkg/snap mutation guards
+# (SPEC.md §7 "Drift prevention"; SPEC.md §3 "No imperative package
+# operations"; GitHub issue #31, milestone M2).
+#
+# NOT executable, and never run directly: this is `source`d by
+# bin/ubx-guard-apt, bin/ubx-guard-dpkg, and bin/ubx-guard-snap, each of
+# which owns its own command's verb/action matrix (they differ enough
+# between apt, dpkg, and snap that a shared table would obscure more than
+# it would save) and calls into the two functions below for the parts that
+# genuinely are identical across all three: the refusal message, and
+# handing off to the real binary.
+#
+# -- Why these three scripts exist -------------------------------------------
+#
+# SPEC.md §7 requires imperative package mutation to be BLOCKED, not merely
+# reverted: "the flake is the complete truth". A read-only rootfs already
+# makes dpkg-level mutation impossible by construction once composed into an
+# image (SPEC.md §4.2) — but that alone still lets a mutating command run
+# and fail confusingly deep inside dpkg/snapd (partial lock acquisition,
+# EROFS mid-transaction, etc.) instead of failing fast with an explanation.
+# These guards intercept at the command layer instead: refuse mutating
+# verbs immediately with a pointer to the real fix (edit /flake, `ubx
+# rebuild switch`), and pass read/query operations straight through so
+# `apt search`, `dpkg -l`, `snap list`, and friends keep working exactly as
+# they always have.
+#
+# -- Deferred: installing these into the composed image ---------------------
+#
+# THIS ISSUE (#31) is scope-limited to the guard scripts themselves, unit-
+# tested standalone; wiring them into the actual composed runtime image is
+# explicitly OUT of scope here, deferred by the PM until issue #10's file-
+# injection mechanism merges (see docs/guards.md for the fuller writeup).
+# The intended install shape, so the scripts below are written against a
+# stable contract from day one:
+#
+#   - Inside the composed image only (SPEC.md §7 is explicit that the
+#     COMPOSE-TIME dpkg running in the build sandbox — SPEC.md §4.1's
+#     Ubuntu-native stdenv — stays unguarded; it has to be able to unpack
+#     debs and run maintainer scripts to build the image in the first
+#     place). These guards apply to the RUNNING system only.
+#   - The real `apt`/`apt-get`/`dpkg`/`snap` binaries are moved aside (e.g.
+#     `dpkg-divert --divert /usr/bin/apt.ubx-real --rename /usr/bin/apt`,
+#     repeated per command — or an equivalent PATH-shadowing symlink
+#     approach; whichever the M2+ image-composition work settles on), and
+#     one of these three scripts is installed in their place under the
+#     original name.
+#   - Each guard is told where the real binary ended up via the
+#     UBX_GUARD_REAL_BIN environment variable (set by whatever installs the
+#     guard — a systemd-level environment file, a wrapper the divert
+#     target execs through, etc.). This is deliberate: hard-coding a
+#     guessed path (e.g. "always `.ubx-real`") risks either silently doing
+#     nothing (path wrong, binary not found) or, worse, recursing into the
+#     guard itself if the install mechanism ever reuses the guard's own
+#     name for something. A guard with no real binary configured refuses
+#     to run at all rather than guess — see ubx_guard_exec_real below.
+set -u
+
+# ubx_guard_refuse PROG REASON
+#
+# Prints the standard refusal message to stderr. PROG is the command name
+# to show in the message (e.g. "apt", "dpkg", "snap" — NOT this library's
+# own name); REASON is a single sentence specific to why this invocation
+# was refused. The boilerplate underneath is identical across all three
+# guards, and identical across every refusal reason (a listed mutating
+# verb, an unrecognized verb, or arguments this guard couldn't confidently
+# parse) — SPEC.md §7 draws no distinction between "known-bad" and
+# "unknown, so assumed bad": both are refused, both point at the same fix,
+# and neither has an override. Callers are expected to `exit 1` (or
+# propagate a nonzero return) right after calling this.
+ubx_guard_refuse() {
+  local prog="$1" reason="$2"
+  {
+    echo "$prog: $reason"
+    echo
+    echo "ubuntnix systems are managed declaratively (SPEC.md §7): edit"
+    echo "/flake and run 'ubx rebuild switch' (or 'boot' / 'test') to apply"
+    echo "the change instead. This guard has no override by design --"
+    echo "imperative mutation is blocked, not reverted, and no escape valve"
+    echo "exists for it."
+  } >&2
+}
+
+# ubx_guard_exec_real PROG ARG...
+#
+# Hands off to the real binary this guard fronts, replacing the current
+# process (`exec`) so the exit code and all I/O are the real binary's,
+# unmodified -- callers of the guard cannot tell a passthrough happened.
+# PROG is the display name for error messages (see ubx_guard_refuse);
+# ARG... is the guard's own original argv, forwarded verbatim.
+#
+# Requires UBX_GUARD_REAL_BIN in the environment (see this file's header
+# for why there is no guessed fallback path): unset or non-executable
+# fails closed with a clear diagnostic rather than silently doing nothing.
+ubx_guard_exec_real() {
+  local prog="$1"
+  shift
+  if [ -z "${UBX_GUARD_REAL_BIN:-}" ]; then
+    echo "$prog: UBX_GUARD_REAL_BIN is not set -- whatever installs this guard must point it at the real $prog binary's diverted/absolute path (see bin/ubx-guard-lib's header). Refusing to guess." >&2
+    return 1
+  fi
+  if [ ! -x "$UBX_GUARD_REAL_BIN" ]; then
+    echo "$prog: UBX_GUARD_REAL_BIN=$UBX_GUARD_REAL_BIN is not an executable file" >&2
+    return 1
+  fi
+  exec "$UBX_GUARD_REAL_BIN" "$@"
+}

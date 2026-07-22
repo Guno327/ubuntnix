@@ -163,7 +163,7 @@ die() {
 }
 
 usage() {
-  cat <<USAGE
+  cat <<'USAGE'
 usage: ubx-etc <command> [options]
 
 commands:
@@ -218,7 +218,7 @@ write_out() {
 # =====================================================================
 
 cmd_exceptions_usage() {
-  cat <<USAGE
+  cat <<'USAGE'
 usage: ubx-etc exceptions [--file FILE]
 
 Prints every machine-local mutable exception path, one per line, sorted.
@@ -257,7 +257,7 @@ PYEOF
 # =====================================================================
 
 cmd_observe_usage() {
-  cat <<USAGE
+  cat <<'USAGE'
 usage: ubx-etc observe --dir DIR [--out FILE|-]
 
 Walks DIR recursively and emits an observed-state manifest (this script's
@@ -352,7 +352,7 @@ PYEOF
 # =====================================================================
 
 cmd_plan_usage() {
-  cat <<USAGE
+  cat <<'USAGE'
 usage: ubx-etc plan --old-manifest FILE --new-manifest FILE \\
          --observed-manifest FILE [--exceptions FILE] [--out FILE|-]
 

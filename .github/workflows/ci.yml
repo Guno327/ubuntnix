@@ -131,6 +131,35 @@ jobs:
             cat mismatch.log
             exit 1
           }
+      # Generated /etc proof (SPEC.md §4.2/§4.3; issue #26, M2):
+      # nix/etc.nix's `render` evaluated end to end against a small fixture
+      # declaration (two entries: a `text` file and a `text` file with
+      # non-default owner/group/mode) -- the one part of this issue that
+      # can only be exercised where a real `nix` binary exists; the
+      # planner half (bin/ubx-etc) is unit-tested without one under
+      # tests/unit/11x (see nix/etc.nix's own header, "What this file is,
+      # and what it deliberately is NOT").
+      - name: Build etc-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#etc-proof -L -o result-etc-proof
+          sudo chown -R "$USER" result-etc-proof
+      - name: Assert etc-proof output tree + manifest
+        run: |
+          [ -f result-etc-proof/tree/motd ] || { echo "no tree/motd in etc-proof output"; exit 1; }
+          [ -f result-etc-proof/tree/app/config.json ] || { echo "no tree/app/config.json in etc-proof output"; exit 1; }
+          grep -q 'Welcome to ubuntnix.' result-etc-proof/tree/motd || {
+            echo "tree/motd does not contain the declared text"; exit 1;
+          }
+          [ -f result-etc-proof/manifest.json ] || { echo "no manifest.json in etc-proof output"; exit 1; }
+          python3 -c "
+import json
+m = json.load(open('result-etc-proof/manifest.json'))
+assert m['version'] == 1, m
+paths = sorted(e['path'] for e in m['entries'])
+assert paths == ['app/config.json', 'motd'], paths
+cfg = next(e for e in m['entries'] if e['path'] == 'app/config.json')
+assert (cfg['owner'], cfg['group'], cfg['mode']) == ('root', 'root', '0640'), cfg
+"
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

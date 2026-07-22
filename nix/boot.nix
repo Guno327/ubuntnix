@@ -647,7 +647,7 @@ let
       tools = toolsFHS {
         inherit system;
         name = "diskimage-${name}";
-        packages = [ "grub-pc-bin" "grub-common" "dosfstools" "mtools" "parted" ];
+        packages = [ "grub-pc-bin" "grub-common" "grub2-common" "dosfstools" "mtools" "parted" ];
       };
     in
     runInUbuntuBase {

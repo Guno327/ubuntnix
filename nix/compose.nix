@@ -389,7 +389,16 @@ let
     runInUbuntuBase {
       inherit system;
       name = "rootfs-${name}";
-      env = debEnv;
+      env = debEnv // {
+        # scanScript — bin/ubx-scan-deb-ownership itself, staged into the
+        # sandbox the same way bin/ubx-gen-grub-cfg's `genScript` is
+        # (nix/boot.nix's grubCfg): a plain source-path env attr, copied
+        # into $out/.ubx-compose below and invoked BY PATH from inside the
+        # chroot (scanLines above), never sourced -- unlike genScript, this
+        # script shells out to dpkg-deb/tar, so it needs a real FHS root
+        # (chroot) around it, not the raw-loader trick.
+        scanScript = ../bin/ubx-scan-deb-ownership;
+      };
       script = ''
         # ubxrun BIN ARGS... — invoke a dynamically-linked ubuntu-base
         # binary through its own ELF interpreter (nix/stdenv.nix's
@@ -445,6 +454,14 @@ let
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-compose/debs"
         ${debCopyLines}
 
+        # Stage bin/ubx-scan-deb-ownership itself (see the `scanScript` env
+        # attr comment above) -- scanLines/restoreLines (spliced into
+        # configure.sh below) invoke it BY PATH from inside the chroot as
+        # "/.ubx-compose/ubx-scan-deb-ownership", so it must exist there,
+        # executable, before enter.sh's chroot(2) happens.
+        ubxrun "$UBX_BASE/bin/cp" "$scanScript" "$out/.ubx-compose/ubx-scan-deb-ownership"
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/ubx-scan-deb-ownership"
+
         # Stage the rendered preseed data (see renderPreseed above):
         # tab-separated "pkg<TAB>question<TAB>value" records. This heredoc
         # embeds plain user-supplied strings only (no derivation-output
@@ -490,6 +507,15 @@ let
         # order-insensitive data (hash keys) comes out.
         export PERL_HASH_SEED=0 PERL_PERTURB_KEYS=0
 
+        # ubx_tab — a literal tab character, used by scanLines/restoreLines
+        # (spliced below) to split bin/ubx-scan-deb-ownership's TAB-
+        # separated records. dash (this script's own /bin/sh) has no
+        # `$'\t'` ANSI-C quoting, so `IFS="$(printf '\t')"` is the portable
+        # way to split on a literal tab alone -- see this file's own
+        # scanLines/restoreLines comment above for why plain default IFS
+        # (which also splits on spaces) is not good enough here.
+        ubx_tab="$(printf '\t')"
+
         # /dev was prepared BEFORE this chroot, by enter.sh (see below):
         # bind mounts of the outer build sandbox's own device nodes onto
         # plain-file mountpoints under $out/dev. mknod is NOT an option
@@ -524,7 +550,42 @@ let
         # this order also pins those files' content, independent of
         # whatever filesystem/locale glob-matching behavior would
         # otherwise apply.
+        #
+        # scanLines (PR #36; see this file's header "PR #36" section and
+        # bin/ubx-scan-deb-ownership's own header for the full design) runs
+        # BEFORE unpack, per package, in the same pass: it discovers every
+        # non-root-owned path that package's data.tar carries (which
+        # `dpkg --unpack` would otherwise hard-fail chown()-ing under this
+        # chroot's single-id-mapped user namespace), path-excludes it from
+        # dpkg's own extraction, pre-creates any such DIRECTORY now (a
+        # later package's file may need it as a mkdir target), and records
+        # its true intended owner as an mksquashfs pseudo-file "modify"
+        # line in /.ubx-ownership-pseudo.txt, applied at IMAGE-PACK time by
+        # squashfsImage (nix/compose.nix, below) instead of by chown(2)
+        # here. `mkdir -p`/`touch` first: a bare Ubuntu-base chroot is not
+        # guaranteed to already carry /etc/dpkg/dpkg.cfg.d (dpkg.cfg(5)
+        # reads every file under it automatically), and the pseudo-file
+        # manifest must exist -- even empty -- for squashfsImage to always
+        # find it, independent of whether any package in this run actually
+        # ships a non-root-owned entry.
+        mkdir -p /etc/dpkg/dpkg.cfg.d
+        touch /.ubx-ownership-pseudo.txt
+        ${scanLines}
+
         ${unpackLines}
+
+        # restoreLines (PR #36; see scanLines above and
+        # bin/ubx-scan-deb-ownership's own header): for every FILE/symlink/
+        # hardlink entry scanLines found (directories were already created
+        # above), extract that ONE archive member's real content+mode
+        # straight from its already-staged .deb into its real place --
+        # content/mode restoration needs no id-mapping, only the OWNER is
+        # deferred to squashfsImage's pack-time pseudo-file pass. Runs
+        # AFTER unpack (the target directory tree, including any OTHER
+        # package's contribution, must already exist) but BEFORE
+        # `dpkg --configure -a` below, so maintainer postinst scripts see
+        # the same tree a real, unrestricted install would have produced.
+        ${restoreLines}
 
         # Expand the 3-field preseed records into debconf-set-selections'
         # required 4-field form ("owner question type value") by looking
@@ -817,9 +878,28 @@ let
         # flat extraction has no such symlink, proven by CI run
         # 29786592587: mksquashfs failed to load liblzo2.so.2 with only
         # the usr/lib path on the search path).
+        # -pf/-e (PR #36; see composeRootfs's scanLines/restoreLines
+        # comment above and bin/ubx-scan-deb-ownership's own header for the
+        # full design): $rootfs/.ubx-ownership-pseudo.txt is composeRootfs's
+        # own manifest of every non-root-owned path some package's data.tar
+        # carried, which `dpkg --unpack`'s in-chroot chown() could not
+        # apply directly (EINVAL under that chroot's single-id-mapped user
+        # namespace). `-pf` (squashfs-tools 4.6.1's "m"/modify pseudo-file
+        # syntax, matching what scanLines already writes: "<path relative,
+        # no leading slash> m <mode> <uid> <gid>") applies each such
+        # path's TRUE owner directly to the squashfs inode metadata at
+        # PACK time here -- no chown(2) syscall at all, so this sandbox's
+        # id-mapping limit never applies to it. The manifest file itself
+        # is composeRootfs's own bookkeeping, not part of the real Ubuntu
+        # system `$rootfs` otherwise represents -- always present (even
+        # empty: composeRootfs unconditionally `touch`es it) but excluded
+        # from the image's actual CONTENT via `-e`, the same bare
+        # rootfs-relative path convention `-pf`'s own entries and
+        # composeRootfs's `path-exclude=` lines already use.
         "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu:$tools/lib/x86_64-linux-gnu" \
           "$tools/usr/bin/mksquashfs" "$rootfs" "$out/rootfs.squashfs" \
-          -mkfs-time 0 -all-time 0 -no-progress -processors 1
+          -mkfs-time 0 -all-time 0 -no-progress -processors 1 \
+          -pf "$rootfs/.ubx-ownership-pseudo.txt" -e .ubx-ownership-pseudo.txt
       '';
     };
 in

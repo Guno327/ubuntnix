@@ -23,6 +23,7 @@
         ./nix/stdenv.nix
         ./nix/archive.nix
         ./nix/compose.nix
+        ./nix/users.nix
       ];
     };
 }

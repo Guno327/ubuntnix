@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""bin/ubx-users -- the users primitive's convergence PLANNER and a thin
+EXECUTOR (SPEC.md §4.3 "Users" row, §6, §7; GitHub issue #28, milestone
+M2).
+
+-- Why this lives outside Nix, as a script under bin/ -----------------------
+
+Exactly the same reasoning nix/archive.nix / bin/ubx-resolve split fetching
+(pure, hash-pinned) from resolution (inherently impure -- "what does this
+resolve to *right now*"): convergence is inherently a function of REAL,
+observed system state (the actual /etc/passwd, /etc/group, /etc/shadow on a
+running machine) that Nix's build graph has no business seeing. nix/users.nix
+owns the declaration surface and renders it to a flat JSON manifest (see that
+file's header for the schema); this script CONSUMES that manifest plus
+fixture (in tests) or real (at activation) copies of passwd/group/shadow and
+decides what needs to change. Kept in one deterministic, pure-Python
+file specifically so the planner half can be unit-tested with zero root,
+network, or `nix` binary (tests/README.md's own rule) -- see
+tests/unit/100-ubx-users-parsing.sh through 103-ubx-users-executor.sh.
+
+-- The two subcommands, and why they're separate ---------------------------
+
+  ubx-users plan --manifest FILE --passwd FILE --group FILE --shadow FILE
+                  [--exceptions FILE] [--home-state FILE] [--out FILE]
+    Pure function of its inputs: declared manifest + observed passwd/group/
+    shadow (+ optional exceptions/home-state fixtures) -> a deterministic
+    JSON PLAN on stdout (or --out). Never touches a real system. This is
+    the half tests/unit/ exercises heavily -- see "The plan schema" below.
+
+  ubx-users execute --plan FILE [--format shell|json] [--out FILE]
+    Translates an already-computed plan into the EXACT command sequence
+    that converges a real system to it (useradd/usermod/groupadd/gpasswd,
+    plus the authorized_keys file-materialization steps) -- emission only.
+    Deliberately does NOT run anything itself: SPEC.md §11 M2 scopes this
+    issue to "converge passwd/groups state" being *testable*, the same way
+    issue #31's apt/dpkg/snap guards were unit-tested standalone with real
+    activation-image wiring explicitly deferred (see docs/guards.md's "What
+    is deferred"). Real execution inside a running system's activation path
+    is follow-up work once that wiring exists; see docs/users.md.
+
+Keeping `execute` a thin, separate translation step (rather than folding
+command-emission into `plan`) is what SPEC.md's own convergence-diagram
+row means by "Live switch ... users/home ... none [downtime]": the plan is
+inspectable and diffable on its own before anything is applied, and unit
+tests cover the planner's decisions in complete isolation from how those
+decisions eventually get executed.
+
+-- The manifest schema (produced by nix/users.nix's `renderManifestJSON`) --
+
+  {
+    "version": 1,
+    "users": [
+      { "name": ..., "uid": <int|null>, "system": <bool>,
+        "shell": "/usr/bin/bash", "home": <str|null>, "createHome": <bool>,
+        "groups": [ ... ], "authorizedKeys": [ "ssh-ed25519 ... ", ... ] },
+      ...
+    ],
+    "groups": [
+      { "name": ..., "gid": <int|null>, "system": <bool> },
+      ...
+    ]
+  }
+`home: null` means "default to /home/<name>" (HOME_DEFAULT_FMT below);
+`uid`/`gid: null` means "the planner auto-allocates one" (see "UID/GID
+allocation" below). This exact schema is also accepted directly as a hand-
+written JSON fixture by every planner test in tests/unit/ -- nothing about
+`plan` requires having gone through Nix at all, matching this repo's "no
+`nix` binary in the dev harness" constraint.
+
+-- UID/GID allocation -------------------------------------------------------
+
+Mirrors Debian/Ubuntu shadow-utils' own /etc/login.defs defaults (unchanged
+on stock Ubuntu 24.04): SYS_UID_MIN/MAX = 100/999, UID_MIN/MAX = 1000/59999,
+and the identical SYS_GID_MIN/MAX, GID_MIN/MAX for groups. A user/group's own
+`system` flag selects the range; within it, the LOWEST free id (not already
+used by an observed account, nor already handed out earlier in this same
+planning run) is picked -- deterministic for a fixed observed-state input.
+An explicit `uid`/`gid` is always honored verbatim (never range-checked
+against `system`) -- see userType's own description in nix/users.nix for why.
+
+-- What counts as "managed" -------------------------------------------------
+
+The planner only ever looks at: (1) declared users/groups, and (2)
+"required" groups -- every declared group, plus every group any declared
+user's `groups` list references. It never inspects, reports on, or plans a
+change to any OTHER passwd/group entry (SPEC.md §7's "never plan changes to
+non-declared users or system accounts not under management"). Anomalies
+found strictly WITHIN that managed domain (a managed group's observed
+membership includes a user this manifest doesn't declare; an existing
+managed group's observed gid disagrees with an explicit declared one; a
+malformed passwd/group line) are reported as `drift` entries -- surfaced,
+never silently auto-corrected (SPEC.md §7's converge-report posture) --
+and do not by themselves fail the run (only `errors` -- uid/gid conflicts
+with a FOREIGN account -- do that; see "Errors vs. drift" below).
+
+-- Errors vs. drift ---------------------------------------------------------
+
+A hard `errors` entry (nonzero exit) is reserved for exactly one class of
+problem: a declared, explicit uid/gid that a FOREIGN (non-declared) account
+already holds. SPEC.md's own acceptance line for this issue is explicit:
+"declared uid already taken by a foreign user -> error, not silent
+adoption" -- creating (or renaming into) that identity would either fail at
+the OS level anyway or, worse, silently start managing an account this
+manifest never declared. Every other anomaly is `drift`: informational,
+inspectable, and left for a human to resolve deliberately.
+
+-- Machine-local exceptions -------------------------------------------------
+
+`--exceptions FILE`: a JSON object `{ "<user>": ["shell", "home", "uid",
+"groups", "authorizedKeys"], ... }` naming, per declared user, which fields
+the planner must leave alone even if the declared value disagrees with what
+it observes -- SPEC.md §4.2's "machine-local mutable exceptions" concept,
+narrowed to this primitive's own fields (no exceptions file at all, or a
+user/field pair not listed in it, is fully converged as normal).
+
+-- authorizedKeys materialization -------------------------------------------
+
+`--home-state FILE` (optional): a JSON object `{ "<user>": ["key line",
+...], ... }` representing the authorized_keys lines *currently* observed for
+that user (there is no such thing in passwd/group/shadow -- this is the
+planner's one fixture input that isn't shadow-file-shaped). A declared
+user's authorizedKeys plan entry is only emitted when it differs from this
+(omitted user/key entirely -> treated as empty, i.e. "nothing observed
+yet"); this is what makes the "no-op on an already-converged fixture"
+acceptance case reachable even for a manifest that declares keys.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+PROG = "ubx-users"
+
+# -- UID/GID range constants (Debian/Ubuntu shadow-utils defaults; see this
+# file's own header, "UID/GID allocation") -----------------------------------
+SYS_UID_MIN, SYS_UID_MAX = 100, 999
+UID_MIN, UID_MAX = 1000, 59999
+SYS_GID_MIN, SYS_GID_MAX = 100, 999
+GID_MIN, GID_MAX = 1000, 59999
+
+NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+KEY_LINE_RE = re.compile(r"^\S+ \S+")
+
+
+def die(msg):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# -- fixture parsing (passwd / group / shadow) -------------------------------
+#
+# Each parser returns (entries, malformed) rather than raising on a bad
+# line: a single corrupt line in an otherwise-fine fixture/real file
+# shouldn't abort the whole run -- it becomes a `malformed_*_line` drift
+# entry instead (see this file's header, "What counts as managed"), and
+# that one entry is simply excluded from further processing (never guessed
+# at).
+
+
+def parse_passwd(path):
+    entries = {}
+    malformed = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.rstrip("\n")
+            if line == "":
+                continue
+            fields = line.split(":")
+            if len(fields) != 7 or not fields[2].isdigit() or not fields[3].isdigit():
+                malformed.append({"file": "passwd", "line": lineno, "text": line})
+                continue
+            name, _passwd, uid, gid, gecos, home, shell = fields
+            entries[name] = {
+                "uid": int(uid),
+                "gid": int(gid),
+                "gecos": gecos,
+                "home": home,
+                "shell": shell,
+            }
+    return entries, malformed
+
+
+def parse_group(path):
+    entries = {}
+    malformed = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.rstrip("\n")
+            if line == "":
+                continue
+            fields = line.split(":")
+            if len(fields) != 4 or not fields[2].isdigit():
+                malformed.append({"file": "group", "line": lineno, "text": line})
+                continue
+            name, _passwd, gid, members_field = fields
+            members = [m for m in members_field.split(",") if m != ""]
+            entries[name] = {"gid": int(gid), "members": members}
+    return entries, malformed
+
+
+def parse_shadow_names(path):
+    names = set()
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if line == "":
+                continue
+            name = line.split(":", 1)[0]
+            if name:
+                names.add(name)
+    return names
+
+
+def load_json(path, default):
+    if path is None:
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+# -- manifest validation ------------------------------------------------------
+#
+# Defense-in-depth, independent of nix/users.nix's own eval-time checks
+# (this script's tests hand-craft manifest.json fixtures directly, with no
+# `nix` binary involved at all -- see this file's header): a manifest that
+# reaches `plan` is re-validated here rather than trusted blindly.
+
+
+def validate_manifest(manifest):
+    errors = []
+    if not isinstance(manifest, dict):
+        return ["manifest top level is not a JSON object"]
+    if manifest.get("version") != 1:
+        errors.append(f"manifest 'version' must be 1, got {manifest.get('version')!r}")
+
+    users = manifest.get("users")
+    if not isinstance(users, list):
+        errors.append("manifest 'users' must be a list")
+        users = []
+    groups = manifest.get("groups")
+    if not isinstance(groups, list):
+        errors.append("manifest 'groups' must be a list")
+        groups = []
+
+    seen_user_names = set()
+    seen_uids = {}
+    for i, u in enumerate(users):
+        label = f"users[{i}]"
+        if not isinstance(u, dict):
+            errors.append(f"{label} is not an object")
+            continue
+        name = u.get("name")
+        label = f"users[{i}] ({name!r})"
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            errors.append(f"{label} 'name' is not a valid username (must match {NAME_RE.pattern})")
+        elif name in seen_user_names:
+            errors.append(f"duplicate declared user name: {name!r}")
+        else:
+            seen_user_names.add(name)
+
+        uid = u.get("uid")
+        if uid is not None and (not isinstance(uid, int) or isinstance(uid, bool) or uid < 0):
+            errors.append(f"{label} 'uid' must be null or a non-negative integer, got {uid!r}")
+        elif uid is not None:
+            if uid in seen_uids:
+                errors.append(
+                    f"duplicate explicit uid {uid} declared by {seen_uids[uid]!r} and {name!r}"
+                )
+            else:
+                seen_uids[uid] = name
+
+        if not isinstance(u.get("system", False), bool):
+            errors.append(f"{label} 'system' must be a boolean")
+        if not isinstance(u.get("createHome", True), bool):
+            errors.append(f"{label} 'createHome' must be a boolean")
+
+        shell = u.get("shell")
+        if not isinstance(shell, str) or not shell.startswith("/"):
+            errors.append(f"{label} 'shell' must be an absolute path string, got {shell!r}")
+
+        home = u.get("home")
+        if home is not None and (not isinstance(home, str) or not home.startswith("/")):
+            errors.append(f"{label} 'home' must be null or an absolute path string, got {home!r}")
+
+        ugroups = u.get("groups", [])
+        if not isinstance(ugroups, list) or not all(
+            isinstance(g, str) and NAME_RE.match(g) for g in ugroups
+        ):
+            errors.append(f"{label} 'groups' must be a list of valid group names")
+
+        keys = u.get("authorizedKeys", [])
+        if not isinstance(keys, list) or not all(
+            isinstance(k, str) and KEY_LINE_RE.match(k) and "\n" not in k and "\t" not in k
+            for k in keys
+        ):
+            errors.append(f"{label} 'authorizedKeys' must be a list of single key lines")
+
+    seen_group_names = set()
+    seen_gids = {}
+    for i, g in enumerate(groups):
+        label = f"groups[{i}]"
+        if not isinstance(g, dict):
+            errors.append(f"{label} is not an object")
+            continue
+        name = g.get("name")
+        label = f"groups[{i}] ({name!r})"
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            errors.append(f"{label} 'name' is not a valid group name (must match {NAME_RE.pattern})")
+        elif name in seen_group_names:
+            errors.append(f"duplicate declared group name: {name!r}")
+        else:
+            seen_group_names.add(name)
+
+        gid = g.get("gid")
+        if gid is not None and (not isinstance(gid, int) or isinstance(gid, bool) or gid < 0):
+            errors.append(f"{label} 'gid' must be null or a non-negative integer, got {gid!r}")
+        elif gid is not None:
+            if gid in seen_gids:
+                errors.append(
+                    f"duplicate explicit gid {gid} declared by {seen_gids[gid]!r} and {name!r}"
+                )
+            else:
+                seen_gids[gid] = name
+
+        if not isinstance(g.get("system", False), bool):
+            errors.append(f"{label} 'system' must be a boolean")
+
+    return errors
+
+
+# -- id allocation ------------------------------------------------------------
+
+
+def alloc_id(used, planned, is_system, kind):
+    ranges = {
+        ("user", False): (UID_MIN, UID_MAX),
+        ("user", True): (SYS_UID_MIN, SYS_UID_MAX),
+        ("group", False): (GID_MIN, GID_MAX),
+        ("group", True): (SYS_GID_MIN, SYS_GID_MAX),
+    }
+    lo, hi = ranges[(kind, bool(is_system))]
+    for candidate in range(lo, hi + 1):
+        if candidate not in used and candidate not in planned:
+            return candidate
+    raise PlannerError(f"no free {'system' if is_system else 'normal'} {kind} id in range {lo}-{hi}")
+
+
+class PlannerError(Exception):
+    pass
+
+
+# -- the planner --------------------------------------------------------------
+
+
+def build_plan(manifest, passwd, group_entries, shadow_names, exceptions, home_state,
+                passwd_malformed, group_malformed):
+    errors = []
+    drift = []
+
+    declared_users = {u["name"]: u for u in manifest["users"]}
+    declared_groups = {g["name"]: g for g in manifest["groups"]}
+
+    for m in passwd_malformed:
+        drift.append({"kind": "malformed_passwd_line", "line": m["line"], "text": m["text"]})
+    for m in group_malformed:
+        drift.append({"kind": "malformed_group_line", "line": m["line"], "text": m["text"]})
+
+    # -- required groups: every declared group, plus every group any
+    # declared user's `groups` list references (this file's header, "What
+    # counts as managed").
+    required_group_names = set(declared_groups) | {
+        g for u in declared_users.values() for g in u.get("groups", [])
+    }
+
+    used_gids = {ent["gid"] for ent in group_entries.values()}
+    planned_gids = set()
+    groups_create = []
+    for name in sorted(required_group_names):
+        if name in group_entries:
+            obs = group_entries[name]
+            decl = declared_groups.get(name)
+            if decl is not None and decl.get("gid") is not None and decl["gid"] != obs["gid"]:
+                drift.append({
+                    "kind": "group_gid_mismatch",
+                    "group": name,
+                    "declared_gid": decl["gid"],
+                    "observed_gid": obs["gid"],
+                })
+            continue
+        decl = declared_groups.get(name)
+        gid = decl["gid"] if decl is not None else None
+        system = bool(decl["system"]) if decl is not None else False
+        if gid is not None:
+            if gid in used_gids:
+                errors.append(
+                    f"group '{name}': declared gid {gid} is already used by a different "
+                    "group in the observed /etc/group (not silently adopting)"
+                )
+                continue
+        else:
+            try:
+                gid = alloc_id(used_gids | planned_gids, planned_gids, system, "group")
+            except PlannerError as e:
+                errors.append(str(e))
+                continue
+        planned_gids.add(gid)
+        groups_create.append({"name": name, "gid": gid, "system": system})
+
+    used_uids = {ent["uid"] for ent in passwd.values()}
+    planned_uids = set()
+    users_create = []
+    users_modify = []
+    membership_add = []
+    membership_remove = []
+
+    for name in sorted(declared_users):
+        decl = declared_users[name]
+        exc = set(exceptions.get(name, []))
+        decl_home = decl.get("home") or f"/home/{name}"
+        decl_groups = sorted(decl.get("groups", []))
+
+        if name not in passwd:
+            uid = decl.get("uid")
+            if uid is not None:
+                if uid in used_uids:
+                    foreign = next(n for n, u in passwd.items() if u["uid"] == uid)
+                    errors.append(
+                        f"user '{name}': declared uid {uid} is already used by observed "
+                        f"user '{foreign}' (not silently adopting)"
+                    )
+                    continue
+            else:
+                try:
+                    uid = alloc_id(used_uids | planned_uids, planned_uids, bool(decl.get("system", False)), "user")
+                except PlannerError as e:
+                    errors.append(str(e))
+                    continue
+            planned_uids.add(uid)
+            users_create.append({
+                "name": name,
+                "uid": uid,
+                "system": bool(decl.get("system", False)),
+                "shell": decl["shell"],
+                "home": decl_home,
+                "createHome": bool(decl.get("createHome", True)),
+                "groups": decl_groups,
+            })
+            continue
+
+        obs = passwd[name]
+        changes = {}
+        if "uid" not in exc and decl.get("uid") is not None and decl["uid"] != obs["uid"]:
+            target = decl["uid"]
+            foreign = next(
+                (n for n, u in passwd.items() if u["uid"] == target and n != name), None
+            )
+            if foreign is not None:
+                errors.append(
+                    f"user '{name}': declared uid {target} is already used by observed "
+                    f"user '{foreign}' (not silently adopting)"
+                )
+            else:
+                changes["uid"] = {"from": obs["uid"], "to": target}
+        if "shell" not in exc and decl["shell"] != obs["shell"]:
+            changes["shell"] = {"from": obs["shell"], "to": decl["shell"]}
+        if "home" not in exc and decl_home != obs["home"]:
+            changes["home"] = {"from": obs["home"], "to": decl_home}
+        if changes:
+            users_modify.append({"name": name, "changes": changes})
+
+        if name not in shadow_names:
+            drift.append({"kind": "missing_shadow_entry", "user": name})
+
+        if "groups" not in exc:
+            observed_membership = {
+                g for g, ent in group_entries.items() if name in ent["members"]
+            }
+            declared_membership = set(decl_groups)
+            for g in sorted(declared_membership - observed_membership):
+                membership_add.append({"user": name, "group": g})
+            for g in sorted(observed_membership - declared_membership):
+                membership_remove.append({"user": name, "group": g})
+
+    # -- undeclared members of a managed (required) group: drift, never an
+    # auto-planned removal (this file's header, "What counts as managed").
+    for name in sorted(required_group_names):
+        ent = group_entries.get(name)
+        if ent is None:
+            continue
+        for member in sorted(ent["members"]):
+            if member not in declared_users:
+                drift.append({"kind": "undeclared_group_member", "group": name, "user": member})
+
+    authorized_keys = []
+    for name in sorted(declared_users):
+        decl = declared_users[name]
+        exc = set(exceptions.get(name, []))
+        keys = decl.get("authorizedKeys", [])
+        if not keys or "authorizedKeys" in exc:
+            continue
+        observed = home_state.get(name, [])
+        if list(keys) == list(observed):
+            continue
+        home = decl.get("home") or f"/home/{name}"
+        authorized_keys.append({
+            "user": name,
+            "dir": f"{home}/.ssh",
+            "path": f"{home}/.ssh/authorized_keys",
+            "dir_mode": "0700",
+            "file_mode": "0600",
+            "keys": list(keys),
+        })
+
+    drift.sort(key=lambda d: json.dumps(d, sort_keys=True))
+    errors.sort()
+
+    empty = not (
+        users_create or users_modify or groups_create
+        or membership_add or membership_remove or authorized_keys
+    )
+
+    return {
+        "version": 1,
+        "empty": empty,
+        "users": {
+            "create": users_create,
+            "modify": sorted(users_modify, key=lambda u: u["name"]),
+        },
+        "groups": {
+            "create": sorted(groups_create, key=lambda g: g["name"]),
+        },
+        "membership": {
+            "add": sorted(membership_add, key=lambda m: (m["group"], m["user"])),
+            "remove": sorted(membership_remove, key=lambda m: (m["group"], m["user"])),
+        },
+        "authorized_keys": sorted(authorized_keys, key=lambda a: a["user"]),
+        "drift": drift,
+        "errors": errors,
+    }
+
+
+def write_json(obj, out_path):
+    text = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+    if out_path is None:
+        sys.stdout.write(text)
+        return
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, out_path)
+
+
+def cmd_plan(args):
+    manifest = load_json(args.manifest, None)
+    if manifest is None:
+        die("--manifest is required")
+    m_errors = validate_manifest(manifest)
+    if m_errors:
+        die("manifest failed validation:\n" + "\n".join(f"  - {e}" for e in m_errors))
+
+    passwd, passwd_malformed = parse_passwd(args.passwd)
+    group_entries, group_malformed = parse_group(args.group)
+    shadow_names = parse_shadow_names(args.shadow)
+    exceptions = load_json(args.exceptions, {})
+    home_state = load_json(args.home_state, {})
+
+    plan = build_plan(
+        manifest, passwd, group_entries, shadow_names, exceptions, home_state,
+        passwd_malformed, group_malformed,
+    )
+    write_json(plan, args.out)
+    sys.exit(1 if plan["errors"] else 0)
+
+
+# -- the executor: plan -> exact command sequence (emission only) -----------
+#
+# See this file's header, "The two subcommands, and why they're separate":
+# this never runs anything itself. Ordering is fixed and deterministic:
+# groups.create, users.create, users.modify, membership.remove,
+# membership.add, authorized_keys -- each already sorted by the planner
+# (groups/users by name, membership by (group, user)), so iterating them in
+# plan order is itself deterministic.
+
+
+def build_steps(plan):
+    steps = []
+
+    for g in plan["groups"]["create"]:
+        argv = ["groupadd", "-g", str(g["gid"])]
+        if g["system"]:
+            argv.append("-r")
+        argv.append(g["name"])
+        steps.append({"op": "run", "argv": argv})
+
+    for u in plan["users"]["create"]:
+        argv = ["useradd", "-u", str(u["uid"])]
+        if u["system"]:
+            argv.append("-r")
+        argv.append("-m" if u["createHome"] else "-M")
+        argv += ["-d", u["home"], "-s", u["shell"]]
+        if u["groups"]:
+            argv += ["-G", ",".join(sorted(u["groups"]))]
+        argv.append(u["name"])
+        steps.append({"op": "run", "argv": argv})
+
+    for u in plan["users"]["modify"]:
+        changes = u["changes"]
+        argv = ["usermod"]
+        if "uid" in changes:
+            argv += ["-u", str(changes["uid"]["to"])]
+        if "home" in changes:
+            argv += ["-d", changes["home"]["to"]]
+        if "shell" in changes:
+            argv += ["-s", changes["shell"]["to"]]
+        argv.append(u["name"])
+        steps.append({"op": "run", "argv": argv})
+
+    for m in plan["membership"]["remove"]:
+        steps.append({"op": "run", "argv": ["gpasswd", "-d", m["user"], m["group"]]})
+    for m in plan["membership"]["add"]:
+        steps.append({"op": "run", "argv": ["gpasswd", "-a", m["user"], m["group"]]})
+
+    for a in plan["authorized_keys"]:
+        content = "".join(line + "\n" for line in a["keys"])
+        steps.append({"op": "mkdir", "path": a["dir"], "mode": a["dir_mode"]})
+        steps.append({"op": "chown", "path": a["dir"], "owner": a["user"], "group": a["user"]})
+        steps.append({"op": "write_file", "path": a["path"], "mode": a["file_mode"], "content": content})
+        steps.append({"op": "chown", "path": a["path"], "owner": a["user"], "group": a["user"]})
+
+    return steps
+
+
+def shquote(s):
+    if s == "" or re.search(r"[^A-Za-z0-9_./:,=-]", s):
+        return "'" + s.replace("'", "'\\''") + "'"
+    return s
+
+
+def steps_to_shell(steps):
+    lines = ["#!/bin/sh", "set -eu", ""]
+    heredoc_i = 0
+    for step in steps:
+        op = step["op"]
+        if op == "run":
+            lines.append(" ".join(shquote(a) for a in step["argv"]))
+        elif op == "mkdir":
+            lines.append(f"mkdir -p {shquote(step['path'])}")
+            lines.append(f"chmod {step['mode']} {shquote(step['path'])}")
+        elif op == "chown":
+            lines.append(f"chown {shquote(step['owner'])}:{shquote(step['group'])} {shquote(step['path'])}")
+        elif op == "write_file":
+            heredoc_i += 1
+            delim = f"UBX_USERS_WRITE_FILE_{heredoc_i}"
+            lines.append(f"cat > {shquote(step['path'])} <<'{delim}'")
+            lines.append(step["content"].rstrip("\n"))
+            lines.append(delim)
+            lines.append(f"chmod {step['mode']} {shquote(step['path'])}")
+        else:  # pragma: no cover -- defensive; build_steps never emits this
+            raise PlannerError(f"unknown step op: {op!r}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_execute(args):
+    plan = load_json(args.plan, None)
+    if plan is None:
+        die("--plan is required")
+    steps = build_steps(plan)
+    if args.format == "json":
+        write_json(steps, args.out)
+    else:
+        text = steps_to_shell(steps)
+        if args.out is None:
+            sys.stdout.write(text)
+        else:
+            tmp = args.out + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, args.out)
+    sys.exit(0)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description=(
+            "Users-primitive convergence planner and thin command-sequence "
+            "executor (SPEC.md §4.3 'Users'; issue #28, milestone M2)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_plan = sub.add_parser("plan", help="compute a convergence plan from a manifest + observed state")
+    p_plan.add_argument("--manifest", required=True, help="declared users/groups manifest (nix/users.nix's renderManifestJSON output)")
+    p_plan.add_argument("--passwd", required=True, help="observed /etc/passwd (or a fixture copy)")
+    p_plan.add_argument("--group", required=True, help="observed /etc/group (or a fixture copy)")
+    p_plan.add_argument("--shadow", required=True, help="observed /etc/shadow (or a fixture copy)")
+    p_plan.add_argument("--exceptions", default=None, help="optional machine-local-exceptions JSON")
+    p_plan.add_argument("--home-state", default=None, dest="home_state", help="optional observed authorized_keys JSON")
+    p_plan.add_argument("--out", default=None, help="write the plan here instead of stdout")
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_exec = sub.add_parser("execute", help="translate a plan into the exact command sequence (emission only)")
+    p_exec.add_argument("--plan", required=True, help="a plan produced by 'plan'")
+    p_exec.add_argument("--format", choices=["shell", "json"], default="shell", help="output format (default: shell)")
+    p_exec.add_argument("--out", default=None, help="write the sequence here instead of stdout")
+    p_exec.set_defaults(func=cmd_execute)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except (OSError, json.JSONDecodeError) as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()

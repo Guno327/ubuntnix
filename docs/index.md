@@ -47,6 +47,10 @@ milestone plan.
 - {doc}`generations` — the generation model: on-disk layout, numbering,
   retention, and GC planning (planner implemented in M2; activation and
   deletion land later).
+- {doc}`etc` — the generated `/etc`: declared-entry compilation, the
+  machine-local mutable exceptions, and the diff-driven activation planner
+  (compile + plan implemented in M2; applying a plan to a real `/etc` lands
+  later).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -62,5 +66,6 @@ archive
 guards
 generations
 users
+etc
 reference/index
 ```

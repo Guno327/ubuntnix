@@ -403,7 +403,20 @@ let
         # final artifact regardless: Nix re-canonicalizes $out read-only at
         # registration).
         ubxrun "$UBX_BASE/bin/cp" -r --preserve=mode,timestamps,links --no-preserve=ownership "$base/." "$out/"
-        ubxrun "$UBX_BASE/bin/chmod" u+w "$out"
+        # -R, not just $out's own top-level mode: Nix CANONICALIZES every
+        # path inside a registered store output to a read-only mode (0444
+        # for files, 0555 for directories) when it registers `$base`, and
+        # the --preserve=mode copy above faithfully carries that whole
+        # read-only tree onto $out. Restoring owner-write on $out alone is
+        # therefore not enough -- the writes below create entries under
+        # NESTED directories (/usr/local/bin, /etc, /ubx/...), each of
+        # which arrives 0555 and rejects them ("ln: failed to create
+        # symbolic link '.../usr/local/bin/ubx': Permission denied", CI run
+        # 29957021613). Cosmetic in the final artifact either way: Nix
+        # re-canonicalizes $out read-only at registration, and the image's
+        # true set*id/ownership metadata is applied at mksquashfs pack time
+        # from nix/compose.nix's pseudo-file manifest, not from these bits.
+        ubxrun "$UBX_BASE/bin/chmod" -R u+w "$out"
 
         # -- /ubx store skeleton + the CLI aboard (scope item 3) -----------
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/ubx/bin" "$out/ubx/store" "$out/ubx/var"

@@ -90,11 +90,31 @@
 # resolving its seed set is expected to grow the package count, not
 # reproduce the old fixture's exact 5 entries.
 #
-# Trust: the `deb [signed-by=<path>] ...` sources.list line points at the
+# Trust: each `deb [signed-by=<path>] ...` sources.list line (one per
+# resolved suite -- see "Which suites get resolved" below) points at the
 # HOST's own `ubuntu-archive-keyring.gpg` (installed by the `ubuntu-keyring`
 # package, present on every Ubuntu image including the CI runner) rather
 # than `[trusted=yes]` — real signature verification against Canonical's
 # real archive key, not a blind-trust shortcut.
+#
+# -- Which suites get resolved ----------------------------------------------
+#
+# `resolve()` writes THREE lines to the scratch sources.list, not one:
+# `<series>`, `<series>-updates`, `<series>-security`, all against the same
+# snapshot timestamp/keyring/component set. Resolving against `<series>`
+# alone (the plain release pocket) was GitHub issue #39: it only ever
+# yields the OLDEST content a snapshot carries for that series, older than
+# the `-updates` content already baked into the `ubuntu-base` tarball the
+# compose step bootstraps from, so a resolve-then-compose pipeline
+# "downgraded" packages apt/dpkg had already installed (issue #39's
+# example: libpam-modules 1.5.3-5ubuntu5.5 -> 1.5.3-5ubuntu5) and left the
+# composed system security-wise behind its own base image. SPEC.md §4.4
+# scopes the public tier as "archive.ubuntu.com + security.ubuntu.com" —
+# i.e. the updates and security pockets are already in-spec, not an
+# expansion of it — and snapshot.ubuntu.com serves all three suites off
+# the exact same timestamped snapshot, so adding the two extra lines stays
+# fully hermetic: no new host, no new network source, no unpinned
+# timestamp, just more of the one pinned snapshot's own content.
 #
 # -- Never trust index metadata blindly --------------------------------------
 #
@@ -186,6 +206,15 @@ options:
                          emits them through the exact same
                          validate/sort/format logic real resolution uses.
                          Requires --snapshot.
+  --print-sources-list   testing hook: skip apt entirely. Parses
+                         --declaration (default: archive.packages.json) for
+                         series/components and prints the exact scratch
+                         sources.list real resolution would write --
+                         noble/noble-updates/noble-security suite lines
+                         against the same --snapshot/--keyring (GitHub
+                         issue #39; see this script's "Which suites get
+                         resolved" header section) -- to stdout. Requires
+                         --snapshot. No network, no apt.
   -h, --help             show this message
 
 Real resolution requires network access to snapshot.ubuntu.com and the
@@ -577,6 +606,27 @@ json.dump(entries, sys.stdout)
 PYEOF
 }
 
+# write_sources_list KEYRING SNAPSHOT_URL SERIES COMPONENTS OUT_FILE
+#
+# Pure (no network, no apt): formats the three suite lines described in
+# this script's "Which suites get resolved" header section and writes them
+# to OUT_FILE. Factored out of `resolve()` so the exact line
+# shape/order/count is directly testable via `--print-sources-list`
+# (below) without needing apt-get/dpkg-deb/network on the machine running
+# the test -- the same "pure half, testable in isolation" split
+# `emit_lockfile` uses (see this script's header, "Emission" section).
+write_sources_list() {
+  local keyring="$1" snapshot_url="$2" series="$3" components="$4" out_file="$5"
+  {
+    printf 'deb [signed-by=%s] %s %s %s\n' \
+      "$keyring" "$snapshot_url" "$series" "$components"
+    printf 'deb [signed-by=%s] %s %s-updates %s\n' \
+      "$keyring" "$snapshot_url" "$series" "$components"
+    printf 'deb [signed-by=%s] %s %s-security %s\n' \
+      "$keyring" "$snapshot_url" "$series" "$components"
+  } > "$out_file"
+}
+
 resolve() {
   local declaration_file="$1" out_file="$2" snapshot="$3" keyring="$4" work_dir_arg="$5"
 
@@ -622,9 +672,14 @@ resolve() {
   mkdir -p "$work/var/log/apt"
 
   local snapshot_url="https://snapshot.ubuntu.com/ubuntu/${snapshot}"
-  printf 'deb [signed-by=%s] %s %s %s\n' \
-    "$keyring" "$snapshot_url" "$series" "${components[*]}" \
-    > "$work/etc/apt/sources.list"
+  # Three suite lines (noble/noble-updates/noble-security), not one -- see
+  # this script's "Which suites get resolved" header section (GitHub issue
+  # #39) for why. Order is fixed so apt's own tie-breaking among equally-
+  # versioned candidates -- and thus the solver's output -- stays
+  # deterministic run over run; see tests/unit/054-ubx-resolve-suites.sh,
+  # which pins this exact line shape/order.
+  write_sources_list "$keyring" "$snapshot_url" "$series" "${components[*]}" \
+    "$work/etc/apt/sources.list"
 
   local apt_opts=(
     -o "Dir=$work"
@@ -657,7 +712,7 @@ resolve() {
     -o "Acquire::AllowInsecureRepositories=false"
   )
 
-  echo "$prog_name: updating package indices from $snapshot_url ($series: ${components[*]})..." >&2
+  echo "$prog_name: updating package indices from $snapshot_url ($series/$series-updates/$series-security: ${components[*]})..." >&2
   apt-get "${apt_opts[@]}" update -qq
 
   echo "$prog_name: solving dependency closure for: ${packages[*]}..." >&2
@@ -681,6 +736,7 @@ main() {
   local work_dir=""
   local check_only=0
   local emit_from=""
+  local print_sources_list=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -723,6 +779,10 @@ main() {
         emit_from="$2"
         shift 2
         ;;
+      --print-sources-list)
+        print_sources_list=1
+        shift
+        ;;
       -h | --help)
         usage
         exit 0
@@ -745,6 +805,19 @@ main() {
     [ -n "$snapshot" ] || die "--emit-lockfile requires --snapshot"
     [ -f "$emit_from" ] || die "resolved-package file does not exist: $emit_from"
     emit_lockfile "$emit_from" "$snapshot" "$series" "$out_file"
+    exit 0
+  fi
+
+  if [ "$print_sources_list" = 1 ]; then
+    [ -n "$snapshot" ] || die "--print-sources-list requires --snapshot"
+    local decl_tmp
+    decl_tmp="$(mktemp)"
+    trap 'rm -f "$decl_tmp"' EXIT
+    validate_declaration "$declaration_file" > "$decl_tmp" || exit 1
+    local decl_series components_line
+    { IFS= read -r decl_series; IFS= read -r components_line; } < "$decl_tmp"
+    write_sources_list "$keyring" "https://snapshot.ubuntu.com/ubuntu/${snapshot}" \
+      "$decl_series" "$components_line" /dev/stdout
     exit 0
   fi
 

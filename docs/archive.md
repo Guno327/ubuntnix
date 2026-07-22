@@ -41,6 +41,27 @@ differently:
   populated `esm` tier could not ship in the public project cache or ISOs
   even once M4 lands.
 
+## Resolving the public tier: three suites, one snapshot
+
+`bin/ubx-resolve` resolves the public tier against **three suites** of the
+one pinned `snapshot.ubuntu.com` timestamp — `noble`, `noble-updates`, and
+`noble-security` — not just the plain `noble` release pocket. This closes
+[GitHub issue #39](https://github.com/ubuntnix/ubuntnix/issues/39): a
+resolve against `noble` alone only ever yields the *oldest* content a
+snapshot carries for that series, older than the `-updates` content
+already baked into the `ubuntu-base` tarball the compose step bootstraps
+from — so a single-suite resolve pinned packages *older* than what the
+base image already had installed, and apt/dpkg "downgraded" them
+mid-compose. `SPEC.md` §4.4 already scopes the public tier as covering
+both `archive.ubuntu.com` and `security.ubuntu.com`, so resolving against
+all three suites honors that scope rather than expanding it. All three
+suite lines share the identical snapshot timestamp, keyring, and component
+set — this widens which pockets of the *one* pinned snapshot apt is
+allowed to solve against, not which archive or timestamp is trusted; see
+`bin/ubx-resolve`'s "Which suites get resolved" header comment and
+`tests/unit/054-ubx-resolve-suites.sh` for the exact line shape/order this
+pins.
+
 ## Entry schema
 
 `archive.lock.json` lives at the repository root (not under `nix/`) as

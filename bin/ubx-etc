@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+# bin/ubx-etc — diff-driven `/etc` activation PLANNER (SPEC.md §4.2
+# "generated /etc", §4.3 switching-table row 1 "generate + diff + restart
+# changed units", §7 drift reporting; GitHub issue #26, milestone M2).
+#
+# -- Scope: planner only, never touches a filesystem it's asked about ------
+#
+# This script computes what SHOULD happen; it never installs a file,
+# never chowns/chmods anything, and never deletes anything. Given two
+# generations' `/etc` manifests (as rendered by nix/etc.nix's `render` —
+# see that file's "Interface with bin/ubx-etc / bin/ubx-etc-apply") and an
+# observed-state manifest (see `observe`, below), `plan` prints a
+# deterministic, TAB-separated list of what would change. Applying that
+# plan to a real `/etc` is bin/ubx-etc-apply's job, deliberately kept in a
+# SEPARATE, thin script (see that script's header for why) — mirrors this
+# project's existing planner/executor split (bin/ubx-generations plans
+# retention/GC; nothing in that script deletes a generation directory or a
+# store artifact either).
+#
+# -- Why this depends on python3 (unlike bin/ubx-generations) ---------------
+#
+# bin/ubx-generations' header explains at length why ITS manifest format
+# is flat KEY=value, not JSON: no `nix` binary needed, no `jq`/`python3`
+# dependency, because that script picked its own on-disk format and had a
+# free choice. This script does not have that freedom: nix/etc.nix's
+# `render` is REQUIRED (this issue's own scope item 1) to emit a JSON
+# manifest — a flat array of small objects (path/sha256/owner/group/mode),
+# not the single flat field:value map bin/ubx-generations' format fits —
+# and this script must consume exactly that shape. Hand-rolled awk/sed
+# parsing of a general JSON array-of-objects is exactly the kind of fragile
+# reimplementation this project avoids elsewhere (nix/archive.nix's own
+# lockfile is JSON for the same "arbitrary-width array of records" reason,
+# and its shell-side consumers — tests/lib/validate-archive-lockfile.py,
+# bin/ubx-resolve — use python3's `json` module rather than hand-parsing).
+# `python3` is a safe dependency to add here specifically because it is
+# already effectively guaranteed present on every machine this script runs
+# on: every stock Ubuntu image (server or desktop) ships `python3` in the
+# base seed (apt itself is implemented in python3-apt), unlike `jq`, which
+# is not. This script is still expected to run natively on-device at every
+# `ubx rebuild switch` (SPEC.md §4.3), same as bin/ubx-generations — the
+# dependency tradeoff here is JSON-shape-driven, not a change in that
+# expectation.
+#
+# -- Inputs: three manifests, one schema ------------------------------------
+#
+# `plan` takes three inputs, ALL in the identical manifest schema
+# nix/etc.nix's `render` emits (see that file's header for the
+# authoritative description):
+#
+#   { "version": 1,
+#     "entries": [
+#       { "path": "ssh/sshd_config", "sha256": <64 hex>,
+#         "owner": "root", "group": "root", "mode": "0644" },
+#       ... ] }
+#
+#   --old-manifest       generation N's rendered manifest (nix/etc.nix
+#                         $out/manifest.json)
+#   --new-manifest        generation N+1's rendered manifest
+#   --observed-manifest    what is ACTUALLY on disk right now — see
+#                          `observe` below for how a real one is produced;
+#                          tests hand-craft fixture files directly in this
+#                          same schema, no real filesystem or root
+#                          privilege required to exercise `plan` itself
+#
+# Deliberately three SEPARATE manifests rather than one "diff old vs new,
+# trust that old matches reality" shortcut: SPEC.md §4.3 says activation
+# "computes the delta against observed system state", not against the
+# previous generation's own record of itself — a file hand-edited outside
+# `ubx` since the last switch (drift) must still converge correctly on the
+# NEXT switch even though the old manifest never noticed the edit. Basing
+# the diff on `--observed-manifest` (not `--old-manifest`) for content/
+# metadata comparisons is what makes that true; `--old-manifest` is
+# consulted for exactly one thing: which paths were previously MANAGED (so
+# `remove` only ever targets a path this project itself declared before —
+# see "Removal scope" below).
+#
+# -- The plan algorithm -------------------------------------------------
+#
+# For every path in the NEW manifest:
+#   - absent from observed             -> create
+#   - present, sha256 differs          -> update-content (metadata is
+#                                          re-applied as part of the same
+#                                          write; a content mismatch is
+#                                          treated as the more specific of
+#                                          the two possible actions)
+#   - present, sha256 matches, but
+#     owner/group/mode differs         -> update-metadata
+#   - present, everything matches      -> no action (already converged)
+#
+# For every path in the OLD manifest but not the NEW one (dropped from the
+# declaration):
+#   - present in observed              -> remove
+#   - absent from observed             -> no action (nothing to remove)
+#
+# For every path in OBSERVED that is in NEITHER manifest and is not a
+# machine-local mutable exception:
+#   - -> drift (see "Drift reporting", below)
+#
+# -- Removal scope (issue #26 scope item 2) ----------------------------------
+#
+# "Removal only applies to previously-managed entries (present in N's
+# manifest) — never unmanaged files": enforced structurally above — the
+# `remove` action is only ever derived by iterating `--old-manifest`'s own
+# paths, so a path this tool never declared before can never be planned
+# for removal, regardless of what `--observed-manifest` contains.
+#
+# -- Drift reporting (SPEC.md §7) --------------------------------------------
+#
+# A path present in `--observed-manifest` that belongs to neither manifest
+# (never declared by this generation OR the previous one) and is not a
+# machine-local mutable exception is UNMANAGED — SPEC.md §7 requires this
+# be surfaced, not silently deleted: "the converge report surfaces and
+# removes any drift found" describes a DIFFERENT, later component (the
+# converge report), not this planner. `drift` lines here are informational
+# only: bin/ubx-etc-apply refuses to act on them (see that script's
+# header) exactly like it refuses to act on any action string it doesn't
+# recognize — purge policy for unmanaged files is explicitly out of this
+# issue's scope (see the task's own framing: "purge policy decisions stay
+# with the converge report").
+#
+# -- Machine-local mutable exceptions: refused, not silently dropped --------
+#
+# `--exceptions` (default: <repo-root>/etc.exceptions.json, the same file
+# nix/etc.nix reads — see that file's header for why this is the single
+# committed source of truth) names every path `ubuntnix.etc` can never
+# declare. Per this issue's scope item 3 ("The planner must never plan
+# create/update/remove on exception paths even if declared"), if EITHER
+# `--old-manifest` or `--new-manifest` names an exception path, `plan`
+# REFUSES outright: it prints an error naming every offending path and
+# exits non-zero WITHOUT printing any plan lines at all (fail-closed, not
+# "skip the bad entry and carry on") — nix/etc.nix's own `validate` is
+# supposed to make this unreachable in practice (an exception path is an
+# eval-time error there), so a manifest that still contains one indicates
+# a bug or a hand-crafted/tampered file; refusing outright surfaces that
+# loudly rather than silently doing a partial, possibly-misleading
+# activation. This mirrors this project's guard scripts (bin/ubx-guard-*)
+# refusing outright rather than degrading gracefully. Exception paths that
+# merely happen to exist in `--observed-manifest` are simply never
+# considered for `drift`/`create`/`update`/`remove` — expected, not
+# reported.
+#
+# -- Output: deterministic TAB-separated plan lines --------------------------
+#
+#   ACTION<TAB>PATH<TAB>OWNER<TAB>GROUP<TAB>MODE<TAB>SHA256
+#
+# ACTION is one of create/update-content/update-metadata/remove/drift.
+# OWNER/GROUP/MODE/SHA256 are the TARGET values for the three actionable,
+# mutating actions (what the file SHOULD become); for `remove` they are
+# "-" (nothing to target); for `drift` they are the OBSERVED values
+# (diagnostic only — bin/ubx-etc-apply never reads them for a drift line).
+# Lines are sorted by PATH ascending, regardless of action — one single,
+# simple, machine-checkable ordering rule rather than a secondary
+# action-based tiebreak, so "deterministic ordering" has exactly one
+# definition here. An empty (fully converged) input produces zero lines
+# and exit 0 — a no-op plan is success, not an error.
+set -euo pipefail
+
+prog_name="ubx-etc"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+usage: ubx-etc <command> [options]
+
+commands:
+  plan       compute a deterministic create/update/remove/drift plan from
+             two generations' manifests plus an observed-state manifest
+  observe    walk a real directory and emit its observed-state manifest
+             (regular files only; see this script's header)
+  exceptions print the machine-local mutable exception paths (one per
+             line) from the committed etc.exceptions.json
+  -h, --help  show this message
+
+Run 'ubx-etc <command> --help' for a command's own options. See this
+script's header for the manifest schema, the plan algorithm, and the
+machine-local-exception refusal rule (SPEC.md §4.2, §4.3, §7).
+USAGE
+}
+
+default_repo_root() {
+  # Mirrors bin/ubx-generations' UBX_GEN_ROOT-vs-default pattern for the
+  # one path this script needs a default for: where etc.exceptions.json
+  # lives. UBX_REPO_ROOT is set by tests/run.sh; fall back to this
+  # script's own location (bin/../) so ad hoc/manual invocation works too.
+  if [ -n "${UBX_REPO_ROOT:-}" ]; then
+    echo "$UBX_REPO_ROOT"
+  else
+    (cd "$(dirname "$0")/.." && pwd)
+  fi
+}
+
+default_exceptions_file() {
+  echo "$(default_repo_root)/etc.exceptions.json"
+}
+
+# write_out FILE CONTENT — "-" means stdout; otherwise an atomic
+# temp-file + rename into place, same pattern bin/ubx-generations' own
+# atomic writers use (mv/rename is atomic; a bare redirect into the final
+# name is not).
+write_out() {
+  local out="$1" content="$2"
+  if [ "$out" = - ]; then
+    printf '%s' "$content"
+  else
+    local tmp
+    tmp="$(mktemp "$(dirname "$out")/.ubx-etc.XXXXXX")"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$out"
+  fi
+}
+
+# =====================================================================
+# exceptions
+# =====================================================================
+
+cmd_exceptions_usage() {
+  cat <<USAGE
+usage: ubx-etc exceptions [--file FILE]
+
+Prints every machine-local mutable exception path, one per line, sorted.
+--file overrides the committed etc.exceptions.json (default: the repo
+root's copy — see this script's header, "Machine-local mutable
+exceptions").
+USAGE
+}
+
+cmd_exceptions() {
+  local file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --file) [ $# -ge 2 ] || die "--file requires an argument"; file="$2"; shift 2 ;;
+      -h | --help) cmd_exceptions_usage; exit 0 ;;
+      *) echo "$prog_name: exceptions: unknown option: $1" >&2; cmd_exceptions_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$file" ] || file="$(default_exceptions_file)"
+  [ -f "$file" ] || die "exceptions: no such file: $file"
+
+  python3 - "$file" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+for e in sorted(x["path"] for x in data.get("exceptions", [])):
+    print(e)
+PYEOF
+}
+
+# =====================================================================
+# observe
+# =====================================================================
+
+cmd_observe_usage() {
+  cat <<USAGE
+usage: ubx-etc observe --dir DIR [--out FILE|-]
+
+Walks DIR recursively and emits an observed-state manifest (this script's
+own manifest schema — see the header) describing every REGULAR file found
+underneath it, relative to DIR. Symlinks, directories, and other special
+files are skipped: bin/ubx-etc-apply's copy-based activation model (see
+that script's header for the symlink-vs-copy decision) never itself
+creates anything else under a managed path, so anything else found there
+is outside this tool's model by construction, not silently
+misrepresented as a plain file.
+
+--out defaults to stdout ("-"); a real path is written atomically.
+
+This is the one subcommand in this script that touches a real filesystem
+with real ownership/permission bits (via stat) — everything `plan`
+computes is a pure function of already-produced manifest files, and needs
+no filesystem access nor privilege of its own; see this script's header,
+"Inputs: three manifests, one schema", for why the two are kept separate.
+USAGE
+}
+
+cmd_observe() {
+  local dir="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "--dir requires an argument"; dir="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_observe_usage; exit 0 ;;
+      *) echo "$prog_name: observe: unknown option: $1" >&2; cmd_observe_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$dir" ] || die "observe: --dir is required"
+  [ -d "$dir" ] || die "observe: no such directory: $dir"
+
+  local content
+  content="$(python3 - "$dir" <<'PYEOF'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+entries = []
+
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames.sort()
+    for fname in sorted(filenames):
+        full = os.path.join(dirpath, fname)
+        st = os.lstat(full)
+        if not stat.S_ISREG(st.st_mode):
+            # Symlinks/specials are outside this tool's copy-based model
+            # (see this command's --help); silently skipped, not an error.
+            continue
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+
+        h = hashlib.sha256()
+        with open(full, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+
+        try:
+            import pwd
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except (KeyError, ImportError):
+            owner = str(st.st_uid)
+        try:
+            import grp
+            group = grp.getgrgid(st.st_gid).gr_name
+        except (KeyError, ImportError):
+            group = str(st.st_gid)
+
+        mode = "0" + oct(stat.S_IMODE(st.st_mode))[2:].zfill(3)
+
+        entries.append({
+            "path": rel,
+            "sha256": h.hexdigest(),
+            "owner": owner,
+            "group": group,
+            "mode": mode,
+        })
+
+entries.sort(key=lambda e: e["path"])
+print(json.dumps({"version": 1, "entries": entries}, indent=2, ensure_ascii=False))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# plan
+# =====================================================================
+
+cmd_plan_usage() {
+  cat <<USAGE
+usage: ubx-etc plan --old-manifest FILE --new-manifest FILE \\
+         --observed-manifest FILE [--exceptions FILE] [--out FILE|-]
+
+Computes a deterministic create/update-content/update-metadata/remove/
+drift plan (see this script's header for the full algorithm) and prints
+it as TAB-separated lines:
+
+  ACTION<TAB>PATH<TAB>OWNER<TAB>GROUP<TAB>MODE<TAB>SHA256
+
+sorted by PATH. Refuses (nonzero exit, no plan printed) if either input
+manifest declares a machine-local mutable exception path (--exceptions
+default: the repo root's etc.exceptions.json).
+
+--out defaults to stdout ("-"); a real path is written atomically. Prints
+nothing and exits 0 when every declared entry is already converged.
+USAGE
+}
+
+cmd_plan() {
+  local old="" new="" observed="" exceptions="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --old-manifest) [ $# -ge 2 ] || die "--old-manifest requires an argument"; old="$2"; shift 2 ;;
+      --new-manifest) [ $# -ge 2 ] || die "--new-manifest requires an argument"; new="$2"; shift 2 ;;
+      --observed-manifest) [ $# -ge 2 ] || die "--observed-manifest requires an argument"; observed="$2"; shift 2 ;;
+      --exceptions) [ $# -ge 2 ] || die "--exceptions requires an argument"; exceptions="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_plan_usage; exit 0 ;;
+      *) echo "$prog_name: plan: unknown option: $1" >&2; cmd_plan_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$old" ] || die "plan: --old-manifest is required"
+  [ -n "$new" ] || die "plan: --new-manifest is required"
+  [ -n "$observed" ] || die "plan: --observed-manifest is required"
+  [ -n "$exceptions" ] || exceptions="$(default_exceptions_file)"
+  [ -f "$old" ] || die "plan: no such file: $old"
+  [ -f "$new" ] || die "plan: no such file: $new"
+  [ -f "$observed" ] || die "plan: no such file: $observed"
+  [ -f "$exceptions" ] || die "plan: no such file: $exceptions"
+
+  local content
+  content="$(python3 - "$old" "$new" "$observed" "$exceptions" <<'PYEOF'
+import json
+import sys
+
+old_path, new_path, observed_path, exceptions_path = sys.argv[1:5]
+
+
+def load_manifest(path, label):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-etc: plan: {label} ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    entries = {}
+    for e in data.get("entries", []):
+        missing = [k for k in ("path", "sha256", "owner", "group", "mode") if k not in e]
+        if missing:
+            print(f"ubx-etc: plan: {label} ({path}): entry missing field(s) {missing}: {e}", file=sys.stderr)
+            sys.exit(1)
+        entries[e["path"]] = {
+            "sha256": e["sha256"],
+            "owner": e["owner"],
+            "group": e["group"],
+            "mode": e["mode"],
+        }
+    return entries
+
+
+def load_exceptions(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {e["path"] for e in data.get("exceptions", [])}
+
+
+old = load_manifest(old_path, "--old-manifest")
+new = load_manifest(new_path, "--new-manifest")
+observed = load_manifest(observed_path, "--observed-manifest")
+exceptions = load_exceptions(exceptions_path)
+
+# Hard refusal (see this script's header, "Machine-local mutable
+# exceptions: refused, not silently dropped"): NO plan is printed at all
+# if either declaration manifest names an exception path.
+declared_exceptions = sorted((set(old) | set(new)) & exceptions)
+if declared_exceptions:
+    for p in declared_exceptions:
+        print(
+            f"ubx-etc: plan: refusing: \"{p}\" is a machine-local mutable "
+            "exception but is declared in a manifest (SPEC.md §4.2/§4.3; "
+            "see etc.exceptions.json) -- this should never pass "
+            "nix/etc.nix's own eval-time validation; refusing rather than "
+            "silently dropping it",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+
+lines = []
+
+for path, target in new.items():
+    obs = observed.get(path)
+    if obs is None:
+        lines.append(("create", path, target))
+    elif obs["sha256"] != target["sha256"]:
+        lines.append(("update-content", path, target))
+    elif (obs["owner"], obs["group"], obs["mode"]) != (
+        target["owner"],
+        target["group"],
+        target["mode"],
+    ):
+        lines.append(("update-metadata", path, target))
+    # else: already converged -- no line emitted.
+
+for path in old:
+    if path in new:
+        continue
+    if path in observed:
+        lines.append(("remove", path, None))
+
+managed = set(old) | set(new)
+for path, obs in observed.items():
+    if path in managed or path in exceptions:
+        continue
+    lines.append(("drift", path, obs))
+
+lines.sort(key=lambda t: t[1])
+
+out_lines = []
+for action, path, meta in lines:
+    if meta is None:
+        owner = group = mode = sha256 = "-"
+    else:
+        owner, group, mode, sha256 = meta["owner"], meta["group"], meta["mode"], meta["sha256"]
+    out_lines.append(f"{action}\t{path}\t{owner}\t{group}\t{mode}\t{sha256}")
+
+text = "\n".join(out_lines)
+if text:
+    text += "\n"
+sys.stdout.write(text)
+PYEOF
+  )"
+  write_out "$out" "$content"
+}
+
+# =====================================================================
+# main
+# =====================================================================
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    -h | --help | "" | help)
+      usage
+      [ "$cmd" = "" ] && exit 2
+      exit 0
+      ;;
+    plan) shift; cmd_plan "$@" ;;
+    observe) shift; cmd_observe "$@" ;;
+    exceptions) shift; cmd_exceptions "$@" ;;
+    *)
+      echo "$prog_name: unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

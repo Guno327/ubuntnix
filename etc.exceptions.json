@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "path": "machine-id",
+      "owner": "root",
+      "group": "root",
+      "mode": "0444",
+      "sensitive": false,
+      "reason": "systemd generates this at first boot (systemd-machine-id-setup, called from the machine-id-setup.service unit shipped by the systemd package) as a unique, stable identifier for the life of the machine -- D-Bus, journald's persistent storage, and various systemd units key state off it. It is unique PER INSTALL by definition, so no flake declaration could ever be the same value across two machines built from the same generation; regenerating it on every switch would also break every consumer that expects it stable across reboots. Stock Ubuntu/systemd ship it 0444 root:root (systemd.machine-id(5)) -- world-readable by design (many unprivileged tools read it), never secret."
+    },
+    {
+      "path": "ssh/ssh_host_rsa_key",
+      "owner": "root",
+      "group": "root",
+      "mode": "0600",
+      "sensitive": true,
+      "reason": "openssh-server's postinst runs `ssh-keygen -A` on first install, which generates an RSA/ECDSA/Ed25519 host keypair for any type not already present. The PRIVATE half authenticates this specific host to every client that has pinned its fingerprint (~/.ssh/known_hosts, host-key-checking automation); overwriting it every switch would silently break that pinning on every client, and baking a generated key into the read-only store would mean every machine built from the same generation shares an identical private key -- a serious security defect, not a config-drift nuisance. 0600 root:root matches stock Debian/Ubuntu packaging (world- and group-unreadable)."
+    },
+    {
+      "path": "ssh/ssh_host_rsa_key.pub",
+      "owner": "root",
+      "group": "root",
+      "mode": "0644",
+      "sensitive": false,
+      "reason": "the public half of ssh_host_rsa_key above. Not sensitive on its own (openssh hands it to every connecting client during the handshake) but kept as an exception alongside its private key so the pair can never be split across the generated/mutable boundary (e.g. a flake-declared stale .pub next to a real, later-rotated private key)."
+    },
+    {
+      "path": "ssh/ssh_host_ecdsa_key",
+      "owner": "root",
+      "group": "root",
+      "mode": "0600",
+      "sensitive": true,
+      "reason": "same generation mechanism and rationale as ssh_host_rsa_key (ssh-keygen -A generates one keypair per supported type: rsa, ecdsa, ed25519 -- dsa was dropped from ssh-keygen -A's default set in OpenSSH 8.8 and noble's openssh-server no longer generates it). 0600 root:root, never world-readable."
+    },
+    {
+      "path": "ssh/ssh_host_ecdsa_key.pub",
+      "owner": "root",
+      "group": "root",
+      "mode": "0644",
+      "sensitive": false,
+      "reason": "public half of ssh_host_ecdsa_key; see that entry's reason."
+    },
+    {
+      "path": "ssh/ssh_host_ed25519_key",
+      "owner": "root",
+      "group": "root",
+      "mode": "0600",
+      "sensitive": true,
+      "reason": "same generation mechanism and rationale as ssh_host_rsa_key (see that entry). 0600 root:root, never world-readable."
+    },
+    {
+      "path": "ssh/ssh_host_ed25519_key.pub",
+      "owner": "root",
+      "group": "root",
+      "mode": "0644",
+      "sensitive": false,
+      "reason": "public half of ssh_host_ed25519_key; see that entry's reason."
+    },
+    {
+      "path": "adjtime",
+      "owner": "root",
+      "group": "root",
+      "mode": "0644",
+      "sensitive": false,
+      "reason": "hwclock's drift-correction state, rewritten by `hwclock --systohc`/`--adjust` (invoked by systemd's hwclock-save.service and by the hwclock package's own hooks) across boots/shutdowns that touch the RTC. Its content is a running measurement of THIS machine's real-time-clock drift, not configuration -- declaring or regenerating it every switch would discard that measurement and degrade clock accuracy between NTP syncs. Not sensitive; 0644 root:root matches stock util-linux packaging."
+    }
+  ]
+}

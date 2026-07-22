@@ -24,6 +24,7 @@
         ./nix/archive.nix
         ./nix/compose.nix
         ./nix/users.nix
+        ./nix/etc.nix
       ];
     };
 }

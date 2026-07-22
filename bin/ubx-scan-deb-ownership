@@ -211,7 +211,17 @@ scan() {
   # (this script's header) would turn the trap itself into an "unbound
   # variable" error instead of a cleanup. A script-global variable stays
   # visible to the trap for the process's whole remaining lifetime.
-  tmp="$(mktemp)" || die "could not create a temp file for the tar listing"
+  # TMPDIR is forced to /tmp rather than inherited: nix/compose.nix runs
+  # this script INSIDE the chroot, but the environment it inherits is the
+  # outer Nix builder's, whose TMPDIR (/build) exists only outside that
+  # chroot -- bare `mktemp` therefore failed with "failed to create file
+  # via template '/build/tmp.XXXXXXXXXX': No such file or directory" (CI
+  # run 29955258055). /tmp is guaranteed present and 1777 in the
+  # ubuntu-base tree this chroot is built from, and the EXIT trap below
+  # removes the file again, so nothing of it survives into the composed
+  # rootfs. Outside the chroot (the unit tests' direct invocation) the
+  # same /tmp is equally valid, so this needs no conditional.
+  tmp="$(TMPDIR=/tmp mktemp)" || die "could not create a temp file for the tar listing"
   trap 'rm -f "$tmp"' EXIT
 
   # `set -o pipefail` (see this script's `set -euo pipefail` header) makes

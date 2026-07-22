@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/unit/080-compose-ownership-scan.sh — bin/ubx-scan-deb-ownership:
+# tests/unit/063-compose-ownership-scan.sh — bin/ubx-scan-deb-ownership:
 # real functional tests against fixture .deb archives (GitHub issue #10
 # PR #36: the full-168-package-closure `rootfs-boot-proof` compose failing
 # on libpam-modules-bin's setgid-shadow pam_extrausers_chkpwd -- see that

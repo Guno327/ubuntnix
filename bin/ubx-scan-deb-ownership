@@ -181,6 +181,47 @@ scan() {
   local deb="$1"
   [ -f "$deb" ] || die "no such file: $deb"
 
+  # The tar listing this loop reads is fed via an explicit temp file, NOT
+  # a `done < <(...)` process substitution, and NOT a `cmd | while read`
+  # pipeline. Two independent constraints rule out the more obvious
+  # forms:
+  #
+  #   - Process substitution (`<(...)`) is implemented by bash opening
+  #     /dev/fd/N (or an equivalent named-pipe path threaded through
+  #     /dev/fd) and handing that path to the command. nix/compose.nix's
+  #     enter.sh runs this script inside a chroot whose only /dev entries
+  #     are the explicit bind mounts it lists (null, zero, random,
+  #     urandom, ...) plus a freshly mounted /proc -- there is no /dev/fd
+  #     and no /proc/self/fd symlink, so bash cannot open the
+  #     substitution's fd and the whole scan dies before it reads a
+  #     single line (CI run 29953677609: "rootfs-compose-proof>
+  #     /.ubx-compose/ubx-scan-deb-ownership: line 180: /dev/fd/63: No
+  #     such file or directory"). A plain `< "$tmpfile"` redirect opens an
+  #     ordinary regular file and needs no /dev/fd at all.
+  #   - `dpkg-deb ... | tar ... | while read ...` would put the loop body
+  #     in a subshell (the last stage of a pipeline runs in a subshell in
+  #     bash), so every variable this loop's caller relies on afterward
+  #     would vanish when the subshell exits. Reading from a temp file
+  #     keeps the loop in the current shell.
+  # Deliberately NOT `local`: the EXIT trap below fires after this
+  # function has already returned (every exit path here, including
+  # die()'s inside mode_to_octal()/check_safe_path(), only reliably
+  # cleans up $tmp via a process-EXIT trap, not a RETURN one) -- by then a
+  # `local` copy of $tmp would already be out of scope, and `set -u`
+  # (this script's header) would turn the trap itself into an "unbound
+  # variable" error instead of a cleanup. A script-global variable stays
+  # visible to the trap for the process's whole remaining lifetime.
+  tmp="$(mktemp)" || die "could not create a temp file for the tar listing"
+  trap 'rm -f "$tmp"' EXIT
+
+  # `set -o pipefail` (see this script's `set -euo pipefail` header) makes
+  # $? the rightmost-nonzero of dpkg-deb/tar, so a failure in either half
+  # of the pipeline still kills the script via `set -e` here, exactly as
+  # it would have with the process-substitution form -- the temp-file
+  # redirect only changes how the listing reaches the loop below, not how
+  # pipeline failure is detected.
+  LC_ALL=C dpkg-deb --fsys-tarfile "$deb" | LC_ALL=C tar --numeric-owner -tv > "$tmp"
+
   local line
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -231,7 +272,7 @@ scan() {
     check_safe_path "$path"
 
     printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$type" "$(mode_to_octal "$mode")" "$uid" "$gid"
-  done < <(LC_ALL=C dpkg-deb --fsys-tarfile "$deb" | LC_ALL=C tar --numeric-owner -tv)
+  done < "$tmp"
 }
 
 main() {

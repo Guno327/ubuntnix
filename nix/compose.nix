@@ -285,12 +285,28 @@ let
       # scanLines / restoreLines (PR #36; see this file's header section
       # "PR #36 -- the full-closure ownership problem" and
       # bin/ubx-scan-deb-ownership's own header for the full design):
-      # work around dpkg's unconditional, unpatchable insistence on
-      # chown(2)-ing every extracted file to the archive's own recorded
-      # owner (verified against dpkg upstream -- see that script's header
-      # for the citation), which fails EINVAL under this chroot's
-      # single-id-mapped user namespace for any file/dir a .deb ships
-      # owned by something other than root:root.
+      # work around TWO independent, unconditional, unpatchable dpkg
+      # unpack-time operations that this chroot's single-id-mapped user
+      # namespace cannot always perform:
+      #   - chown(2)-ing every extracted file to the archive's own
+      #     recorded owner (verified against dpkg upstream -- see that
+      #     script's header for the citation), which fails EINVAL for any
+      #     file/dir a .deb ships owned by something other than root:root;
+      #   - (CI run 29955725327, this issue's mode follow-up) chmod(2)-ing
+      #     a setuid/setgid/sticky bit onto an extracted file, which fails
+      #     EPERM regardless of who owns it -- the concrete case that
+      #     surfaced this was dpkg's own unpack of /usr/bin/mount
+      #     (root:root, mode 4755): "error setting permissions of
+      #     './usr/bin/mount': Operation not permitted".
+      # bin/ubx-scan-deb-ownership's scan trigger is therefore two-fold
+      # (non-root owner OR a set*id/sticky mode bit, see that script's own
+      # "MODE follow-up" header section) but the two properties are
+      # deferred by exactly the same mechanism below: OWNER always, and
+      # now MODE's special bits too, are never chown(2)/chmod(2)'d inside
+      # this chroot at all -- both instead travel, via the SAME manifest
+      # line, to squashfsImage's mksquashfs pseudo-file pass (PACK time),
+      # which writes final inode metadata directly with no chown(2)/
+      # chmod(2) syscall of any kind.
       #
       # Both are ONE-BLOCK-PER-PACKAGE, generated over the SAME `indices`
       # or `checked`-derived order as debCopyLines/unpackLines above, for
@@ -305,51 +321,82 @@ let
       #
       # scanLines runs BEFORE `${unpackLines}` (spliced below), for every
       # package, in the SAME pass:
-      #   1. bin/ubx-scan-deb-ownership lists that package's non-root-owned
-      #      entries (empty output, the common case, for every package in
-      #      this project's proof sets today -- htop/hello/libnl/tzdata
-      #      ship nothing but root:root).
+      #   1. bin/ubx-scan-deb-ownership lists that package's selected
+      #      (non-root-owned and/or set*id/sticky) entries (empty output,
+      #      the common case, for every package in this project's proof
+      #      sets today -- htop/hello/libnl/tzdata ship nothing but plain
+      #      root:root files).
       #   2. each entry's path becomes a `path-exclude=` line in a dpkg
       #      config fragment (/etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes,
       #      read automatically by every dpkg invocation below, per
       #      dpkg.cfg(5)) -- dpkg's own, real, long-supported path-filter
       #      mechanism (dpkg(1) "--path-exclude"), which skips extracting
-      #      (and therefore chown-ing) a matched path ENTIRELY, rather
-      #      than attempting and failing.
-      #   3. a DIRECTORY entry is created (mkdir -p + chmod its real mode)
-      #      immediately, right here -- BEFORE any package's unpack runs
-      #      -- because a later, non-excluded file from ANY package might
-      #      need that directory to already exist as a mkdir target; a
-      #      FILE/symlink/hardlink entry is deliberately NOT restored yet
-      #      (see restoreLines below for why the ordering differs).
+      #      (and therefore chown/chmod-ing) a matched path ENTIRELY,
+      #      rather than attempting and failing.
+      #   3. a DIRECTORY entry is created (mkdir -p + chmod'd to `ubx_safe_mode`,
+      #      NOT `ubx_mode` -- see that variable's own comment below for
+      #      why) immediately, right here -- BEFORE any package's unpack
+      #      runs -- because a later, non-excluded file from ANY package
+      #      might need that directory to already exist as a mkdir
+      #      target; a FILE/symlink/hardlink entry is deliberately NOT
+      #      restored yet (see restoreLines below for why the ordering
+      #      differs).
       #   4. every entry, directory or not, gets one line in
       #      /.ubx-ownership-pseudo.txt: an mksquashfs pseudo-file "modify"
       #      definition (`<path> m <mode> <uid> <gid>` -- squashfs-tools'
       #      own USAGE-MKSQUASHFS.md syntax, verified against the
       #      squashfs-tools 4.6.1 this project's archive.lock.json pins)
-      #      recording the TRUE intended owner, applied by squashfsImage
-      #      (nix/compose.nix, below) at PACK time -- mksquashfs writes
-      #      final squashfs inode metadata directly, no chown(2) syscall
-      #      at all, so it is not subject to this sandbox's id-mapping
-      #      limit in the first place. This is the concrete mechanism
-      #      behind this file's own long-standing comment (composeRootfs's
+      #      recording the TRUE intended owner AND mode (special bits
+      #      included -- `ubx_mode`, unmodified, not `ubx_safe_mode`),
+      #      applied by squashfsImage (nix/compose.nix, below) at PACK
+      #      time -- mksquashfs writes final squashfs inode metadata
+      #      directly, no chown(2)/chmod(2) syscall at all, so it is not
+      #      subject to this sandbox's id-mapping/set*id limits in the
+      #      first place. This is the concrete mechanism behind this
+      #      file's own long-standing comment (composeRootfs's
       #      "Deliberately drop ownership on copy" note, above) that
-      #      on-disk ownership inside this sandbox was never meant to be
-      #      meaningful -- PR #36 is simply the first time a real owner
-      #      needed to travel all the way to the FINAL packed image
-      #      despite that.
+      #      on-disk ownership/mode inside this sandbox was never meant to
+      #      be a meaningful, complete record of the real system -- PR #36
+      #      is simply the first time a real owner (and now mode) needed
+      #      to travel all the way to the FINAL packed image despite that.
       #
       # restoreLines runs AFTER `${unpackLines}` but BEFORE debconf/
       # `dpkg --configure -a` (spliced below): for every FILE/symlink/
       # hardlink entry scanLines found (directories were already created
-      # above), extract that ONE archive member's real content+mode
-      # straight from the already-staged .deb (`tar -x --no-same-owner`
-      # -- content and permission-bit restoration need no id-mapping at
-      # all; only the OWNER is deferred to pack time) into its real
-      # place, so maintainer postinst scripts (which run during
+      # above), extract that ONE archive member's real content straight
+      # from the already-staged .deb (`tar -x --no-same-owner
+      # --no-same-permissions` -- content restoration needs no
+      # id-mapping/capability at all; the OWNER and the mode's special
+      # bits are BOTH deferred to pack time, so tar must not attempt to
+      # apply either: `--no-same-owner` for the former exactly as before,
+      # `--no-same-permissions` (new) so tar does NOT try to chmod() the
+      # archive's own recorded mode -- including its set*id/sticky bits --
+      # onto the extracted file, which is exactly the operation that fails
+      # EPERM (see this block's own header above)), then chmod's it to
+      # `ubx_safe_mode` explicitly (deterministic regardless of umask,
+      # unlike relying on tar's --no-same-permissions default) into its
+      # real place, so maintainer postinst scripts (which run during
       # `dpkg --configure -a`, right after) see the same tree a real,
       # unrestricted install would have produced -- just not yet
-      # correctly-OWNED, which squashfsImage's pseudo-file pass fixes.
+      # correctly-OWNED/-MODED, which squashfsImage's pseudo-file pass
+      # fixes.
+      #
+      # ubx_safe_mode -- `ubx_mode` with its leading (special) digit
+      # forced to 0 (dropped via `${ubx_mode#?}`, a plain POSIX one-char
+      # parameter-removal dash already supports, then re-prefixed with
+      # "0"): the same permission bits (read/write/execute for owner/
+      # group/other) MINUS the setuid/setgid/sticky bit, e.g. "4755" ->
+      # "0755", "1777" -> "0777", and a no-op for an entry that never had
+      # a special bit at all (a plain non-root-owned file, "0644" ->
+      # "0644"). This is applied by mkdir+chmod (scanLines, directories)
+      # and by the explicit chmod after tar -x (restoreLines, everything
+      # else) so that NEITHER of this block's own in-chroot mode-setting
+      # operations ever attempts the one chmod() class this sandbox
+      # cannot perform -- exactly like `ubx_mode`'s OWNER fields were
+      # already never chown(2)'d in-chroot even for the original
+      # (ownership-only) trigger. `ubx_mode` itself, unstripped, still
+      # goes to the pseudo-file manifest (step 4 above) -- ONLY the two
+      # in-chroot mode-setting call sites use the stripped form.
       #
       # ubx_tab (defined once, near configure.sh's own top, alongside the
       # existing PERL_HASH_SEED export) is a literal tab character: dash
@@ -364,10 +411,11 @@ let
           /.ubx-compose/ubx-scan-deb-ownership "/.ubx-compose/debs/${toString i}.deb" > "/.ubx-compose/scan-${toString i}.tsv"
           while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
             [ -n "$ubx_path" ] || continue
+            ubx_safe_mode="0''${ubx_mode#?}"
             echo "path-exclude=$ubx_path" >> /etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes
             if [ "$ubx_type" = d ]; then
               mkdir -p "$ubx_path"
-              chmod "$ubx_mode" "$ubx_path"
+              chmod "$ubx_safe_mode" "$ubx_path"
             fi
             printf '%s m %s %s %s\n' "''${ubx_path#/}" "$ubx_mode" "$ubx_uid" "$ubx_gid" >> /.ubx-ownership-pseudo.txt
           done < "/.ubx-compose/scan-${toString i}.tsv"
@@ -379,7 +427,9 @@ let
           while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
             [ -n "$ubx_path" ] || continue
             [ "$ubx_type" = d ] && continue
-            dpkg-deb --fsys-tarfile "/.ubx-compose/debs/${toString i}.deb" | tar -x --no-same-owner -C / ".$ubx_path"
+            ubx_safe_mode="0''${ubx_mode#?}"
+            dpkg-deb --fsys-tarfile "/.ubx-compose/debs/${toString i}.deb" | tar -x --no-same-owner --no-same-permissions -C / ".$ubx_path"
+            chmod "$ubx_safe_mode" "$ubx_path"
           done < "/.ubx-compose/scan-${toString i}.tsv"
         '')
         indices);
@@ -554,20 +604,25 @@ let
         # scanLines (PR #36; see this file's header "PR #36" section and
         # bin/ubx-scan-deb-ownership's own header for the full design) runs
         # BEFORE unpack, per package, in the same pass: it discovers every
-        # non-root-owned path that package's data.tar carries (which
-        # `dpkg --unpack` would otherwise hard-fail chown()-ing under this
-        # chroot's single-id-mapped user namespace), path-excludes it from
-        # dpkg's own extraction, pre-creates any such DIRECTORY now (a
-        # later package's file may need it as a mkdir target), and records
-        # its true intended owner as an mksquashfs pseudo-file "modify"
-        # line in /.ubx-ownership-pseudo.txt, applied at IMAGE-PACK time by
-        # squashfsImage (nix/compose.nix, below) instead of by chown(2)
-        # here. `mkdir -p`/`touch` first: a bare Ubuntu-base chroot is not
-        # guaranteed to already carry /etc/dpkg/dpkg.cfg.d (dpkg.cfg(5)
-        # reads every file under it automatically), and the pseudo-file
-        # manifest must exist -- even empty -- for squashfsImage to always
-        # find it, independent of whether any package in this run actually
-        # ships a non-root-owned entry.
+        # non-root-owned path AND every path carrying a setuid/setgid/
+        # sticky bit that package's data.tar carries (which `dpkg
+        # --unpack` would otherwise hard-fail chown()-ing/chmod()-ing --
+        # EINVAL for the former, EPERM for the latter (CI run
+        # 29955725327: "error setting permissions of './usr/bin/mount':
+        # Operation not permitted") -- under this chroot's single-id-mapped
+        # user namespace), path-excludes it from dpkg's own extraction,
+        # pre-creates any such DIRECTORY now with its safe (non-special)
+        # mode (a later package's file may need it as a mkdir target), and
+        # records its true intended owner AND mode (special bits included)
+        # as an mksquashfs pseudo-file "modify" line in
+        # /.ubx-ownership-pseudo.txt, applied at IMAGE-PACK time by
+        # squashfsImage (nix/compose.nix, below) instead of by chown(2)/
+        # chmod(2) here. `mkdir -p`/`touch` first: a bare Ubuntu-base
+        # chroot is not guaranteed to already carry /etc/dpkg/dpkg.cfg.d
+        # (dpkg.cfg(5) reads every file under it automatically), and the
+        # pseudo-file manifest must exist -- even empty -- for
+        # squashfsImage to always find it, independent of whether any
+        # package in this run actually ships a selected entry.
         mkdir -p /etc/dpkg/dpkg.cfg.d
         touch /.ubx-ownership-pseudo.txt
         ${scanLines}
@@ -577,14 +632,22 @@ let
         # restoreLines (PR #36; see scanLines above and
         # bin/ubx-scan-deb-ownership's own header): for every FILE/symlink/
         # hardlink entry scanLines found (directories were already created
-        # above), extract that ONE archive member's real content+mode
-        # straight from its already-staged .deb into its real place --
-        # content/mode restoration needs no id-mapping, only the OWNER is
-        # deferred to squashfsImage's pack-time pseudo-file pass. Runs
-        # AFTER unpack (the target directory tree, including any OTHER
-        # package's contribution, must already exist) but BEFORE
+        # above), extract that ONE archive member's real content straight
+        # from its already-staged .deb into its real place, then chmod it
+        # to its SAFE mode (special bits stripped) explicitly -- content
+        # restoration needs no id-mapping/capability at all, and the safe
+        # (non-special) permission bits need none either; only the OWNER
+        # and the mode's setuid/setgid/sticky bit are deferred to
+        # squashfsImage's pack-time pseudo-file pass. Runs AFTER unpack
+        # (the target directory tree, including any OTHER package's
+        # contribution, must already exist) but BEFORE
         # `dpkg --configure -a` below, so maintainer postinst scripts see
-        # the same tree a real, unrestricted install would have produced.
+        # the same tree a real, unrestricted install would have produced
+        # -- just not yet carrying its real owner/special mode bit, which
+        # is fine: no maintainer script in this project's locked set is
+        # known to depend on a setuid/setgid bit being effective DURING
+        # its own postinst run (see this file's PR #36 header section for
+        # the residual-risk discussion this assumption rests on).
         ${restoreLines}
 
         # Expand the 3-field preseed records into debconf-set-selections'
@@ -881,15 +944,19 @@ let
         # -pf/-e (PR #36; see composeRootfs's scanLines/restoreLines
         # comment above and bin/ubx-scan-deb-ownership's own header for the
         # full design): $rootfs/.ubx-ownership-pseudo.txt is composeRootfs's
-        # own manifest of every non-root-owned path some package's data.tar
-        # carried, which `dpkg --unpack`'s in-chroot chown() could not
-        # apply directly (EINVAL under that chroot's single-id-mapped user
-        # namespace). `-pf` (squashfs-tools 4.6.1's "m"/modify pseudo-file
-        # syntax, matching what scanLines already writes: "<path relative,
-        # no leading slash> m <mode> <uid> <gid>") applies each such
-        # path's TRUE owner directly to the squashfs inode metadata at
-        # PACK time here -- no chown(2) syscall at all, so this sandbox's
-        # id-mapping limit never applies to it. The manifest file itself
+        # own manifest of every selected (non-root-owned and/or set*id/
+        # sticky) path some package's data.tar carried, which `dpkg
+        # --unpack`'s in-chroot chown()/chmod() could not apply directly
+        # (EINVAL for a non-root owner, EPERM for a special mode bit --
+        # see CI run 29955725327 -- both under that chroot's
+        # single-id-mapped user namespace). `-pf` (squashfs-tools 4.6.1's
+        # "m"/modify pseudo-file syntax, matching what scanLines already
+        # writes: "<path relative, no leading slash> m <mode> <uid>
+        # <gid>") applies each such path's TRUE owner AND mode (special
+        # bits included) directly to the squashfs inode metadata at PACK
+        # time here -- no chown(2)/chmod(2) syscall at all, so this
+        # sandbox's id-mapping/set*id limits never apply to it. The
+        # manifest file itself
         # is composeRootfs's own bookkeeping, not part of the real Ubuntu
         # system `$rootfs` otherwise represents -- always present (even
         # empty: composeRootfs unconditionally `touch`es it) but excluded

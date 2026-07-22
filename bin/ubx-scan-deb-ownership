@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# bin/ubx-scan-deb-ownership — list every non-root:root-owned entry in a
-# .deb's data.tar (SPEC.md §4.1/§4.2; GitHub issue #10 PR #36 follow-up:
-# the "Bootable disk image + QEMU e2e" CI job failing to compose the full
-# 168-package locked closure).
+# bin/ubx-scan-deb-ownership — list every entry in a .deb's data.tar that
+# EITHER is not root:root-owned OR carries a setuid/setgid/sticky bit
+# (SPEC.md §4.1/§4.2; GitHub issue #10 PR #36 follow-up: the "Bootable disk
+# image + QEMU e2e" CI job failing to compose the full 168-package locked
+# closure).
 #
 # -- The problem this exists to work around ----------------------------
 #
@@ -45,6 +46,42 @@
 # id-mapping limit at all. See nix/compose.nix's own comments at the call
 # site for the exact sequencing.
 #
+# -- The MODE follow-up (CI run 29955725327) -----------------------------
+#
+# The same "single-id-mapped user namespace, one layer down" family hits a
+# SECOND, independent dpkg operation once the closure grows past the
+# ownership-only packages above: dpkg's own unpack of `mount` --
+#
+#   rootfs-boot-proof> dpkg: error processing archive
+#   /.ubx-compose/debs/142.deb (--unpack):
+#   rootfs-boot-proof>  error setting permissions of './usr/bin/mount':
+#   Operation not permitted
+#
+# -- fails EPERM chmod()-ing /usr/bin/mount (a perfectly ordinary
+# root:root file) to its real mode, 4755: dpkg's tarobject() sets the
+# extracted file's permission bits (fchmod) unconditionally too, exactly
+# as it unconditionally chowns (see the citation above) -- and setting the
+# setuid/setgid/sticky bit specifically is the one chmod(2) this build
+# sandbox also cannot reliably perform, independent of whether the OWNER
+# is root or not (this is NOT a downgrade-specific quirk of that one log
+# line -- a first-time install of the same package would hit the identical
+# chmod). So this script's scan trigger is now TWO-FOLD, not one: a member
+# is selected for the exclude+restore+pseudo-file treatment if EITHER its
+# recorded owner is not root:root (the original trigger, above) OR its
+# recorded mode carries a setuid/setgid/sticky bit -- regardless of owner.
+# Either way the caller's handling is identical: path-exclude it from
+# dpkg's own extraction, restore its real CONTENT afterward with a plain
+# SAFE mode (the same permission bits, with the set*id/sticky digit
+# forced to 0 -- restoring that bit needs no id-mapping at all, only
+# setting the SPECIAL bits does), and record its TRUE mode (special bits
+# included) in the same mksquashfs pseudo-file manifest this script
+# already emits for ownership -- see this file's "Output format" section
+# below; no format change was needed, since a "modify" pseudo-file line
+# already carries mode, uid, AND gid together. mksquashfs applies the real
+# 4755 directly to the packed image's inode metadata, again with no
+# chmod(2) syscall of any kind, so the sandbox restriction never applies
+# to that final step either.
+#
 # -- Residual risk this script does NOT cover ---------------------------
 #
 # This only fixes dpkg's OWN unpack-time extraction chowns. A maintainer
@@ -69,20 +106,27 @@
 #
 # -- Output format --------------------------------------------------------
 #
-# One TAB-separated record per non-root-owned entry, to stdout:
+# One TAB-separated record per SELECTED entry (non-root-owned, OR carrying
+# a setuid/setgid/sticky bit -- see "The MODE follow-up" above), to
+# stdout:
 #   <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
 #   path   absolute install path (e.g. /usr/sbin/pam_extrausers_chkpwd)
 #   type   "d" for a directory, "f" for anything else (regular file,
 #          symlink, hardlink -- all restored the same way, via a targeted
 #          `tar -x` of that one member)
-#   mode   4-digit octal permission string (e.g. "2755"), INCLUDING the
-#          setuid/setgid/sticky bits -- parsed from tar's own symbolic
-#          mode string, since `tar -tv` has no numeric-mode listing mode
+#   mode   4-digit octal permission string (e.g. "2755", "4755"),
+#          INCLUDING the setuid/setgid/sticky bits -- parsed from tar's
+#          own symbolic mode string, since `tar -tv` has no numeric-mode
+#          listing mode. This is always the member's TRUE mode, even
+#          though the caller must restore it with the special bits
+#          stripped (see "The MODE follow-up" above) -- this manifest
+#          field is what carries the true value through to mksquashfs's
+#          pack-time pseudo-file pass.
 #   uid    numeric owner id, as recorded in the archive
 #   gid    numeric group id, as recorded in the archive
-# A .deb with no non-root-owned entries (the common case -- every proof
-# package before PR #36's full-closure boot image) produces empty output
-# and exits 0.
+# A .deb with no selected entries (the common case -- every proof package
+# before PR #36's full-closure boot image) produces empty output and
+# exits 0.
 set -euo pipefail
 
 prog_name="ubx-scan-deb-ownership"
@@ -92,7 +136,8 @@ usage() {
 usage: ubx-scan-deb-ownership DEBFILE
 
 Lists every entry in DEBFILE's data.tar whose recorded owner is not
-uid=0/gid=0 (root:root), one TAB-separated record per line:
+uid=0/gid=0 (root:root), OR whose recorded mode carries a setuid/setgid/
+sticky bit, one TAB-separated record per line:
 
   <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
 
@@ -260,28 +305,49 @@ scan() {
     [ -n "$path" ] || continue           # the "./" root entry itself
 
     local uid="${owner%/*}" gid="${owner#*/}"
-    [ "$uid/$gid" = "0/0" ] && continue   # only non-root ownership is this script's concern
+
+    # octal_mode is computed BEFORE the trigger check below (rather than
+    # only once an entry is already known to be selected) because, since
+    # CI run 29955725327 (see "The MODE follow-up" above), the mode itself
+    # is now part of deciding whether to select this entry at all -- not
+    # just something recorded once a non-root owner already selected it.
+    local octal_mode
+    octal_mode="$(mode_to_octal "$mode")"
+    local special="${octal_mode%???}"   # the leading (setuid/setgid/sticky) digit alone
+
+    # Select this entry if EITHER its owner is not root:root (the original
+    # trigger -- dpkg's unconditional chown() fails EINVAL under this
+    # sandbox's single-id-mapped user namespace) OR its mode carries a
+    # setuid/setgid/sticky bit (the mode follow-up -- dpkg's unconditional
+    # chmod() to set that bit fails EPERM under the same sandbox,
+    # independent of who owns the file: /usr/bin/mount, root:root, 4755,
+    # is the concrete CI failure this exists for). Neither condition alone
+    # is "this script's concern" the way the original comment put it --
+    # both now are.
+    if [ "$uid/$gid" = "0/0" ] && [ "$special" = "0" ]; then
+      continue
+    fi
 
     # Only entries we're ABOUT to ask the caller to path-exclude-then-
     # restore need a restorable type: a device/fifo/socket tar entry would
     # need mknod(2) to recreate, which this build sandbox already refuses
     # regardless of ownership (nix/compose.nix's own /dev bind-mount
     # comment: "Nix refuses to register device nodes in store paths") --
-    # so a NON-root-owned one is doubly unsupported. Checked here, not
-    # earlier, so a root:root device/fifo/socket entry (outside this
-    # script's remit entirely) is never flagged by it.
+    # so a selected one is doubly unsupported. Checked here, not earlier,
+    # so a root:root, non-special-mode device/fifo/socket entry (outside
+    # this script's remit entirely) is never flagged by it.
     local type="${mode:0:1}"
     case "$type" in
       d) type="d" ;;
       -|l|h) type="f" ;;
       *)
-        die "$deb: '$path' is a non-root-owned device/fifo/socket tar entry (mode '$mode', owner $uid/$gid) -- this script has no safe way to restore it (mknod is refused inside this project's build sandbox; see nix/compose.nix's own /dev bind-mount comment), and no package in this project's locked archive set is expected to ship one. Investigate before adding a package that does."
+        die "$deb: '$path' is a selected (non-root-owned and/or set*id/sticky) device/fifo/socket tar entry (mode '$mode', owner $uid/$gid) -- this script has no safe way to restore it (mknod is refused inside this project's build sandbox; see nix/compose.nix's own /dev bind-mount comment), and no package in this project's locked archive set is expected to ship one. Investigate before adding a package that does."
         ;;
     esac
 
     check_safe_path "$path"
 
-    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$type" "$(mode_to_octal "$mode")" "$uid" "$gid"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$type" "$octal_mode" "$uid" "$gid"
   done < "$tmp"
 }
 

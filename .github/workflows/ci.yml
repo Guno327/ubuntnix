@@ -151,15 +151,7 @@ jobs:
             echo "tree/motd does not contain the declared text"; exit 1;
           }
           [ -f result-etc-proof/manifest.json ] || { echo "no manifest.json in etc-proof output"; exit 1; }
-          python3 -c "
-import json
-m = json.load(open('result-etc-proof/manifest.json'))
-assert m['version'] == 1, m
-paths = sorted(e['path'] for e in m['entries'])
-assert paths == ['app/config.json', 'motd'], paths
-cfg = next(e for e in m['entries'] if e['path'] == 'app/config.json')
-assert (cfg['owner'], cfg['group'], cfg['mode']) == ('root', 'root', '0640'), cfg
-"
+          python3 tests/lib/check-etc-proof.py result-etc-proof
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

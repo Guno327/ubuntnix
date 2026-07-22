@@ -87,15 +87,17 @@ grep -qxF 'chmod 0600 /home/alice/.ssh/authorized_keys' "$shell_out" \
 # has to exist before `useradd -G` can add them to it).
 group_line=$(grep -n '^groupadd' "$shell_out" | head -1 | cut -d: -f1)
 user_line=$(grep -n '^useradd' "$shell_out" | head -1 | cut -d: -f1)
-[ -n "$group_line" ] && [ -n "$user_line" ] && [ "$group_line" -lt "$user_line" ] \
-  || fail "shell format: groupadd must be emitted before useradd"
+if ! { [ -n "$group_line" ] && [ -n "$user_line" ] && [ "$group_line" -lt "$user_line" ]; }; then
+  fail "shell format: groupadd must be emitted before useradd"
+fi
 
 # -- ordering: membership removals precede additions (deterministic,
 # always in this relative order).
 remove_line=$(grep -n '^gpasswd -d' "$shell_out" | head -1 | cut -d: -f1)
 add_line=$(grep -n '^gpasswd -a' "$shell_out" | head -1 | cut -d: -f1)
-[ -n "$remove_line" ] && [ -n "$add_line" ] && [ "$remove_line" -lt "$add_line" ] \
-  || fail "shell format: membership removals must precede additions"
+if ! { [ -n "$remove_line" ] && [ -n "$add_line" ] && [ "$remove_line" -lt "$add_line" ]; }; then
+  fail "shell format: membership removals must precede additions"
+fi
 
 # -- json format: structured steps, same content, machine-parseable.
 json_out="$work/json_out.json"

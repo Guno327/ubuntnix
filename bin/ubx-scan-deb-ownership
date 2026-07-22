@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# bin/ubx-scan-deb-ownership — list every non-root:root-owned entry in a
+# .deb's data.tar (SPEC.md §4.1/§4.2; GitHub issue #10 PR #36 follow-up:
+# the "Bootable disk image + QEMU e2e" CI job failing to compose the full
+# 168-package locked closure).
+#
+# -- The problem this exists to work around ----------------------------
+#
+# nix/compose.nix's composeRootfs runs `dpkg --unpack`/`--configure`
+# inside `unshare --user --map-root-user --mount --pid` (see that file's
+# own HARDENING section): a SINGLE-id user-namespace mapping -- only the
+# build uid/gid is mapped, to namespace-uid/gid 0. Per user_namespaces(7),
+# chown(2)/lchown(2)/fchownat(2) to ANY id absent from that mapping fails
+# with EINVAL, unconditionally, regardless of the calling process's
+# capabilities -- the kernel simply has nothing to translate the target id
+# through. dpkg's own extraction code (tarobject() in its archives.c)
+# always attempts to chown every extracted file to the archive's own
+# recorded owner (confirmed against dpkg upstream: see
+# https://lists.debian.org/debian-dpkg/2007/12/msg00031.html, Ian
+# Jackson's reply -- "dpkg will insist on setting the ownership of the
+# files on-disk to that specified in the package", no force flag or
+# DPKG_FORCE/env hook overrides this). The first package in this
+# project's full locked closure whose data.tar embeds a non-root owner
+# (libpam-modules-bin's setgid-shadow `pam_extrausers_chkpwd`) therefore
+# hard-fails `dpkg --unpack` and aborts the whole compose.
+#
+# The genuinely general fix is fakeroot (LD_PRELOAD syscall interception,
+# faking chown success while recording the intended owner) -- not yet in
+# this project's locked archive set (see archive.packages.json's own
+# "fakeroot" entry and its comment for why this script exists as an
+# interim rather than waiting on that). This script implements the M1
+# INTERIM instead: nix/compose.nix's composeRootfs calls it, per package,
+# BEFORE that package's `dpkg --unpack`, to discover every path dpkg would
+# fail on. The caller then (a) tells dpkg to skip extracting exactly those
+# paths (`--path-exclude`, a real, long-supported dpkg mechanism -- unlike
+# ownership, dpkg's PATH FILTERING happens before any chown attempt, so an
+# excluded path never reaches the failing syscall at all), (b) places that
+# path's real CONTENT+MODE itself afterward via a plain, unprivileged
+# `tar -x --no-same-owner` of just that one archive member (chmod, unlike
+# chown, needs no id-mapping -- it never references an external id at
+# all), and (c) records the TRUE intended owner in a manifest applied at
+# IMAGE-PACK time via mksquashfs's `-pf`/"m" (modify) pseudo-file
+# mechanism -- which writes final squashfs inode metadata directly, with
+# no chown(2) syscall involved, so it is not subject to this sandbox's
+# id-mapping limit at all. See nix/compose.nix's own comments at the call
+# site for the exact sequencing.
+#
+# -- Residual risk this script does NOT cover ---------------------------
+#
+# This only fixes dpkg's OWN unpack-time extraction chowns. A maintainer
+# script (preinst/postinst) that itself calls chown/dpkg-statoverride/
+# adduser against a non-root id during `dpkg --configure -a` hits the
+# exact same EINVAL, and there is no path-exclude equivalent for arbitrary
+# script code -- that residual class genuinely needs fakeroot. See this
+# project's handback notes (PR #36) for the concrete risk assessment.
+#
+# -- Why a script, not inline Nix/shell -------------------------------------
+#
+# Mirrors bin/ubx-gen-grub-cfg's own rationale exactly: this dev harness
+# has no `nix`, so a Nix-only implementation could only be checked by
+# grepping source text, never by running the logic against a fixture and
+# diffing real output. This script needs only `dpkg-deb` and `tar`, both
+# already required by nix/compose.nix elsewhere (nix/archive.nix's own
+# control-extraction, nix/compose.nix's toolsFHS) -- no new archive
+# package, and both are ALSO ordinary host-Ubuntu tools, so
+# tests/unit/080-compose-ownership-scan.sh can run it directly against a
+# real (test-constructed) fixture .deb on this dev machine, with real
+# dpkg-deb/tar, no privilege and no nix required.
+#
+# -- Output format --------------------------------------------------------
+#
+# One TAB-separated record per non-root-owned entry, to stdout:
+#   <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
+#   path   absolute install path (e.g. /usr/sbin/pam_extrausers_chkpwd)
+#   type   "d" for a directory, "f" for anything else (regular file,
+#          symlink, hardlink -- all restored the same way, via a targeted
+#          `tar -x` of that one member)
+#   mode   4-digit octal permission string (e.g. "2755"), INCLUDING the
+#          setuid/setgid/sticky bits -- parsed from tar's own symbolic
+#          mode string, since `tar -tv` has no numeric-mode listing mode
+#   uid    numeric owner id, as recorded in the archive
+#   gid    numeric group id, as recorded in the archive
+# A .deb with no non-root-owned entries (the common case -- every proof
+# package before PR #36's full-closure boot image) produces empty output
+# and exits 0.
+set -euo pipefail
+
+prog_name="ubx-scan-deb-ownership"
+
+usage() {
+  cat <<USAGE
+usage: ubx-scan-deb-ownership DEBFILE
+
+Lists every entry in DEBFILE's data.tar whose recorded owner is not
+uid=0/gid=0 (root:root), one TAB-separated record per line:
+
+  <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
+
+Pure read-only inspection (dpkg-deb --fsys-tarfile | tar -tv under the
+hood) -- no privileges, no mutation, no network. See this script's own
+header comment for why it exists (GitHub issue #10 PR #36).
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+# mode_to_octal SYMBOLIC_MODE — "-rwsr-xr-x" -> "4755", "drwxr-sr-x" ->
+# "2755", "-rw-r--r--" -> "0644". Parsed positionally (tar's symbolic mode
+# string is always exactly 10 characters: type, then owner/group/other
+# rwx triads, with setuid/setgid/sticky folded into the executable
+# position as s/S or t/T) rather than via any external tool, so this is
+# pure bash -- directly unit-testable, and correct regardless of locale.
+mode_to_octal() {
+  local m="$1"
+  [ "${#m}" -eq 10 ] || die "internal error: unexpected mode string '$m' (want 10 characters)"
+
+  local special=0 owner=0 group=0 other=0
+  local r w x
+
+  r="${m:1:1}"; w="${m:2:1}"; x="${m:3:1}"
+  [ "$r" = "r" ] && owner=$((owner + 4))
+  [ "$w" = "w" ] && owner=$((owner + 2))
+  case "$x" in
+    x) owner=$((owner + 1)) ;;
+    s) owner=$((owner + 1)); special=$((special + 4)) ;;
+    S) special=$((special + 4)) ;;
+    -) ;;
+    *) die "internal error: unexpected owner-exec bit '$x' in mode '$m'" ;;
+  esac
+
+  r="${m:4:1}"; w="${m:5:1}"; x="${m:6:1}"
+  [ "$r" = "r" ] && group=$((group + 4))
+  [ "$w" = "w" ] && group=$((group + 2))
+  case "$x" in
+    x) group=$((group + 1)) ;;
+    s) group=$((group + 1)); special=$((special + 2)) ;;
+    S) special=$((special + 2)) ;;
+    -) ;;
+    *) die "internal error: unexpected group-exec bit '$x' in mode '$m'" ;;
+  esac
+
+  r="${m:7:1}"; w="${m:8:1}"; x="${m:9:1}"
+  [ "$r" = "r" ] && other=$((other + 4))
+  [ "$w" = "w" ] && other=$((other + 2))
+  case "$x" in
+    x) other=$((other + 1)) ;;
+    t) other=$((other + 1)); special=$((special + 1)) ;;
+    T) special=$((special + 1)) ;;
+    -) ;;
+    *) die "internal error: unexpected other-exec bit '$x' in mode '$m'" ;;
+  esac
+
+  printf '%d%d%d%d' "$special" "$owner" "$group" "$other"
+}
+
+# A dpkg --path-exclude pattern is a shell glob (dpkg.cfg(5)); we only
+# ever want an EXACT match against one known path, so a real glob
+# metacharacter in the path would silently exclude more than intended (or
+# nothing at all, if the "glob" happens not to match) instead of exactly
+# what we scanned. Whitespace is rejected too: the caller writes this
+# path, unquoted, as both a `path-exclude=` line AND a field in an
+# mksquashfs pseudo-file definition (`-pf`; space/tab-separated, per
+# squashfs-tools' own USAGE-MKSQUASHFS.md) -- an embedded space would
+# silently corrupt either format's field count. No path in the real
+# Ubuntu archive is expected to contain any of these -- fail loudly rather
+# than risk a silent mismatch or corrupt record if that assumption is
+# ever wrong.
+check_safe_path() {
+  case "$1" in
+    *[\*\?\[]*) die "path contains a dpkg path-exclude glob metacharacter, refusing to build an exclude pattern for it safely: '$1'" ;;
+  esac
+  case "$1" in
+    *[[:space:]]*) die "path contains whitespace, refusing to emit it as a dpkg path-exclude/mksquashfs pseudo-file record: '$1'" ;;
+  esac
+}
+
+scan() {
+  local deb="$1"
+  [ -f "$deb" ] || die "no such file: $deb"
+
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+
+    local mode owner rest path
+    # `read` folds every field past the named ones into the LAST
+    # variable verbatim (see bin/ubx-gen-grub-cfg's identical use of this
+    # for kernelParams) -- here that's everything from the size field
+    # onward, which this function then re-splits only as far as it needs
+    # to (date/time are never used).
+    read -r mode owner rest <<<"$line"
+    path="${rest#* }"   # drop the size field
+    path="${path#* }"   # drop the date field
+    path="${path#* }"   # drop the time field
+
+    # Symlinks ("name -> target") and hardlinks ("name link to target")
+    # are the only two tar -tv annotations that append extra text after
+    # the path; strip either so `path` is the install path alone.
+    path="${path%% -> *}"
+    path="${path%% link to *}"
+    # tar member names are archive-relative ("./usr/sbin/..."); dpkg
+    # --path-exclude and mksquashfs pseudo-file entries both want it
+    # without the leading "./".
+    path="${path#.}"
+    path="${path%/}"                     # tar directory entries carry a trailing "/"
+    [ -n "$path" ] || continue           # the "./" root entry itself
+
+    local uid="${owner%/*}" gid="${owner#*/}"
+    [ "$uid/$gid" = "0/0" ] && continue   # only non-root ownership is this script's concern
+
+    # Only entries we're ABOUT to ask the caller to path-exclude-then-
+    # restore need a restorable type: a device/fifo/socket tar entry would
+    # need mknod(2) to recreate, which this build sandbox already refuses
+    # regardless of ownership (nix/compose.nix's own /dev bind-mount
+    # comment: "Nix refuses to register device nodes in store paths") --
+    # so a NON-root-owned one is doubly unsupported. Checked here, not
+    # earlier, so a root:root device/fifo/socket entry (outside this
+    # script's remit entirely) is never flagged by it.
+    local type="${mode:0:1}"
+    case "$type" in
+      d) type="d" ;;
+      -|l|h) type="f" ;;
+      *)
+        die "$deb: '$path' is a non-root-owned device/fifo/socket tar entry (mode '$mode', owner $uid/$gid) -- this script has no safe way to restore it (mknod is refused inside this project's build sandbox; see nix/compose.nix's own /dev bind-mount comment), and no package in this project's locked archive set is expected to ship one. Investigate before adding a package that does."
+        ;;
+    esac
+
+    check_safe_path "$path"
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$type" "$(mode_to_octal "$mode")" "$uid" "$gid"
+  done < <(LC_ALL=C dpkg-deb --fsys-tarfile "$deb" | LC_ALL=C tar --numeric-owner -tv)
+}
+
+main() {
+  [ $# -eq 1 ] || { usage >&2; die "expected exactly one argument (DEBFILE), got $#"; }
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+  scan "$1"
+}
+
+main "$@"

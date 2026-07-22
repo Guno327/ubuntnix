@@ -282,6 +282,108 @@ let
         (i: ''dpkg --unpack --force-depends "/.ubx-compose/debs/${toString i}.deb"'')
         indices);
 
+      # scanLines / restoreLines (PR #36; see this file's header section
+      # "PR #36 -- the full-closure ownership problem" and
+      # bin/ubx-scan-deb-ownership's own header for the full design):
+      # work around dpkg's unconditional, unpatchable insistence on
+      # chown(2)-ing every extracted file to the archive's own recorded
+      # owner (verified against dpkg upstream -- see that script's header
+      # for the citation), which fails EINVAL under this chroot's
+      # single-id-mapped user namespace for any file/dir a .deb ships
+      # owned by something other than root:root.
+      #
+      # Both are ONE-BLOCK-PER-PACKAGE, generated over the SAME `indices`
+      # or `checked`-derived order as debCopyLines/unpackLines above, for
+      # the identical R1 determinism reason those already document: a
+      # shell loop over `/.ubx-compose/debs/*.deb` (or `scan-*.tsv`) ties
+      # iteration to filesystem/locale glob behavior for something Nix
+      # already knows the fixed order of. The inner `while read` loop
+      # each block contains does NOT have that problem (it walks one
+      # already-named, already-ordered file's lines, not a directory
+      # listing), so it stays a plain shell loop rather than being
+      # Nix-unrolled a second time.
+      #
+      # scanLines runs BEFORE `${unpackLines}` (spliced below), for every
+      # package, in the SAME pass:
+      #   1. bin/ubx-scan-deb-ownership lists that package's non-root-owned
+      #      entries (empty output, the common case, for every package in
+      #      this project's proof sets today -- htop/hello/libnl/tzdata
+      #      ship nothing but root:root).
+      #   2. each entry's path becomes a `path-exclude=` line in a dpkg
+      #      config fragment (/etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes,
+      #      read automatically by every dpkg invocation below, per
+      #      dpkg.cfg(5)) -- dpkg's own, real, long-supported path-filter
+      #      mechanism (dpkg(1) "--path-exclude"), which skips extracting
+      #      (and therefore chown-ing) a matched path ENTIRELY, rather
+      #      than attempting and failing.
+      #   3. a DIRECTORY entry is created (mkdir -p + chmod its real mode)
+      #      immediately, right here -- BEFORE any package's unpack runs
+      #      -- because a later, non-excluded file from ANY package might
+      #      need that directory to already exist as a mkdir target; a
+      #      FILE/symlink/hardlink entry is deliberately NOT restored yet
+      #      (see restoreLines below for why the ordering differs).
+      #   4. every entry, directory or not, gets one line in
+      #      /.ubx-ownership-pseudo.txt: an mksquashfs pseudo-file "modify"
+      #      definition (`<path> m <mode> <uid> <gid>` -- squashfs-tools'
+      #      own USAGE-MKSQUASHFS.md syntax, verified against the
+      #      squashfs-tools 4.6.1 this project's archive.lock.json pins)
+      #      recording the TRUE intended owner, applied by squashfsImage
+      #      (nix/compose.nix, below) at PACK time -- mksquashfs writes
+      #      final squashfs inode metadata directly, no chown(2) syscall
+      #      at all, so it is not subject to this sandbox's id-mapping
+      #      limit in the first place. This is the concrete mechanism
+      #      behind this file's own long-standing comment (composeRootfs's
+      #      "Deliberately drop ownership on copy" note, above) that
+      #      on-disk ownership inside this sandbox was never meant to be
+      #      meaningful -- PR #36 is simply the first time a real owner
+      #      needed to travel all the way to the FINAL packed image
+      #      despite that.
+      #
+      # restoreLines runs AFTER `${unpackLines}` but BEFORE debconf/
+      # `dpkg --configure -a` (spliced below): for every FILE/symlink/
+      # hardlink entry scanLines found (directories were already created
+      # above), extract that ONE archive member's real content+mode
+      # straight from the already-staged .deb (`tar -x --no-same-owner`
+      # -- content and permission-bit restoration need no id-mapping at
+      # all; only the OWNER is deferred to pack time) into its real
+      # place, so maintainer postinst scripts (which run during
+      # `dpkg --configure -a`, right after) see the same tree a real,
+      # unrestricted install would have produced -- just not yet
+      # correctly-OWNED, which squashfsImage's pseudo-file pass fixes.
+      #
+      # ubx_tab (defined once, near configure.sh's own top, alongside the
+      # existing PERL_HASH_SEED export) is a literal tab character: dash
+      # (configure.sh's own `/bin/sh`) has no `$'\t'` ANSI-C quoting, so
+      # `IFS="$(printf '\t')"` is the portable way to split
+      # bin/ubx-scan-deb-ownership's TAB-separated records on tabs alone
+      # (not dash's default IFS, which would also split on any literal
+      # space inside a field -- none are expected in a real archive path,
+      # but the field boundary should not depend on that).
+      scanLines = builtins.concatStringsSep "\n" (map
+        (i: ''
+          /.ubx-compose/ubx-scan-deb-ownership "/.ubx-compose/debs/${toString i}.deb" > "/.ubx-compose/scan-${toString i}.tsv"
+          while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
+            [ -n "$ubx_path" ] || continue
+            echo "path-exclude=$ubx_path" >> /etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes
+            if [ "$ubx_type" = d ]; then
+              mkdir -p "$ubx_path"
+              chmod "$ubx_mode" "$ubx_path"
+            fi
+            printf '%s m %s %s %s\n' "''${ubx_path#/}" "$ubx_mode" "$ubx_uid" "$ubx_gid" >> /.ubx-ownership-pseudo.txt
+          done < "/.ubx-compose/scan-${toString i}.tsv"
+        '')
+        indices);
+
+      restoreLines = builtins.concatStringsSep "\n" (map
+        (i: ''
+          while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
+            [ -n "$ubx_path" ] || continue
+            [ "$ubx_type" = d ] && continue
+            dpkg-deb --fsys-tarfile "/.ubx-compose/debs/${toString i}.deb" | tar -x --no-same-owner -C / ".$ubx_path"
+          done < "/.ubx-compose/scan-${toString i}.tsv"
+        '')
+        indices);
+
       preseedText = renderPreseed preseed;
     in
     runInUbuntuBase {

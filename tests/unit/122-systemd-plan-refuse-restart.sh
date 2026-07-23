@@ -82,7 +82,7 @@ print("OK")
 PYEOF
 )"
 check_rc=$?
-[ "$check_rc" -eq 0 ] && [ "$check" = "OK" ] || fail "socket refuse-restart check failed: $check"
+if [ "$check_rc" -ne 0 ] || [ "$check" != "OK" ]; then fail "socket refuse-restart check failed: $check"; fi
 
 # =====================================================================
 # every documented refuse-restart class (socket, mount, swap, target,

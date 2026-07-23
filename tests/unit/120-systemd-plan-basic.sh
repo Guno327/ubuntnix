@@ -127,6 +127,6 @@ print("OK")
 PYEOF
 )"
 check_rc=$?
-[ "$check_rc" -eq 0 ] && [ "$check" = "OK" ] || fail "plan content check failed: $check"
+if [ "$check_rc" -ne 0 ] || [ "$check" != "OK" ]; then fail "plan content check failed: $check"; fi
 
 exit "$fails"

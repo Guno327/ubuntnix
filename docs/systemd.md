@@ -211,7 +211,7 @@ how many unit files actually changed.
 
 A single JSON object:
 
-```json
+```text
 { "version": 1, "daemonReload": true, "actions": [ { "op": "...", "unit": "...", "...": "..." }, ... ] }
 ```
 

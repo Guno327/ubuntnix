@@ -771,7 +771,12 @@ let
         # -- 4. partition the raw disk image FILE directly (see this
         #       function's own header: parted's file backend needs no
         #       loop device/mount/elevated privilege). -------------------
-        disk_size_mib=$squashfs_end_mib
+        # The last partition ENDS at squashfs_end_mib, so the backing device
+        # must extend PAST that offset -- parted rejects a partition whose end
+        # equals the exact device size ("The location <N>MiB is outside of the
+        # device", CI run 29997249917). One MiB of tail slack puts the end
+        # strictly inside the device.
+        disk_size_mib=$((squashfs_end_mib + 1))
         ubxrun "$UBX_BASE/usr/bin/truncate" -s "''${disk_size_mib}M" disk.img
         toolrun "$tools/usr/sbin/parted" --script disk.img -- \
           mklabel msdos \

@@ -26,6 +26,7 @@
         ./nix/users.nix
         ./nix/etc.nix
         ./nix/boot.nix
+        ./nix/systemd.nix
       ];
     };
 }

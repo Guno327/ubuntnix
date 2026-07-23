@@ -152,6 +152,28 @@ jobs:
           }
           [ -f result-etc-proof/manifest.json ] || { echo "no manifest.json in etc-proof output"; exit 1; }
           python3 tests/lib/check-etc-proof.py result-etc-proof
+      # Systemd units/services proof (SPEC.md §4.3 switching-table row 1,
+      # §6; issue #27, M2): nix/systemd.nix's `render` evaluated end to end
+      # against a small fixture declaration (one fully-owned `.service`
+      # unit plus one packaged-state-only `services.cups` entry) -- the
+      # one part of this issue that can only be exercised where a real
+      # `nix` binary exists; the planner half (bin/ubx-systemd) is
+      # unit-tested without one under tests/unit/12x (see nix/systemd.nix's
+      # own header, "What this file is, and what it deliberately is NOT").
+      - name: Build systemd-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#systemd-proof -L -o result-systemd-proof
+          sudo chown -R "$USER" result-systemd-proof
+      - name: Assert systemd-proof output tree + manifest
+        run: |
+          [ -f result-systemd-proof/tree/ubuntnix-example.service ] || {
+            echo "no tree/ubuntnix-example.service in systemd-proof output"; exit 1;
+          }
+          grep -q 'ubuntnix example service' result-systemd-proof/tree/ubuntnix-example.service || {
+            echo "tree/ubuntnix-example.service does not contain the declared text"; exit 1;
+          }
+          [ -f result-systemd-proof/manifest.json ] || { echo "no manifest.json in systemd-proof output"; exit 1; }
+          python3 tests/lib/check-systemd-proof.py result-systemd-proof
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

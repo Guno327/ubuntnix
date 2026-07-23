@@ -53,6 +53,10 @@ milestone plan.
   later).
 - {doc}`boot` — kernel selection, GRUB generation machinery, and the
   bootable disk image (implemented in M1).
+- {doc}`systemd` — systemd units/services: declaration, the refuse-restart
+  class rules, and the ordered unit-activation planner (declaration + plan
+  + a thin executor implemented in M2; wiring into a real running system's
+  `ubx rebuild switch` lands later).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -70,5 +74,6 @@ generations
 users
 etc
 boot
+systemd
 reference/index
 ```

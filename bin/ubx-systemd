@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+# bin/ubx-systemd — diff-driven systemd unit activation PLANNER (SPEC.md
+# §4.3 switching-table row 1 "`/etc`, systemd units/services | generate +
+# diff + restart changed units (switch-to-configuration equivalent)", §6,
+# §7 drift/converge reporting; GitHub issue #27, milestone M2).
+#
+# -- Scope: planner only, never touches systemd or a filesystem ------------
+#
+# This script computes what SHOULD happen; it never writes a unit file,
+# never calls `systemctl`, never runs `daemon-reload` for real. Given two
+# generations' systemd manifests (as rendered by nix/systemd.nix's
+# `render` -- see that file's "Interface with bin/ubx-systemd /
+# bin/ubx-systemd-apply") and an observed-state manifest (see `observe`,
+# below), `plan` prints a deterministic, ordered JSON action plan.
+# Applying that plan to a real system is bin/ubx-systemd-apply's job,
+# deliberately kept in a SEPARATE, thin script -- mirrors this project's
+# existing planner/executor split (bin/ubx-etc plans /etc; bin/ubx-users
+# plans passwd/group state; nothing in either script mutates anything for
+# real).
+#
+# -- Why python3 (unlike bin/ubx-generations, like bin/ubx-etc) -----------
+#
+# See bin/ubx-etc's own header for the full reasoning -- it applies
+# verbatim here: nix/systemd.nix's `render` is required to emit a JSON
+# manifest (an array of small per-unit objects), and `python3` is a safe,
+# always-present dependency on stock Ubuntu (apt itself is python3-apt).
+#
+# -- Inputs: three manifests, two related but distinct schemas ------------
+#
+# `plan` takes three inputs:
+#
+#   --old-manifest / --new-manifest   nix/systemd.nix's `render` output
+#                                       ($out/manifest.json) for generation
+#                                       N and N+1 respectively -- the
+#                                       DECLARED schema:
+#     { "version": 1, "units": [
+#         { "name": "myapp.service", "class": "service",
+#           "refuseRestart": false, "hasContent": true,
+#           "sha256": <64 hex | null>, "enable": true, "mask": false },
+#         ... ] }
+#
+#   --observed-manifest                what is ACTUALLY on the machine
+#                                       right now -- the OBSERVED schema
+#                                       (see `observe` below for how a real
+#                                       one is produced):
+#     { "version": 1, "units": [
+#         { "name": "myapp.service", "sha256": <64 hex | null>,
+#           "enabled": true, "masked": false, "active": true },
+#         ... ] }
+#
+# Exactly the same "diff against OBSERVED state, not against the previous
+# generation's own record of itself" posture bin/ubx-etc's header explains
+# at length: a unit hand-edited or hand-(dis/en)abled outside `ubx` since
+# the last switch must still converge correctly on the NEXT switch.
+# `--old-manifest` is consulted for exactly one thing: which unit names
+# were previously MANAGED (so `remove-unit-file`/stop/disable on removal
+# only ever targets a name this project itself declared before).
+#
+# -- Unit classes and the refuse-restart rule ------------------------------
+#
+# See nix/systemd.nix's header, "Unit classes and the refuse-restart rule",
+# for the full reasoning -- the SAME table is mirrored here (dual
+# enforcement, the same posture nix/etc.nix and bin/ubx-etc both take for
+# machine-local mutable exceptions) so this planner can run standalone
+# against hand-crafted fixture manifests with no `nix` binary at all:
+#
+#   service, timer, path, scope    -- restart-safe
+#   socket, mount, swap, target,
+#   device, slice                  -- refuse-restart: content or
+#                                      newly-active-relevant changes NEVER
+#                                      produce a `restart` action here --
+#                                      only a diagnostic `refuse-restart`
+#                                      action naming the class. A manifest
+#                                      already carries `refuseRestart` per
+#                                      unit (set by nix/systemd.nix from
+#                                      this exact table); this script also
+#                                      re-derives it from the unit's own
+#                                      suffix as a defense-in-depth check
+#                                      and REFUSES outright (like
+#                                      bin/ubx-etc's exception refusal) if
+#                                      a manifest's own `refuseRestart`
+#                                      flag disagrees with what the name's
+#                                      suffix implies -- that should never
+#                                      happen from a manifest nix/systemd.nix
+#                                      produced, so disagreement indicates a
+#                                      bug or a hand-tampered file.
+#
+# -- The plan algorithm -----------------------------------------------------
+#
+# For every unit in the NEW manifest (`tgt`), let `obs` be its observed
+# entry (absent -> treated as unmanaged/never-installed: enabled=false,
+# masked=false, active=false, sha256=null):
+#
+#   - `tgt.hasContent` and (obs missing OR obs.sha256 is null)
+#       -> `write-unit-file` (create); the unit's file has never been
+#          installed under this project's management.
+#   - `tgt.hasContent` and obs.sha256 differs from `tgt.sha256`
+#       -> `write-unit-file` (update-content)
+#   - (either of the above happened)
+#       -> triggers a start/restart decision (see below) UNLESS
+#          `tgt.refuseRestart` (or the class-derived flag) is true, in
+#          which case a `refuse-restart` diagnostic action is emitted
+#          instead and no start/restart/stop is ever planned for that
+#          content change.
+#   - `tgt.mask` differs from `obs.masked` -> `mask`/`unmask`
+#   - `tgt.enable` differs from `obs.enabled`, AND `tgt.mask` is false
+#     (masking a unit makes enabling it meaningless/refused by systemd
+#     itself, so this project never plans an enable action alongside a
+#     mask action for the same unit) -> `enable`/`disable`; a `disable`
+#     transition additionally plans `stop` first if `obs.active`.
+#   - start/restart decision, only reached when NOT refuse-restart:
+#       - unit newly created (no prior file) AND `tgt.enable` AND not
+#         `tgt.mask` -> `start`
+#       - unit's content changed (not newly created) AND (`obs.active` OR
+#         (`tgt.enable` and not `tgt.mask`)) -> `restart`
+#       - unit's content UNCHANGED but transitioning disabled->enabled
+#         while not already active -> `start`
+#
+# For every unit in the OLD manifest but not the NEW one (dropped from the
+# declaration): `stop` if `obs.active`, `disable` if `obs.enabled`,
+# `remove-unit-file` if the old entry had content and the observed entry
+# still shows a file (`obs.sha256` is not null) -- exactly bin/ubx-etc's
+# own "Removal scope" rule: only a name this project's OWN old manifest
+# once declared can ever be planned for removal/stop/disable.
+#
+# -- Exactly one coalesced daemon-reload -------------------------------
+#
+# Real systemd only needs `daemon-reload` after a unit FILE is added,
+# changed, or removed -- never merely for enable/disable/mask/start/stop,
+# which read the already-loaded unit file/state directly. So exactly one
+# `daemon-reload` action is emitted, iff at least one `write-unit-file` or
+# `remove-unit-file` action was planned -- never zero-but-nonempty-plan,
+# never more than one, regardless of how many unit files changed.
+#
+# -- Deterministic ordering -----------------------------------------------
+#
+# The action list is grouped by op in this FIXED sequence (each group
+# internally sorted by unit name): write-unit-file (create, then
+# update-content, each sorted by name) -> remove-unit-file -> daemon-reload
+# (at most one, no unit name) -> stop -> disable -> mask -> unmask ->
+# enable -> start -> restart -> refuse-restart. This ordering is itself
+# operationally meaningful (files must exist and be reloaded before
+# anything reads them; stop precedes disable; disable precedes the
+# opposite-direction enable of some OTHER unit only by virtue of the fixed
+# group order, not per-unit interleaving) as well as fully deterministic.
+#
+# -- Output ---------------------------------------------------------------
+#
+# A single JSON object on stdout (or --out):
+#   { "version": 1,
+#     "daemonReload": <bool>,
+#     "actions": [ { "op": ..., "unit": ..., ... }, ... ] }
+# An empty (fully converged) input produces `"actions": []`,
+# `"daemonReload": false`, and exit 0 -- a no-op plan is success.
+#
+# `report` renders an already-computed plan as human-readable text (feeds
+# `ubx diff` / the converge report, SPEC.md §7) -- kept as a SEPARATE
+# subcommand from `plan` itself, the same reasoning bin/ubx-users keeps
+# `plan`/`execute` separate: the machine-readable plan is inspectable and
+# diffable on its own before anything renders prose from it.
+set -euo pipefail
+
+prog_name="ubx-systemd"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-systemd <command> [options]
+
+commands:
+  plan       compute a deterministic, ordered unit-activation action plan
+             from two generations' systemd manifests plus an
+             observed-state manifest
+  observe    walk a real /etc/systemd/system-style directory (+ optional
+             systemctl state fixture) and emit an observed-state manifest
+  report     render an already-computed plan as human-readable text
+  -h, --help  show this message
+
+Run 'ubx-systemd <command> --help' for a command's own options. See this
+script's header for the manifest schemas, the plan algorithm, and the
+refuse-restart class rules (SPEC.md §4.3, §6, §7).
+USAGE
+}
+
+write_out() {
+  local out="$1" content="$2"
+  if [ "$out" = - ]; then
+    printf '%s' "$content"
+  else
+    local tmp
+    tmp="$(mktemp "$(dirname "$out")/.ubx-systemd.XXXXXX")"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$out"
+  fi
+}
+
+# =====================================================================
+# observe
+# =====================================================================
+
+cmd_observe_usage() {
+  cat <<'USAGE'
+usage: ubx-systemd observe --dir DIR [--state FILE] [--out FILE|-]
+
+Walks DIR (expected shape: a real or fixture /etc/systemd/system-style
+directory containing this project's own managed unit files -- one regular
+file per unit, named exactly like the unit itself, e.g.
+DIR/myapp.service) and emits an observed-state manifest describing each
+REGULAR file found directly under it (not recursive -- systemd unit
+directories are flat) plus, for every name mentioned in --state, its
+enabled/masked/active booleans.
+
+--state FILE (optional): a JSON object
+  { "<unit-name>": { "enabled": bool, "masked": bool, "active": bool }, ... }
+representing what a real `systemctl is-enabled`/`is-active`/`is-active
+--quiet` (or `systemctl show`) query would report for each unit -- this is
+this script's one input that isn't file-content-shaped, mirroring
+bin/ubx-users' own --home-state fixture input. A unit named in --state but
+absent from DIR is still included in the manifest with sha256: null
+(state observed, but no managed file present -- exactly the shape a
+`services.*`-only, packaged unit's observed entry takes). Omitted ->
+every unit defaults to enabled: false, masked: false, active: false.
+
+--out defaults to stdout ("-"); a real path is written atomically.
+USAGE
+}
+
+cmd_observe() {
+  local dir="" state="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) [ $# -ge 2 ] || die "--dir requires an argument"; dir="$2"; shift 2 ;;
+      --state) [ $# -ge 2 ] || die "--state requires an argument"; state="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_observe_usage; exit 0 ;;
+      *) echo "$prog_name: observe: unknown option: $1" >&2; cmd_observe_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$dir" ] || die "observe: --dir is required"
+  [ -d "$dir" ] || die "observe: no such directory: $dir"
+  [ -z "$state" ] || [ -f "$state" ] || die "observe: no such file: $state"
+
+  local content
+  content="$(python3 - "$dir" "$state" <<'PYEOF'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root, state_path = sys.argv[1:3]
+
+state = {}
+if state_path:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+
+files = {}
+for fname in sorted(os.listdir(root)):
+    full = os.path.join(root, fname)
+    st = os.lstat(full)
+    if not stat.S_ISREG(st.st_mode):
+        continue
+    h = hashlib.sha256()
+    with open(full, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    files[fname] = h.hexdigest()
+
+names = sorted(set(files) | set(state))
+units = []
+for name in names:
+    st_entry = state.get(name, {})
+    units.append({
+        "name": name,
+        "sha256": files.get(name),
+        "enabled": bool(st_entry.get("enabled", False)),
+        "masked": bool(st_entry.get("masked", False)),
+        "active": bool(st_entry.get("active", False)),
+    })
+
+print(json.dumps({"version": 1, "units": units}, indent=2, ensure_ascii=False))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# plan
+# =====================================================================
+
+cmd_plan_usage() {
+  cat <<'USAGE'
+usage: ubx-systemd plan --old-manifest FILE --new-manifest FILE \\
+         --observed-manifest FILE [--out FILE|-]
+
+Computes a deterministic, ordered unit-activation action plan (see this
+script's header for the full algorithm) and prints it as a JSON object:
+
+  { "version": 1, "daemonReload": <bool>, "actions": [ {"op": ..., ...}, ... ] }
+
+--out defaults to stdout ("-"); a real path is written atomically. Exits 0
+on an empty (fully converged) plan, and also exits 0 for any well-formed,
+non-refusal plan -- `plan` never fails just because changes exist. Refuses
+(nonzero exit, nothing printed) if a manifest's own `refuseRestart` flag
+for some unit disagrees with what its name's suffix implies (see header).
+USAGE
+}
+
+cmd_plan() {
+  local old="" new="" observed="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --old-manifest) [ $# -ge 2 ] || die "--old-manifest requires an argument"; old="$2"; shift 2 ;;
+      --new-manifest) [ $# -ge 2 ] || die "--new-manifest requires an argument"; new="$2"; shift 2 ;;
+      --observed-manifest) [ $# -ge 2 ] || die "--observed-manifest requires an argument"; observed="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_plan_usage; exit 0 ;;
+      *) echo "$prog_name: plan: unknown option: $1" >&2; cmd_plan_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$old" ] || die "plan: --old-manifest is required"
+  [ -n "$new" ] || die "plan: --new-manifest is required"
+  [ -n "$observed" ] || die "plan: --observed-manifest is required"
+  [ -f "$old" ] || die "plan: no such file: $old"
+  [ -f "$new" ] || die "plan: no such file: $new"
+  [ -f "$observed" ] || die "plan: no such file: $observed"
+
+  local content
+  content="$(python3 - "$old" "$new" "$observed" <<'PYEOF'
+import json
+import sys
+
+old_path, new_path, observed_path = sys.argv[1:4]
+
+# -- unit class table -- mirrors nix/systemd.nix's `unitClasses` exactly
+# (see this script's header, "Unit classes and the refuse-restart rule").
+UNIT_CLASSES = {
+    "service": False, "timer": False, "path": False, "scope": False,
+    "socket": True, "mount": True, "swap": True, "target": True,
+    "device": True, "slice": True,
+}
+
+
+def class_of(name):
+    for suffix, refuse in UNIT_CLASSES.items():
+        if name.endswith(f".{suffix}"):
+            return suffix, refuse
+    return None, None
+
+
+def load_declared(path, label):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-systemd: plan: {label} ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    entries = {}
+    for u in data.get("units", []):
+        missing = [k for k in ("name", "class", "refuseRestart", "hasContent", "sha256", "enable", "mask") if k not in u]
+        if missing:
+            print(f"ubx-systemd: plan: {label} ({path}): unit missing field(s) {missing}: {u}", file=sys.stderr)
+            sys.exit(1)
+        name = u["name"]
+        derived_suffix, derived_refuse = class_of(name)
+        if derived_suffix is None:
+            print(f"ubx-systemd: plan: {label} ({path}): unit '{name}' has no recognized class suffix", file=sys.stderr)
+            sys.exit(1)
+        if bool(u["refuseRestart"]) != derived_refuse:
+            print(
+                f"ubx-systemd: plan: {label} ({path}): unit '{name}' declares "
+                f"refuseRestart={u['refuseRestart']!r} but its class ({derived_suffix}) implies "
+                f"{derived_refuse!r} -- refusing (bug or hand-tampered manifest)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        entries[name] = {
+            "class": u["class"],
+            "refuseRestart": bool(u["refuseRestart"]),
+            "hasContent": bool(u["hasContent"]),
+            "sha256": u["sha256"],
+            "enable": bool(u["enable"]),
+            "mask": bool(u["mask"]),
+        }
+    return entries
+
+
+def load_observed(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-systemd: plan: --observed-manifest ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    entries = {}
+    for u in data.get("units", []):
+        missing = [k for k in ("name", "sha256", "enabled", "masked", "active") if k not in u]
+        if missing:
+            print(f"ubx-systemd: plan: --observed-manifest ({path}): unit missing field(s) {missing}: {u}", file=sys.stderr)
+            sys.exit(1)
+        entries[u["name"]] = {
+            "sha256": u["sha256"],
+            "enabled": bool(u["enabled"]),
+            "masked": bool(u["masked"]),
+            "active": bool(u["active"]),
+        }
+    return entries
+
+
+old = load_declared(old_path, "--old-manifest")
+new = load_declared(new_path, "--new-manifest")
+observed = load_observed(observed_path)
+
+EMPTY_OBS = {"sha256": None, "enabled": False, "masked": False, "active": False}
+
+creates = []
+updates = []
+removes = []
+stops = set()
+disables = set()
+masks = []
+unmasks = []
+enables = []
+starts = []
+restarts = []
+refuses = []
+
+for name in sorted(new):
+    tgt = new[name]
+    obs = observed.get(name, EMPTY_OBS)
+
+    content_changed = False
+    is_new_file = False
+    if tgt["hasContent"]:
+        if obs["sha256"] is None:
+            creates.append(name)
+            content_changed = True
+            is_new_file = True
+        elif obs["sha256"] != tgt["sha256"]:
+            updates.append(name)
+            content_changed = True
+
+    if tgt["mask"] != obs["masked"]:
+        (masks if tgt["mask"] else unmasks).append(name)
+
+    if not tgt["mask"] and tgt["enable"] != obs["enabled"]:
+        if tgt["enable"]:
+            enables.append(name)
+        else:
+            disables.add(name)
+            if obs["active"]:
+                stops.add(name)
+
+    if content_changed:
+        if tgt["refuseRestart"]:
+            refuses.append({"name": name, "class": tgt["class"]})
+        elif is_new_file:
+            if tgt["enable"] and not tgt["mask"]:
+                starts.append(name)
+        else:
+            if obs["active"] or (tgt["enable"] and not tgt["mask"]):
+                restarts.append(name)
+    else:
+        if not tgt["mask"] and tgt["enable"] and not obs["enabled"] and not obs["active"]:
+            starts.append(name)
+
+for name in sorted(set(old) - set(new)):
+    old_u = old[name]
+    obs = observed.get(name, EMPTY_OBS)
+    if obs["active"]:
+        stops.add(name)
+    if obs["enabled"]:
+        disables.add(name)
+    if old_u["hasContent"] and obs["sha256"] is not None:
+        removes.append(name)
+
+daemon_reload = bool(creates or updates or removes)
+
+actions = []
+for name in creates:
+    actions.append({"op": "write-unit-file", "action": "create", "unit": name, "sha256": new[name]["sha256"]})
+for name in updates:
+    actions.append({"op": "write-unit-file", "action": "update-content", "unit": name, "sha256": new[name]["sha256"]})
+for name in sorted(removes):
+    actions.append({"op": "remove-unit-file", "unit": name})
+if daemon_reload:
+    actions.append({"op": "daemon-reload"})
+for name in sorted(stops):
+    actions.append({"op": "stop", "unit": name})
+for name in sorted(disables):
+    actions.append({"op": "disable", "unit": name})
+for name in sorted(masks):
+    actions.append({"op": "mask", "unit": name})
+for name in sorted(unmasks):
+    actions.append({"op": "unmask", "unit": name})
+for name in sorted(enables):
+    actions.append({"op": "enable", "unit": name})
+for name in sorted(starts):
+    actions.append({"op": "start", "unit": name})
+for name in sorted(restarts):
+    actions.append({"op": "restart", "unit": name})
+for r in sorted(refuses, key=lambda r: r["name"]):
+    actions.append({
+        "op": "refuse-restart",
+        "unit": r["name"],
+        "class": r["class"],
+        "reason": (
+            f"unit class '{r['class']}' is a refuse-restart class -- content was updated and "
+            "daemon-reload issued, but no restart/start/stop was planned; a human must decide "
+            "whether/how to apply the change live (SPEC.md §4.3, §6; nix/systemd.nix's "
+            "'Unit classes and the refuse-restart rule')"
+        ),
+    })
+
+plan = {"version": 1, "daemonReload": daemon_reload, "actions": actions}
+sys.stdout.write(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
+PYEOF
+  )"
+  write_out "$out" "$content"
+}
+
+# =====================================================================
+# report
+# =====================================================================
+
+cmd_report_usage() {
+  cat <<'USAGE'
+usage: ubx-systemd report --plan FILE [--out FILE|-]
+
+Renders an already-computed plan (bin/ubx-systemd plan's own output) as
+human-readable text -- feeds `ubx diff` / the converge report (SPEC.md
+§7). Kept separate from `plan` itself so the machine-readable plan stays
+inspectable/diffable on its own.
+USAGE
+}
+
+cmd_report() {
+  local plan="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_report_usage; exit 0 ;;
+      *) echo "$prog_name: report: unknown option: $1" >&2; cmd_report_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "report: --plan is required"
+  [ -f "$plan" ] || die "report: no such file: $plan"
+
+  local content
+  content="$(python3 - "$plan" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+actions = plan.get("actions", [])
+if not actions:
+    print("systemd: nothing to do (fully converged)")
+    sys.exit(0)
+
+VERB = {
+    "write-unit-file": lambda a: f"install unit file: {a['unit']} ({a['action']})",
+    "remove-unit-file": lambda a: f"remove unit file: {a['unit']}",
+    "daemon-reload": lambda a: "daemon-reload",
+    "stop": lambda a: f"stop {a['unit']}",
+    "disable": lambda a: f"disable {a['unit']}",
+    "mask": lambda a: f"mask {a['unit']}",
+    "unmask": lambda a: f"unmask {a['unit']}",
+    "enable": lambda a: f"enable {a['unit']}",
+    "start": lambda a: f"start {a['unit']}",
+    "restart": lambda a: f"restart {a['unit']}",
+    "refuse-restart": lambda a: f"REFUSED restart of {a['unit']} (class {a['class']}) -- {a['reason']}",
+}
+
+lines = [f"systemd: {len(actions)} action(s) planned:"]
+for a in actions:
+    render = VERB.get(a["op"])
+    lines.append(f"  - {render(a) if render else a}")
+print("\n".join(lines))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# main
+# =====================================================================
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    -h | --help | "" | help)
+      usage
+      [ "$cmd" = "" ] && exit 2
+      exit 0
+      ;;
+    plan) shift; cmd_plan "$@" ;;
+    observe) shift; cmd_observe "$@" ;;
+    report) shift; cmd_report "$@" ;;
+    *)
+      echo "$prog_name: unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

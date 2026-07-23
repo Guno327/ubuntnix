@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# bin/ubx-systemd-apply — THIN systemd activation EXECUTOR (SPEC.md §4.3
+# switching-table row 1 "generate + diff + restart changed units
+# (switch-to-configuration equivalent)"; GitHub issue #27, milestone M2).
+#
+# Consumes a plan JSON produced by `bin/ubx-systemd plan` and issues the
+# exact `systemctl`/file-write calls it describes, IN THE PLAN'S OWN
+# ORDER. All the intelligence (what should change, whether a restart is
+# safe, coalescing daemon-reload) lives in the planner (bin/ubx-systemd);
+# this script is deliberately dumb -- it does not recompute, re-derive, or
+# second-guess a single decision the plan already made, mirroring
+# bin/ubx-users' own "execute never runs anything itself" scope line, with
+# one difference: THIS executor DOES run its commands (bin/ubx-users
+# execute only emits a shell script for something else to run) -- but it
+# still only ever runs exactly what the plan already decided, in the
+# plan's own order, nothing more.
+#
+# -- No-op / dry-run posture when systemd is absent ------------------------
+#
+# This project's dev/CI harness has no live systemd (tests/README.md's
+# "no root, no network" posture; SPEC.md's on-device activation is real
+# systemd, but this repo's own test environment is not that machine). Per
+# this issue's own scope ("guarded so it is a no-op / dry-run when systemd
+# is absent, matching bin/ubx-users' executor"), this script:
+#   - refuses to actually invoke `systemctl` unless it exists AND
+#     `--apply` is passed (the default is `--dry-run`, printing every
+#     command it WOULD run, one per line, and exiting 0);
+#   - with `--apply` but no `systemctl` binary on PATH, refuses outright
+#     (a real "apply my systemd changes" request with no systemd present
+#     is a hard misconfiguration, not silently downgraded to a no-op);
+#   - `write-unit-file`/`remove-unit-file` actions target `--unit-dir`
+#     (default `/etc/systemd/system`) -- also dry-run by default, same
+#     `--apply` gate.
+#
+# -- Ordering ----------------------------------------------------------
+#
+# Actions are executed in EXACTLY the order the plan JSON lists them --
+# this script never sorts, groups, or reorders; bin/ubx-systemd's own
+# header documents why its emitted order is already the correct one
+# (files before daemon-reload before stop/disable/mask before
+# enable/start/restart before refuse-restart diagnostics).
+set -euo pipefail
+
+prog_name="ubx-systemd-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-systemd-apply --plan FILE [--unit-dir DIR] [--apply | --dry-run]
+
+Consumes a plan produced by `bin/ubx-systemd plan` and issues the
+corresponding systemctl/file-write calls in the plan's own order.
+
+  --plan FILE      the plan JSON to apply (required)
+  --unit-dir DIR   where write-unit-file/remove-unit-file act (default:
+                   /etc/systemd/system)
+  --apply          actually run commands (requires systemctl on PATH)
+  --dry-run        print, don't run (default)
+
+Content for a write-unit-file action is read from --content-dir/<unit>
+(default: the directory the plan's own SYSTEMD_CONTENT_DIR env var names,
+or the current directory) -- see this script's --content-dir option.
+USAGE
+}
+
+main() {
+  local plan="" unit_dir="/etc/systemd/system" mode="dry-run" content_dir="."
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --unit-dir) [ $# -ge 2 ] || die "--unit-dir requires an argument"; unit_dir="$2"; shift 2 ;;
+      --content-dir) [ $# -ge 2 ] || die "--content-dir requires an argument"; content_dir="$2"; shift 2 ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+
+  if [ "$mode" = "apply" ] && ! command -v systemctl > /dev/null 2>&1; then
+    die "--apply requires systemctl on PATH, but none was found (refusing -- see this script's header, 'No-op / dry-run posture')"
+  fi
+
+  local commands
+  commands="$(python3 - "$plan" "$unit_dir" "$content_dir" <<'PYEOF'
+import json
+import shlex
+import sys
+
+plan_path, unit_dir, content_dir = sys.argv[1:4]
+
+with open(plan_path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+lines = []
+
+
+def emit(argv):
+    lines.append(" ".join(shlex.quote(a) for a in argv))
+
+
+for a in plan.get("actions", []):
+    op = a["op"]
+    if op == "write-unit-file":
+        # The plan itself only carries a content hash, never raw content
+        # (see bin/ubx-systemd's header -- manifests are content-hash
+        # addressed). The real content lives at content_dir/<unit>,
+        # exactly nix/systemd.nix's render's own $out/tree/<name> layout;
+        # a real `ubx rebuild switch` points --content-dir at that tree.
+        emit(["install", "-D", "-m", "0644",
+              f"{content_dir}/{a['unit']}", f"{unit_dir}/{a['unit']}"])
+    elif op == "remove-unit-file":
+        emit(["rm", "-f", f"{unit_dir}/{a['unit']}"])
+    elif op == "daemon-reload":
+        emit(["systemctl", "daemon-reload"])
+    elif op == "stop":
+        emit(["systemctl", "stop", a["unit"]])
+    elif op == "disable":
+        emit(["systemctl", "disable", a["unit"]])
+    elif op == "mask":
+        emit(["systemctl", "mask", a["unit"]])
+    elif op == "unmask":
+        emit(["systemctl", "unmask", a["unit"]])
+    elif op == "enable":
+        emit(["systemctl", "enable", a["unit"]])
+    elif op == "start":
+        emit(["systemctl", "start", a["unit"]])
+    elif op == "restart":
+        emit(["systemctl", "restart", a["unit"]])
+    elif op == "refuse-restart":
+        # Diagnostic only -- the planner already decided NOT to restart
+        # this unit; the executor must not second-guess that by running
+        # anything for it. Surfaced as a comment line, never a command.
+        lines.append(f"# refuse-restart: {a['unit']} (class {a['class']}) -- no action taken, see plan report")
+    else:  # pragma: no cover -- defensive; bin/ubx-systemd never emits this
+        print(f"ubx-systemd-apply: unknown plan action op: {op!r}", file=sys.stderr)
+        sys.exit(1)
+
+print("\n".join(lines))
+PYEOF
+  )"
+
+  if [ "$mode" = "dry-run" ]; then
+    if [ -n "$commands" ]; then
+      printf '%s\n' "$commands"
+    fi
+    exit 0
+  fi
+
+  # --apply: run each real command line via a temp script (comments --
+  # refuse-restart markers -- pass through as no-op comments, never
+  # executed as a command).
+  local script
+  script="$(mktemp)"
+  trap 'rm -f "$script"' EXIT
+  {
+    printf '#!/bin/sh\nset -e\n'
+    printf '%s\n' "$commands"
+  } > "$script"
+  chmod +x "$script"
+  "$script"
+}
+
+main "$@"

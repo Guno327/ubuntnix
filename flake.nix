@@ -25,6 +25,7 @@
         ./nix/compose.nix
         ./nix/users.nix
         ./nix/etc.nix
+        ./nix/systemd.nix
       ];
     };
 }

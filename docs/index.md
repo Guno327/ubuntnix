@@ -51,6 +51,10 @@ milestone plan.
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands
   later).
+- {doc}`systemd` — systemd units/services: declaration, the refuse-restart
+  class rules, and the ordered unit-activation planner (declaration + plan
+  + a thin executor implemented in M2; wiring into a real running system's
+  `ubx rebuild switch` lands later).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -67,5 +71,6 @@ guards
 generations
 users
 etc
+systemd
 reference/index
 ```

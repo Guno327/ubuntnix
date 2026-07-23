@@ -679,6 +679,24 @@ let
 
         version="${flavor}"
 
+        # -- 0. point glibc's iconv at the base tree's gconv modules -----
+        #       mkfs.vfat and mtools (mmd/mcopy) convert the FAT volume
+        #       label and 8.3 short names between the DOS codepage (850 by
+        #       default) and the locale charset via glibc iconv. glibc's
+        #       GCONV_PATH is compiled in as the absolute
+        #       /usr/lib/x86_64-linux-gnu/gconv, which does NOT exist inside
+        #       the Nix sandbox — so iconv_open("...","CP850") fails
+        #       ("Cannot initialize conversion from codepage 850 ...",
+        #       CI run 29996044586), mtools falls back to its internal table,
+        #       and even that errors out ("Error setting code page / Cannot
+        #       initialize '::'"). Pointing GCONV_PATH at the base's own
+        #       gconv dir lets iconv load CP850.so (shipped by libc6) again.
+        export GCONV_PATH="$UBX_BASE/usr/lib/x86_64-linux-gnu/gconv"
+        [ -d "$GCONV_PATH" ] || {
+          echo "diskImage: gconv modules dir not found at $GCONV_PATH -- the ubuntu-base tree is expected to ship libc6's gconv modules; mtools/mkfs.vfat codepage conversion will fail without them" >&2
+          exit 1
+        }
+
         # -- 1. compute the fixed partition layout, in MiB, from the
         #       ACTUAL squashfs image size (parted/mtools/mkfs.vfat all
         #       speak MiB) -----------------------------------------------

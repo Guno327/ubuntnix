@@ -73,6 +73,7 @@ done
 #    disk.img, with conv=notrunc (must not truncate disk.img to 440 bytes).
 grep -qE 'dd\s*\\?[[:space:]]*$|dd ' "$boot_nix" ||
   fail "$boot_nix does not appear to invoke dd at all"
+# shellcheck disable=SC2016  # the $tools is a literal string matched inside boot.nix, not a shell expansion
 grep -qE 'if="\$tools/usr/lib/grub/i386-pc/boot\.img"\s+of=disk\.img' "$boot_nix" ||
   fail "$boot_nix does not dd boot.img onto disk.img"
 grep -qE 'bs=440\s+count=1\s+conv=notrunc' "$boot_nix" ||

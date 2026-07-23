@@ -156,6 +156,12 @@ main() {
   # -serial file:$log + console=ttyS0 (baked into the image's kernel
   # command line, nix/boot.nix's proofGeneration) is how the guest's own
   # kernel/systemd/ubx-e2e-assert.service output reaches $log at all.
+  # -drive snapshot=on: the image is typically a Nix store output (mode 0444,
+  # read-only), and the ubuntnix rootfs is immutable by design, so qemu must
+  # not try to open the backing file O_RDWR (that failed with "Permission
+  # denied" on the store object). snapshot=on opens the backing read-only and
+  # sends any guest writes to a discarded temporary overlay -- correct for a
+  # throwaway boot test that must never mutate the built image.
   echo "$prog_name: booting $image (accel=$accel, timeout=${timeout}s)..." >&2
   local rc=0
   timeout -k 10 "${timeout}s" \
@@ -165,7 +171,7 @@ main() {
     -cpu "$cpu" \
     -m 1024 \
     -smp 2 \
-    -drive "file=$image,format=raw,if=virtio" \
+    -drive "file=$image,format=raw,if=virtio,snapshot=on" \
     -serial "file:$log" \
     -display none \
     -no-reboot \

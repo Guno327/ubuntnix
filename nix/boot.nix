@@ -665,7 +665,7 @@ let
 
         for bin in \
           "$tools/usr/bin/grub-mkimage" \
-          "$tools/usr/sbin/grub-bios-setup" \
+          "$tools/usr/lib/grub/i386-pc/grub-bios-setup" \
           "$tools/usr/sbin/mkfs.vfat" \
           "$tools/usr/bin/mmd" \
           "$tools/usr/bin/mcopy" \
@@ -760,7 +760,11 @@ let
         toolrun "$UBX_BASE/bin/cp" "$tools/usr/lib/grub/i386-pc/boot.img" grub-setup-dir/boot.img
         toolrun "$UBX_BASE/bin/cp" core.img grub-setup-dir/core.img
         printf '(hd0) %s\n' "$PWD/disk.img" > device.map
-        toolrun "$tools/usr/sbin/grub-bios-setup" \
+        # noble ships grub-bios-setup as a grub-pc-bin arch tool under
+        # /usr/lib/grub/i386-pc/, NOT at /usr/sbin/ (grub-common's /usr/sbin
+        # carries grub-mkconfig/grub-probe/... but not the BIOS setup tool);
+        # confirmed against the noble grub-pc-bin/grub-common filelists.
+        toolrun "$tools/usr/lib/grub/i386-pc/grub-bios-setup" \
           --directory=grub-setup-dir --device-map=device.map disk.img
 
         ubxrun "$UBX_BASE/bin/cp" disk.img "$out/disk.img"

@@ -647,7 +647,13 @@ let
       tools = toolsFHS {
         inherit system;
         name = "diskimage-${name}";
-        packages = [ "grub-pc-bin" "grub-common" "grub2-common" "dosfstools" "mtools" "parted" ];
+        # libdevmapper1.02.1 is grub-common's own runtime dep: grub-mkimage
+        # and grub-bios-setup both link libdevmapper.so.1.02.1 (device-mapper
+        # disk probing). toolsFHS unpacks each named deb flat with NO
+        # dependency resolution, so the lib has to be named explicitly or
+        # grub-mkimage dies with "libdevmapper.so.1.02.1: cannot open shared
+        # object file" (CI run 29996514090). Already in archive.lock.json.
+        packages = [ "grub-pc-bin" "grub-common" "grub2-common" "libdevmapper1.02.1" "dosfstools" "mtools" "parted" ];
       };
     in
     runInUbuntuBase {

@@ -51,6 +51,8 @@ milestone plan.
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands
   later).
+- {doc}`boot` — kernel selection, GRUB generation machinery, and the
+  bootable disk image (implemented in M1).
 - {doc}`systemd` — systemd units/services: declaration, the refuse-restart
   class rules, and the ordered unit-activation planner (declaration + plan
   + a thin executor implemented in M2; wiring into a real running system's
@@ -71,6 +73,7 @@ guards
 generations
 users
 etc
+boot
 systemd
 reference/index
 ```

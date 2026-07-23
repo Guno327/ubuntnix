@@ -75,8 +75,14 @@ grep -q 'unpackLines = builtins.concatStringsSep "\\n"' "$compose_nix" ||
 
 # shellcheck disable=SC2016 # single-quoted on purpose: matching literal
 # Nix ${...} interpolation syntax in the source text, not shell expansion.
-grep -qF 'dpkg --unpack "/.ubx-compose/debs/${toString i}.deb"' "$compose_nix" ||
-  fail "$compose_nix's unpackLines does not emit an index-named absolute dpkg --unpack line per package"
+# `--force-depends` (PR #36): unpack-time Pre-Depends checks run against
+# the TRANSIENT mid-sequence state (ubuntu-base's own versions mixed with
+# already-unpacked pinned ones) and can fail spuriously on strictly-
+# versioned Pre-Depends; the debootstrap idiom forces past that while
+# `dpkg --configure -a` (no force flag) still strictly verifies the final
+# tree — see nix/compose.nix's unpackLines comment.
+grep -qF 'dpkg --unpack --force-depends "/.ubx-compose/debs/${toString i}.deb"' "$compose_nix" ||
+  fail "$compose_nix's unpackLines does not emit an index-named absolute dpkg --unpack --force-depends line per package"
 
 # The in-chroot script must actually splice unpackLines in — and must NOT
 # still contain the old glob loop (a leftover/duplicate would either

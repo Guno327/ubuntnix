@@ -398,6 +398,72 @@ jobs:
             determinism-full.diff
           if-no-files-found: ignore
 
+  boot:
+    name: Bootable disk image + QEMU e2e (SPEC.md §11 M1 exit criterion; issue #10)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # nix/boot.nix's whole pipeline (bootRootfs -> squashfsImage ->
+      # kernelArtifacts -> grubCfg -> diskImage) composes the FULL locked
+      # archive (bootRootfs's default `packages`), so it goes through the
+      # exact same hardened chroot (nix/compose.nix's
+      # `unshare --user --map-root-user`) the "compose" job's own proofs
+      # do -- same unprivileged-user-namespaces requirement, see that
+      # job's identical step for the full rationale.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: nix/boot.nix's derivations are built via
+      # runInUbuntuBase, transitively depending on nix/stdenv.nix's one
+      # `__noChroot = true` derivation -- same requirement as
+      # stdenv-proof/archive-fetch-proof/compose-proof above.
+      - name: Build boot-image-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#boot-image-proof -L -o result-boot-image
+          sudo chown -R "$USER" result-boot-image
+      - name: Assert boot-image-proof artifact
+        run: |
+          img="result-boot-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          # msdos/MBR boot signature (0x55 0xAA at byte offsets 510-511) --
+          # a cheap, tool-free sanity check that parted/grub-bios-setup
+          # actually produced a partitioned, boot-signed disk, before
+          # spending minutes actually booting it below.
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e boot below will fall back to TCG (slower, still correct; see tests/e2e/010-qemu-boot-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end boot test (SPEC.md §11's M1 exit
+      # criterion): boots the just-built disk image, headless, serial
+      # console captured, under a hard timeout, and asserts the
+      # UBX-E2E-PASS marker the image's own baked-in ubx-e2e-assert.service
+      # emits once it has confirmed (INSIDE the guest) that boot reached
+      # multi-user.target, a generation marker file exists, and ubx is
+      # present and runnable -- see nix/boot.nix's bootRootfs for that
+      # unit's exact assertions.
+      - name: QEMU e2e boot test
+        run: ./tests/e2e/010-qemu-boot-e2e.sh --image result-boot-image --timeout 240 --keep-log serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-e2e-serial-log
+          path: serial.log
+          if-no-files-found: ignore
+
   resolve:
     name: Archive resolution (apt solver, end-to-end)
     runs-on: ubuntu-24.04

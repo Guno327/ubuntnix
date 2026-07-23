@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# bin/ubx-gen-grub-cfg — pure grub.cfg generation from a generation list
+# (SPEC.md §4.2 "a GRUB menu entry (kernel + initrd + rootfs image
+# reference) per generation"; GitHub issue #10, milestone M1's "GRUB
+# generation machinery" line item).
+#
+# -- Why a script, not a Nix function ---------------------------------------
+#
+# nix/boot.nix could render grub.cfg with pure Nix string interpolation
+# (the way nix/compose.nix's `renderPreseed` renders debconf records) --
+# but this dev harness has no `nix` binary (see tests/unit/021-flake-
+# purity.sh's header for the standing caveat), so a Nix-only implementation
+# could only be checked by grepping nix/boot.nix's *source text* (the
+# 030/041/060/061-style "static wiring" tests), never by actually running
+# the logic against a fixture and diffing real output. The issue's own
+# guidance explicitly allows "a script or nix function" for exactly this
+# reason. This script is invoked two ways:
+#   - directly, by tests/unit/070-boot-grub-cfg-gen.sh, against fixture
+#     generation lists, with real output compared byte-for-byte;
+#   - from inside nix/boot.nix's `grubCfg` derivation (via
+#     runInUbuntuBase -- bash is always present in the unpacked
+#     ubuntu-base tree, so no extra archive package is needed to run this).
+#
+# -- The generation-list input format ---------------------------------------
+#
+# Deliberately mirrors nix/compose.nix's own `renderPreseed` convention
+# (tab-separated records, one per line, blank lines skipped) rather than
+# JSON: no jq/python3 dependency inside the ubuntu-native sandbox this also
+# runs in, and a trivial `read` loop is all real parsing needs. See `usage`
+# below for the exact field list.
+#
+# -- Generation-list-shaped, not generation-COUNT-shaped ---------------------
+#
+# M1 boots exactly one generation (SPEC.md §11's M1 exit criterion), but
+# this script accepts and renders an arbitrary-length ordered list of
+# generations on purpose: the interface a future M2 (`ubx rebuild`,
+# GitHub issue #25's generation model) needs to slot new generations into
+# is "call this again with a longer list", not "rewrite this script". This
+# script itself has and needs no opinion on generation ORDERING policy
+# (newest-first, oldest-first, retention pruning, ...) -- it renders
+# whatever order its caller hands it, in that exact order.
+set -euo pipefail
+
+prog_name="ubx-gen-grub-cfg"
+
+usage() {
+  cat <<USAGE
+usage: ubx-gen-grub-cfg --generations FILE [options]
+
+Renders a GRUB grub.cfg with one menuentry per generation, from a plain
+tab-separated generation-list file (SPEC.md §4.2: "a GRUB menu entry --
+kernel + initrd + rootfs image reference -- per generation"). Pure
+text-in/text-out logic: no network, no privileges, no nix -- directly
+unit-testable (tests/unit/070-boot-grub-cfg-gen.sh).
+
+FILE format: one generation per line, six TAB-separated fields (blank or
+whitespace-only lines are skipped, and so is anything after a '#' at the
+start of a line):
+
+  <index><TAB><title><TAB><kernelPath><TAB><initrdPath><TAB><rootDevice><TAB><kernelParams>
+
+  index         non-negative integer, unique across the file
+  title         free-text menuentry label (no literal tab/newline)
+  kernelPath    absolute path to the kernel image on the GRUB-visible boot
+                filesystem, e.g. /vmlinuz-6.8.0-31-generic
+  initrdPath    absolute path to the initrd image, same filesystem
+  rootDevice    the kernel root= value, e.g. /dev/vda2 or LABEL=UBXROOT
+  kernelParams  space-separated extra kernel command-line tokens (may be
+                empty); this is the LAST field, so it may itself contain
+                further whitespace (including stray tabs) -- everything
+                after the 5th tab is taken verbatim
+
+Menu entries are emitted in the file's own line order (this script never
+reorders generations -- ordering/retention policy belongs to the caller
+assembling the generation list, not to rendering).
+
+options:
+  --generations FILE   the generation-list file described above (required)
+  --default INDEX       which generation's index GRUB defaults to
+                         (default: the first generation in the file)
+  --timeout SECONDS      GRUB menu timeout in seconds (default: 5)
+  --out FILE             file to write (default: stdout)
+  -h, --help             show this message
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+# grub.cfg menu entry titles/paths are rendered as GRUB shell single-quoted
+# string literals. Inside a single-quoted GRUB string the only character
+# needing escaping is a literal single quote itself, escaped by closing the
+# quote, emitting an escaped quote, and reopening -- '\'' -- exactly the
+# same idiom POSIX shell uses for the identical reason, and for the same
+# reason (GRUB's own config-file parser is a small POSIX-shell-alike).
+grub_quote() {
+  local s="$1"
+  s="${s//\'/\'\\\'\'}"
+  printf "'%s'" "$s"
+}
+
+# render GENERATIONS_FILE DEFAULT_INDEX TIMEOUT — the pure logic. Prints the
+# full grub.cfg to stdout, or exits nonzero with a clear message identifying
+# the offending line on any malformed record.
+render() {
+  local generations_file="$1" default_index="$2" timeout="$3"
+
+  local -a idx_seen=()
+  local -a out_lines=()
+  local first_index="" line_no=0 count=0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+
+    # Skip blank/whitespace-only lines and '#'-prefixed comments, mirroring
+    # nix/compose.nix's renderPreseed/the in-chroot preseed awk's own
+    # blank-line tolerance (CI run 29785981711 is why that convention
+    # exists in the first place: a trailing-newline-only "record" must not
+    # be treated as data).
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    case "$line" in '#'*) continue ;; esac
+
+    # Split on TAB into exactly 6 fields; bash `read` folds any FIELD COUNT
+    # beyond the number of variables given into the LAST variable verbatim
+    # (separators included), which is exactly the "kernelParams is the
+    # last field and may itself contain further whitespace" contract
+    # `usage` documents above.
+    local idx title kpath ipath rdev params
+    IFS=$'\t' read -r idx title kpath ipath rdev params <<<"$line"
+
+    [[ "$idx" =~ ^[0-9]+$ ]] ||
+      die "$generations_file:$line_no: field 1 (index) must be a non-negative integer, got: '$idx'"
+    [ -n "$title" ] || die "$generations_file:$line_no: field 2 (title) must not be empty"
+    case "$kpath" in
+      /*) ;;
+      *) die "$generations_file:$line_no: field 3 (kernelPath) must be an absolute path, got: '$kpath'" ;;
+    esac
+    case "$ipath" in
+      /*) ;;
+      *) die "$generations_file:$line_no: field 4 (initrdPath) must be an absolute path, got: '$ipath'" ;;
+    esac
+    [ -n "$rdev" ] || die "$generations_file:$line_no: field 5 (rootDevice) must not be empty"
+    # field 6 (kernelParams) is deliberately allowed to be empty.
+
+    for seen in ${idx_seen[@]+"${idx_seen[@]}"}; do
+      [ "$seen" = "$idx" ] &&
+        die "$generations_file:$line_no: duplicate generation index '$idx' (first seen earlier in the same file)"
+    done
+    idx_seen+=("$idx")
+    [ -n "$first_index" ] || first_index="$idx"
+
+    local linux_line="    linux ${kpath} root=${rdev} ro"
+    [ -n "$params" ] && linux_line="${linux_line} ${params}"
+
+    out_lines+=("menuentry $(grub_quote "$title") --id $(grub_quote "ubuntnix-generation-${idx}") {")
+    out_lines+=("    insmod part_msdos")
+    out_lines+=("    insmod fat")
+    out_lines+=("$linux_line")
+    out_lines+=("    initrd ${ipath}")
+    out_lines+=("}")
+    count=$((count + 1))
+  done < "$generations_file"
+
+  [ "$count" -gt 0 ] || die "$generations_file: no generations found (every line was blank/comment, or the file is empty)"
+
+  if [ -z "$default_index" ]; then
+    default_index="$first_index"
+  else
+    local found=0
+    for seen in ${idx_seen[@]+"${idx_seen[@]}"}; do
+      [ "$seen" = "$default_index" ] && { found=1; break; }
+    done
+    [ "$found" = 1 ] ||
+      die "--default $default_index does not match any generation index in $generations_file"
+  fi
+
+  echo "# Generated by bin/ubx-gen-grub-cfg -- DO NOT EDIT BY HAND."
+  echo "# SPEC.md §4.2/§4.3: one menuentry per generation. Regenerate via"
+  echo "# nix/boot.nix's grubCfg (or this script directly) instead."
+  echo
+  echo "set default=\"${default_index}\""
+  echo "set timeout=\"${timeout}\""
+  echo
+  local out_line
+  for out_line in "${out_lines[@]}"; do
+    echo "$out_line"
+  done
+}
+
+main() {
+  local generations_file="" default_index="" timeout="5" out_file=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --generations)
+        [ $# -ge 2 ] || die "--generations requires an argument"
+        generations_file="$2"
+        shift 2
+        ;;
+      --default)
+        [ $# -ge 2 ] || die "--default requires an argument"
+        default_index="$2"
+        shift 2
+        ;;
+      --timeout)
+        [ $# -ge 2 ] || die "--timeout requires an argument"
+        timeout="$2"
+        shift 2
+        ;;
+      --out)
+        [ $# -ge 2 ] || die "--out requires an argument"
+        out_file="$2"
+        shift 2
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "$prog_name: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  [ -n "$generations_file" ] || { usage >&2; die "--generations is required"; }
+  [ -f "$generations_file" ] || die "generations file does not exist: $generations_file"
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer, got: $timeout"
+
+  local body
+  body="$(render "$generations_file" "$default_index" "$timeout")"
+
+  if [ -n "$out_file" ]; then
+    printf '%s\n' "$body" > "$out_file"
+  else
+    printf '%s\n' "$body"
+  fi
+}
+
+main "$@"

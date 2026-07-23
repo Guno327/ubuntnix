@@ -680,7 +680,6 @@ let
 
         for bin in \
           "$tools/usr/bin/grub-mkimage" \
-          "$tools/usr/lib/grub/i386-pc/grub-bios-setup" \
           "$tools/usr/sbin/mkfs.vfat" \
           "$tools/usr/bin/mmd" \
           "$tools/usr/bin/mcopy" \
@@ -789,21 +788,103 @@ let
         ubxrun "$UBX_BASE/bin/dd" if=fatpart.img of=disk.img bs=1M seek="$boot_start_mib" conv=notrunc status=none
         ubxrun "$UBX_BASE/bin/dd" if="$squashfs/rootfs.squashfs" of=disk.img bs=1M seek="$boot_end_mib" conv=notrunc status=none
 
-        # -- 6. embed GRUB's boot code (see this function's own header:
-        #       the single riskiest step here). boot.img (grub-pc-bin's
-        #       own 512-byte MBR template) goes into sector 0; core.img
-        #       (built above) into the embedding area between the MBR and
-        #       partition 1. -------------------------------------------
-        toolrun "$UBX_BASE/bin/mkdir" -p grub-setup-dir
-        toolrun "$UBX_BASE/bin/cp" "$tools/usr/lib/grub/i386-pc/boot.img" grub-setup-dir/boot.img
-        toolrun "$UBX_BASE/bin/cp" core.img grub-setup-dir/core.img
-        printf '(hd0) %s\n' "$PWD/disk.img" > device.map
-        # noble ships grub-bios-setup as a grub-pc-bin arch tool under
-        # /usr/lib/grub/i386-pc/, NOT at /usr/sbin/ (grub-common's /usr/sbin
-        # carries grub-mkconfig/grub-probe/... but not the BIOS setup tool);
-        # confirmed against the noble grub-pc-bin/grub-common filelists.
-        toolrun "$tools/usr/lib/grub/i386-pc/grub-bios-setup" \
-          --directory=grub-setup-dir --device-map=device.map disk.img
+        # -- 6. embed GRUB's boot code MANUALLY, by dd/patching disk.img
+        #       directly, instead of shelling out to grub-bios-setup.
+        #
+        #       grub-bios-setup insists on resolving its --directory (and
+        #       the disk named in --device-map) back to a real backing
+        #       block device via udev/sysfs, to decide where the
+        #       "embedding area" (the gap between the MBR and partition 1)
+        #       starts and how large it is. That resolution is impossible
+        #       in the Nix build sandbox -- there is no /dev, no udevd,
+        #       and grub-setup-dir/disk.img are plain files on an
+        #       overlay/tmpfs, not device nodes -- so grub-bios-setup
+        #       fails outright ("sh: line 1: udevadm: command not found";
+        #       "cannot find a device for grub-setup-dir (is /dev
+        #       mounted?)"). Adding udevadm to $tools does not help: even
+        #       a working udevadm has nothing to report against, since
+        #       these files were never attached as devices in the first
+        #       place.
+        #
+        #       What follows is exactly what grub-bios-setup itself does
+        #       for a post-MBR-gap BIOS install, done by hand so it needs
+        #       no device resolution at all -- this layout is GRUB's own
+        #       documented i386-pc embedding format, not something
+        #       reverse-engineered here:
+        #
+        #         sector 0        : boot.img  (grub-pc-bin's 512-byte MBR
+        #                           template: [0,440) boot code, [440,446)
+        #                           disk signature, [446,510) partition
+        #                           table, [510,512) 0x55AA)
+        #         sector 1..      : core.img  (built in step 3 above),
+        #                           placed CONTIGUOUSLY starting at LBA 1,
+        #                           entirely inside the gap before
+        #                           partition 1 (which starts at
+        #                           boot_start_mib = 1MiB = LBA 2048;
+        #                           core.img is ~30KiB, i.e. tens of
+        #                           sectors, so it fits with room to
+        #                           spare)
+        #
+        #       Only [0,440) of boot.img is written to sector 0: step 4's
+        #       parted call already wrote a valid partition table and the
+        #       0x55AA signature into disk.img's [440,512), and those must
+        #       not be clobbered by boot.img's own (empty/template)
+        #       versions of those same bytes. boot.img's compiled-in
+        #       "first sector of core.img" pointer (offset 0x5c) already
+        #       defaults to LBA 1, which is exactly where core.img is
+        #       placed below, so it needs no patching.
+        #
+        #       core.img's own first sector (diskboot.img) ends in a
+        #       12-byte blocklist record at sector-relative offset 500:
+        #       an 8-byte start LBA (offset 500, already defaults to 2 --
+        #       correct, since core.img's OWN sector 1 follows immediately
+        #       after its sector 0 once placed contiguously -- left
+        #       untouched), a 2-byte sector count (offset 508, defaults to
+        #       0 and MUST be patched to the real count or GRUB reads zero
+        #       sectors of itself and hangs), and a 2-byte segment (offset
+        #       510, left untouched). That length field is patched below.
+        core_bytes="$(ubxrun "$UBX_BASE/usr/bin/stat" -c%s core.img)"
+        core_sectors=$(( (core_bytes + 511) / 512 ))
+        blocklist_len=$(( core_sectors - 1 ))
+
+        # Sanity-guard the "core.img fits in the pre-partition-1 gap"
+        # invariant this whole scheme depends on: core.img occupies LBA
+        # 1..(1 + core_sectors - 1), and partition 1 starts at LBA
+        # boot_start_mib * 2048 (2048 512-byte sectors per MiB). If a
+        # future core.img (more modules, bigger grub.cfg parser, etc.)
+        # ever grows past that gap, fail loudly here instead of silently
+        # producing a disk image with a partition table clobbered by
+        # GRUB's own boot code.
+        gap_sectors=$((boot_start_mib * 2048))
+        if [ $((1 + core_sectors)) -ge "$gap_sectors" ]; then
+          echo "diskImage: core.img ($core_bytes bytes, $core_sectors sectors) no longer fits in the $gap_sectors-sector pre-partition-1 embedding gap -- it would overwrite partition 1's own data; shrink core.img's module list or raise boot_start_mib" >&2
+          exit 1
+        fi
+
+        # 6a. sector 0: boot.img's boot code only, preserving parted's
+        #     disk signature + partition table + 0x55AA already at
+        #     [440,512).
+        ubxrun "$UBX_BASE/bin/dd" \
+          if="$tools/usr/lib/grub/i386-pc/boot.img" of=disk.img \
+          bs=440 count=1 conv=notrunc status=none
+
+        # 6b. sectors 1..: core.img, placed contiguously right after the
+        #     MBR.
+        ubxrun "$UBX_BASE/bin/dd" \
+          if=core.img of=disk.img \
+          bs=512 seek=1 conv=notrunc status=none
+
+        # 6c. patch core.img's on-disk copy of the diskboot blocklist
+        #     length at (sector 1 start = byte 512) + (in-sector offset
+        #     508) = byte 1020, little-endian, 2 bytes. blocklist_len is
+        #     always < 256 here (core.img is tens of sectors, nowhere
+        #     near 65536), so the low byte alone varies and the high byte
+        #     is always 0 -- both are still computed explicitly so this
+        #     keeps working if core.img ever grows past 255 sectors.
+        len_lo=$((blocklist_len & 255))
+        len_hi=$(((blocklist_len >> 8) & 255))
+        printf "$(printf '\\%03o\\%03o' "$len_lo" "$len_hi")" |
+          ubxrun "$UBX_BASE/bin/dd" of=disk.img bs=1 seek=1020 count=2 conv=notrunc status=none
 
         ubxrun "$UBX_BASE/bin/cp" disk.img "$out/disk.img"
       '';

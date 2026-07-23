@@ -647,13 +647,22 @@ let
       tools = toolsFHS {
         inherit system;
         name = "diskimage-${name}";
-        # libdevmapper1.02.1 is grub-common's own runtime dep: grub-mkimage
-        # and grub-bios-setup both link libdevmapper.so.1.02.1 (device-mapper
-        # disk probing). toolsFHS unpacks each named deb flat with NO
-        # dependency resolution, so the lib has to be named explicitly or
-        # grub-mkimage dies with "libdevmapper.so.1.02.1: cannot open shared
-        # object file" (CI run 29996514090). Already in archive.lock.json.
-        packages = [ "grub-pc-bin" "grub-common" "grub2-common" "libdevmapper1.02.1" "dosfstools" "mtools" "parted" ];
+        # toolsFHS unpacks each named deb flat with NO dependency
+        # resolution, so every shared library the tools load at runtime has
+        # to be named explicitly (each is already in archive.lock.json):
+        #   - libdevmapper1.02.1  grub-mkimage / grub-bios-setup link
+        #                         libdevmapper.so.1.02.1 for device-mapper
+        #                         disk probing (CI run 29996514090).
+        #   - libparted2t64       parted links libparted.so.2 (CI run
+        #                         29996904485); its frontend is built with
+        #                         readline, hence:
+        #   - libreadline8t64 +   libreadline.so.8 (and its own libtinfo.so.6
+        #     libtinfo6           dependency) that the parted binary NEEDs.
+        packages = [
+          "grub-pc-bin" "grub-common" "grub2-common"
+          "dosfstools" "mtools" "parted"
+          "libdevmapper1.02.1" "libparted2t64" "libreadline8t64" "libtinfo6"
+        ];
       };
     in
     runInUbuntuBase {

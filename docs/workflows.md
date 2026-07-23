@@ -1,13 +1,15 @@
 # Operational workflows
 
-```{admonition} Planned (M1..M4)
+```{admonition} Partially real as of M2 — see {doc}`ubx` for the details
 :class: warning
 
-There is no `ubx` binary in this repository yet. This page describes the
-day-to-day operational workflows as designed in `SPEC.md` §4.3, §4.4, §4.5,
-and §8.1, so that the shape of the tool is documented before it exists. It
-will be rewritten to describe the real, working `ubx` as `switch`/`boot`/
-`test` (M2), updates (M1/M3), and secrets (M4) land.
+`ubx rebuild switch|boot|test`, `rollback`, `list-generations`, and `diff`
+are real and unit-tested (issue #29) — see {doc}`ubx` for exactly what
+each does today, the GRUB-default matrix, and what's still deferred
+(on-device Nix evaluation, soft-reboot into a changed image, snaps, home).
+This page still describes the FULL day-to-day picture as designed in
+`SPEC.md` §4.3, §4.4, §4.5, and §8.1, including pieces (snaps, home,
+secrets, `ubx update`) that remain planned rather than implemented.
 ```
 
 ## `ubx` verbs

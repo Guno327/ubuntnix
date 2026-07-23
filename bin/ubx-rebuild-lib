@@ -1,0 +1,290 @@
+# bin/ubx-rebuild-lib — shared low-level helpers for `ubx rebuild
+# switch|boot|test`, `ubx rollback`, `ubx list-generations`, and `ubx diff`
+# (SPEC.md §4.3, §4.5, §7; GitHub issue #29, milestone M2).
+#
+# NOT executable, and never run directly: this is `source`d by bin/ubx only
+# (mirrors bin/ubx-guard-lib's own "shared core, not a standalone tool"
+# posture). It factors exactly the parts that are genuinely mechanical and
+# identical across every `ubx` verb that touches a generations root or a
+# domain manifest; the actual per-verb orchestration (which domains run in
+# which order, what the touched-domains report looks like, the GRUB-default
+# matrix) stays in bin/ubx itself, where the decisions are easiest to read
+# in one place.
+#
+# -- Why this exists, and what it deliberately does NOT do ------------------
+#
+# bin/ubx-generations (issue #25) is explicit that real activation is "`ubx`
+# verb work for a later issue (#29), which is expected to shell out to this
+# script the same way `ubx update`'s archive-pins portion shells out to
+# bin/ubx-resolve" — this file is that shelling-out layer, plus the small
+# amount of bookkeeping bin/ubx-generations' own on-disk schema has no field
+# for yet (see "The systemd-manifest sidecar" below). It never itself calls
+# ubx-generations/ubx-etc/ubx-systemd/ubx-users' mutating subcommands with
+# hidden side effects the caller didn't ask for — every function here is a
+# pure read, a pure compute, or an explicit, named write (grub marker,
+# sidecar file) that bin/ubx's own header/usage documents.
+#
+# -- Reading a generation's domain manifests ---------------------------------
+#
+# bin/ubx-generations' manifest already carries two of the three domain
+# references this orchestrator needs: GEN_ETC_REF (the generated /etc tree)
+# and GEN_USERS_MANIFEST (the users/passwd manifest) -- see that script's
+# header, "Manifest format". There is, as of issue #25, no GEN_SYSTEMD_REF
+# field: nix/systemd.nix's render (issue #27) was never wired into
+# nix/compose.nix or bin/ubx-generations' own create flags, and extending
+# ubx-generations' committed, already-tested manifest schema is out of this
+# issue's scope (that tool belongs to issue #25; this orchestrator consumes
+# its contract, it does not extend it).
+#
+# -- The systemd-manifest sidecar --------------------------------------------
+#
+# Instead, bin/ubx owns a SEPARATE, sibling file per generation directory,
+# `$ROOT/<N>/ubx-extra` (flat KEY=value, exactly bin/ubx-generations' own
+# manifest format, for the same reasons: no jq/python3 dependency for what
+# is, today, a single field) -- written by `ubx_rebuild_write_sidecar` right
+# after a `ubx-generations create` call this orchestrator itself made, never
+# touched by bin/ubx-generations. This is a deliberately narrow, additive
+# seam: if bin/ubx-generations ever grows a real GEN_SYSTEMD_REF field (the
+# natural home for this once issue #25's owner decides to add it), this
+# sidecar file simply stops being read/written and nothing else in this
+# orchestrator's logic needs to change (both are consulted through the same
+# `ubx_rebuild_domain_refs` accessor below).
+#
+# -- Manifest-ref resolution: store path, file, or empty ---------------------
+#
+# `GEN_ETC_REF`/the systemd sidecar value are documented (nix/etc.nix,
+# nix/systemd.nix) as the STORE PATH of a derivation whose $out contains
+# `manifest.json` -- but nix evaluation/composition for these two domains is
+# not wired into this project yet (nix/compose.nix has no etc/systemd
+# integration -- see this file's header above), so this orchestrator also
+# accepts a ref that already names a manifest.json file directly (what
+# every fixture in tests/unit/13x-*.sh passes). `ubx_rebuild_resolve_ref`
+# handles both shapes uniformly: a directory ref is joined with
+# `manifest.json`; a file ref is used as-is; an empty ref falls back to a
+# caller-supplied "nothing declared" fixture. Real nix-composed store paths
+# will satisfy the "directory containing manifest.json" branch unchanged
+# once that wiring lands -- this is the "clear seam" the issue's own task
+# description asks on-device nix evaluation to be kept behind.
+set -u
+
+UBX_REBUILD_LIB_PROG="${UBX_REBUILD_LIB_PROG:-ubx}"
+
+_ubx_rebuild_warn() {
+  echo "$UBX_REBUILD_LIB_PROG: $*" >&2
+}
+
+# ubx_rebuild_default_root — echoes the generations root default, mirroring
+# bin/ubx-generations' own default_root (UBX_GEN_ROOT, else
+# /ubx/var/generations). Callers still let --root win over this.
+ubx_rebuild_default_root() {
+  echo "${UBX_GEN_ROOT:-/ubx/var/generations}"
+}
+
+# ubx_rebuild_read_pointer ROOT NAME — prints the numeric target of a
+# current/previous symlink under ROOT, or "" if it doesn't exist or isn't a
+# plain non-negative integer. A read-only reimplementation of
+# bin/ubx-generations' own read_link_target: that function is internal
+# (not exported), so this orchestrator needs its own copy to peek at
+# current/previous without mutating anything.
+ubx_rebuild_read_pointer() {
+  local root="$1" name="$2" link target
+  link="$root/$name"
+  [ -L "$link" ] || { echo ""; return 0; }
+  target="$(basename "$(readlink "$link")")"
+  case "$target" in
+    '' | *[!0-9]*) echo "" ;;
+    *) echo "$target" ;;
+  esac
+}
+
+# ubx_rebuild_manifest_get FILE KEY — prints the single-line value for KEY
+# in a flat KEY=value manifest file, or "" if absent/the file doesn't
+# exist. Mirrors bin/ubx-generations' own manifest_get exactly (see that
+# script's header for why manifests are never `source`d).
+ubx_rebuild_manifest_get() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || { echo ""; return 0; }
+  awk -v key="$key" '
+    BEGIN { prefix = key "=" ; found = 0 }
+    index($0, prefix) == 1 { print substr($0, length(prefix) + 1); found = 1; exit }
+    END { if (!found) print "" }
+  ' "$file"
+}
+
+# ubx_rebuild_sidecar_path ROOT GEN — echoes the path of GEN's
+# bin/ubx-owned systemd-manifest sidecar (see this file's header, "The
+# systemd-manifest sidecar").
+ubx_rebuild_sidecar_path() {
+  echo "$1/$2/ubx-extra"
+}
+
+# ubx_rebuild_write_sidecar ROOT GEN SYSTEMD_REF — atomically records
+# SYSTEMD_REF (may be empty) as GEN's systemd-manifest reference. A no-op
+# write (empty value) still creates the file, so a generation created
+# without --systemd-ref is unambiguously "sidecar says: nothing declared"
+# rather than "sidecar never written" — both read back as "" either way,
+# but writing it always keeps the on-disk contract uniform.
+ubx_rebuild_write_sidecar() {
+  local root="$1" gen="$2" systemd_ref="$3" dir tmp
+  dir="$root/$gen"
+  [ -d "$dir" ] || { _ubx_rebuild_warn "cannot write sidecar: no such generation directory: $dir"; return 1; }
+  case "$systemd_ref" in
+    *$'\t'* | *$'\n'*)
+      _ubx_rebuild_warn "systemd manifest ref must not contain a TAB or newline: $systemd_ref"
+      return 1
+      ;;
+  esac
+  tmp="$(mktemp "$dir/.ubx-extra.XXXXXX")"
+  printf 'SYSTEMD_MANIFEST=%s\n' "$systemd_ref" > "$tmp"
+  mv -f "$tmp" "$dir/ubx-extra"
+}
+
+# ubx_rebuild_domain_refs ROOT GEN — prints three TAB-separated fields:
+# ETC_REF<TAB>SYSTEMD_REF<TAB>USERS_REF for generation GEN under ROOT. GEN
+# may be "" (no generation, e.g. the very first switch ever) — in that case
+# every field is "" ("nothing declared"), which is exactly how an existing
+# generation with legally-empty fields reads too (bin/ubx-generations'
+# header: "present as fields, legally empty today").
+ubx_rebuild_domain_refs() {
+  local root="$1" gen="$2" mf sidecar
+  if [ -z "$gen" ]; then
+    printf '\t\t\n'
+    return 0
+  fi
+  mf="$root/$gen/manifest"
+  sidecar="$(ubx_rebuild_sidecar_path "$root" "$gen")"
+  local etc_ref users_ref systemd_ref
+  etc_ref="$(ubx_rebuild_manifest_get "$mf" GEN_ETC_REF)"
+  users_ref="$(ubx_rebuild_manifest_get "$mf" GEN_USERS_MANIFEST)"
+  systemd_ref="$(ubx_rebuild_manifest_get "$sidecar" SYSTEMD_MANIFEST)"
+  printf '%s\t%s\t%s\n' "$etc_ref" "$systemd_ref" "$users_ref"
+}
+
+# ubx_rebuild_resolve_ref REF DEFAULT_CONTENT WORKDIR NAME — resolves a
+# domain manifest reference to a real, readable manifest.json file path,
+# per this file's header ("Manifest-ref resolution"):
+#   - REF empty        -> write DEFAULT_CONTENT to WORKDIR/NAME.json, echo it
+#   - REF a directory  -> echo REF/manifest.json (must exist)
+#   - REF a plain file -> echo REF as-is (must exist)
+# Dies (via a printed error + nonzero return) on a nonexistent explicit
+# ref -- an empty ref is the only case treated as "nothing declared"; a
+# ref that names a real-but-missing path is a caller mistake, not a
+# legitimate empty-domain generation.
+ubx_rebuild_resolve_ref() {
+  local ref="$1" default_content="$2" workdir="$3" name="$4" out
+  if [ -z "$ref" ]; then
+    out="$workdir/$name.json"
+    printf '%s\n' "$default_content" > "$out"
+    echo "$out"
+    return 0
+  fi
+  if [ -d "$ref" ]; then
+    out="$ref/manifest.json"
+  else
+    out="$ref"
+  fi
+  if [ ! -f "$out" ]; then
+    _ubx_rebuild_warn "$name manifest not found: $out (from ref: $ref)"
+    return 1
+  fi
+  echo "$out"
+}
+
+# The three domains' "nothing declared" fixtures — see
+# ubx_rebuild_resolve_ref above and each domain tool's own manifest schema
+# (bin/ubx-etc, bin/ubx-systemd, bin/ubx-users' headers).
+UBX_REBUILD_EMPTY_ETC_MANIFEST='{"version": 1, "entries": []}'
+UBX_REBUILD_EMPTY_SYSTEMD_MANIFEST='{"version": 1, "units": []}'
+UBX_REBUILD_EMPTY_USERS_MANIFEST='{"version": 1, "users": [], "groups": []}'
+
+# -- GRUB default marker ------------------------------------------------------
+#
+# Real bootloader integration (writing a GRUB environment block / calling
+# grub-editenv, grub-set-default, or equivalent) is soft-reboot/image-swap
+# adjacent activation work this issue explicitly defers (see bin/ubx's own
+# header, "Deferred to #30"). What IS this issue's job, and real today: the
+# durable on-disk RECORD of which generation is the GRUB default -- the
+# fact `switch`/`boot` set it and `test` never does is the behavior under
+# test, and it needs zero root/bootloader access to be correct. This marker
+# (`$ROOT/grub-default`, a bare generation number) is that record; a later
+# issue's real bootloader-install step is expected to read it the same way
+# bin/ubx-generations' own `current`/`previous` pointers are read today,
+# and to actually program the bootloader from it.
+ubx_rebuild_grub_default_path() {
+  echo "$1/grub-default"
+}
+
+# ubx_rebuild_read_grub_default ROOT — prints the recorded GRUB-default
+# generation number, or "" if none has ever been set.
+ubx_rebuild_read_grub_default() {
+  local f
+  f="$(ubx_rebuild_grub_default_path "$1")"
+  [ -f "$f" ] || { echo ""; return 0; }
+  cat "$f"
+}
+
+# ubx_rebuild_write_grub_default ROOT GEN — atomically records GEN as the
+# GRUB default (temp file + rename, same atomicity posture as every other
+# writer in this project -- bin/ubx-generations' atomic_symlink, bin/ubx-etc's
+# write_out).
+ubx_rebuild_write_grub_default() {
+  local root="$1" gen="$2" tmp
+  mkdir -p "$root"
+  tmp="$(mktemp "$root/.grub-default.XXXXXX")"
+  printf '%s\n' "$gen" > "$tmp"
+  mv -f "$tmp" "$root/grub-default"
+}
+
+# -- the "booted" marker ------------------------------------------------------
+#
+# bin/ubx-generations' own "current" pointer is NOT the same thing as "the
+# generation whose live domains are actually converged on this machine
+# right now" (see that script's header, "current vs. booted": `current` is
+# only ever updated by `create`, so it stays wherever the last REGISTERED
+# generation left it, even after a `boot` that never activated anything,
+# or a `rollback` that re-converges an OLDER one). This orchestrator keeps
+# its own marker, `$ROOT/booted`, updated exactly when it ACTUALLY runs
+# live activation: after `rebuild switch|test` and after `rollback`, never
+# after `rebuild boot`. This is what makes a second `rollback` (or a
+# `switch` after a `rollback`) diff against the generation truly running
+# live, instead of silently re-diffing against a stale `current` pointer —
+# precisely the gap bin/ubx-generations' own header calls out ("a real
+# `ubx rollback` (#29) is expected to pass its own observed booted
+# generation explicitly").
+ubx_rebuild_booted_path() {
+  echo "$1/booted"
+}
+
+# ubx_rebuild_read_booted ROOT — prints the recorded booted generation, or
+# "" if this orchestrator has never (yet) actually converged anything live
+# against ROOT.
+ubx_rebuild_read_booted() {
+  local f
+  f="$(ubx_rebuild_booted_path "$1")"
+  [ -f "$f" ] || { echo ""; return 0; }
+  cat "$f"
+}
+
+# ubx_rebuild_write_booted ROOT GEN — atomically records GEN as booted.
+ubx_rebuild_write_booted() {
+  local root="$1" gen="$2" tmp
+  mkdir -p "$root"
+  tmp="$(mktemp "$root/.booted.XXXXXX")"
+  printf '%s\n' "$gen" > "$tmp"
+  mv -f "$tmp" "$root/booted"
+}
+
+# ubx_rebuild_effective_booted ROOT — the booted marker if this
+# orchestrator has ever set one, else bin/ubx-generations' own "current"
+# pointer as a best-effort fallback (the state before this tool ever ran
+# any live activation against ROOT — e.g. a freshly-registered first
+# generation nothing has rolled back from yet).
+ubx_rebuild_effective_booted() {
+  local root="$1" b
+  b="$(ubx_rebuild_read_booted "$root")"
+  if [ -n "$b" ]; then
+    echo "$b"
+  else
+    ubx_rebuild_read_pointer "$root" current
+  fi
+}

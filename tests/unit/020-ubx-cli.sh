@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# tests/unit/020-ubx-cli.sh — ubx CLI skeleton (issue #5).
+# tests/unit/020-ubx-cli.sh — ubx CLI skeleton (issue #5), updated for
+# issue #29's real rebuild/rollback/list-generations/diff orchestrator.
 #
 # Contract under test (SPEC.md §4.5):
 #   - `ubx --help` / `ubx help`: usage to stdout, exit 0, mentions every
 #     subcommand.
-#   - Every real subcommand (rebuild switch|boot|test, rollback,
-#     list-generations, diff, update) is a pre-M1 stub: nonzero exit,
-#     "not implemented" on stderr.
+#   - `ubx update` is STILL a pre-M1 stub: nonzero exit, "not implemented"
+#     on stderr (issue #29 does not touch it).
 #   - Unknown subcommand, or `rebuild` with a missing/unknown verb: usage
 #     to stderr, exit 2.
+#
+# The real behavior of rebuild/rollback/list-generations/diff is covered
+# by tests/unit/130-*.sh onward, not here.
 set -u
 
 ubx="$UBX_REPO_ROOT/bin/ubx"
@@ -45,14 +48,10 @@ run help
 [ "$rc" -eq 0 ] || fail "'help' should exit 0, got $rc"
 contains "$out" "rebuild" || fail "'help' output missing 'rebuild'"
 
-for args in rollback list-generations diff update "rebuild switch" "rebuild boot" "rebuild test"; do
-  # Intentional word-splitting: "rebuild switch" etc. must become two argv
-  # entries.
-  # shellcheck disable=SC2086
-  run $args
-  [ "$rc" -ne 0 ] || fail "'ubx $args' should exit nonzero"
-  contains "$err" "not implemented" || fail "'ubx $args' stderr missing 'not implemented' (got: $err)"
-done
+# `update` remains a pre-M1 stub -- not in this issue's scope.
+run update
+[ "$rc" -ne 0 ] || fail "'ubx update' should exit nonzero (still a stub)"
+contains "$err" "not implemented" || fail "'ubx update' stderr missing 'not implemented' (got: $err)"
 
 run bogus
 [ "$rc" -eq 2 ] || fail "unknown subcommand should exit 2, got $rc"

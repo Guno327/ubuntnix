@@ -23,13 +23,16 @@ repository root for the full specification):
 ```{admonition} Project status
 :class: important
 
-This repository is **early in milestone M1**. The flake skeleton, the
-Ubuntu-native stdenv bootstrap, and the archive lockfile with
-snapshot-pinned deb fetching exist; there are no modules and no working
-`ubx` tool yet. The guides below describe the *design* laid out in
-`SPEC.md` and are explicit about what is implemented today versus what is
-planned for a future milestone (M1 through M7). See `SPEC.md` §11 for the
-milestone plan.
+This repository is **partway through milestone M2**. The flake skeleton,
+the Ubuntu-native stdenv bootstrap, and the archive lockfile with
+snapshot-pinned deb fetching exist; there are no modules and no real Nix
+evaluation/composition for `/etc`, systemd units, or a rootfs image yet.
+`ubx rebuild switch|boot|test`, `rollback`, `list-generations`, and `diff`
+ARE real, orchestrating already-implemented domain planners against
+caller-supplied manifests (see {doc}`ubx`). The guides below are explicit,
+page by page, about what is implemented today versus what is planned for a
+future milestone (M1 through M7). See `SPEC.md` §11 for the milestone
+plan.
 ```
 
 ## Guides
@@ -55,6 +58,11 @@ milestone plan.
   class rules, and the ordered unit-activation planner (declaration + plan
   + a thin executor implemented in M2; wiring into a real running system's
   `ubx rebuild switch` lands later).
+- {doc}`ubx` — the `rebuild switch|boot|test`/`rollback`/`list-generations`/
+  `diff` orchestrator: the GRUB-default matrix, the touched-domains report,
+  and exactly how far each domain's live activation goes today
+  (implemented and unit-tested in M2; on-device Nix evaluation and
+  soft-reboot into a changed image are separate, deferred work).
 - {doc}`reference/index` — the auto-generated options and modules reference,
   regenerated in CI from the current state of the tree.
 
@@ -72,5 +80,6 @@ generations
 users
 etc
 systemd
+ubx
 reference/index
 ```

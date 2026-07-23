@@ -1,27 +1,84 @@
 #!/usr/bin/env bash
 # ubx — the ubuntnix CLI (full name: ubuntnix; alias: ubx). See SPEC.md
-# §4.5 for the on-device tooling contract this stubs out.
+# §4.5 for the on-device tooling contract, §4.3 for the switch/boot/test
+# verb semantics, and §7 for the converge-report posture this orchestrator
+# feeds. GitHub issue #29, milestone M2.
 #
-# Pre-M1: every real subcommand below is a stub. Implementations land with
-# the milestones that give them something to act on (M2: switch/rollback/
-# diff; M3: snaps feed `update`; etc).
-set -u
+# -- What this file orchestrates, and what it deliberately does NOT --------
+#
+# `rebuild switch|boot|test`, `rollback`, `list-generations`, and `diff`
+# are REAL here: they shell out to the already-implemented, independently
+# unit-tested primitives this repo built for exactly this purpose —
+# bin/ubx-generations (the generation model), bin/ubx-etc / bin/ubx-systemd
+# / bin/ubx-users (each domain's plan/observe/execute split) — in a fixed,
+# deterministic order, and add the two things none of those tools owns:
+# the GRUB-default matrix (switch/boot set it, test never does — the most
+# important behavior this issue adds) and a combined, deterministic
+# touched-domains report.
+#
+# This is NOT a real activation engine end to end. Two things are
+# explicitly stubbed/deferred, called out loudly rather than silently
+# half-implemented:
+#   - On-device Nix evaluation/composition (building a rootfs image, an
+#     `/etc` tree, a systemd unit tree from the flake) does not exist yet
+#     (nix/compose.nix has no etc/systemd wiring). `rebuild`'s generation-
+#     creation flags (--rootfs-image, --etc-ref, --systemd-ref, ...) are
+#     the seam: today a caller (a human, or later, real build machinery)
+#     supplies already-built store paths/manifest files directly; nothing
+#     here invokes `nix` itself. See bin/ubx-rebuild-lib's header for how
+#     a domain ref is resolved once supplied.
+#   - Soft-reboot into a changed rootfs image (SPEC.md §4.3's "Deb set...
+#     build new image -> systemctl soft-reboot into it") is explicitly OUT
+#     OF SCOPE for this issue (deferred to issue #30) — `switch`/`test`
+#     print a clear "pending #30" notice for the image-swap step and never
+#     attempt it.
+# Live activation of the three domains this orchestrator DOES run
+# end-to-end is itself gated by how far each domain's own executor got in
+# its own issue: bin/ubx-systemd-apply is a real (dry-run-by-default,
+# `--apply`-gated) executor; bin/ubx-users' `execute` only ever EMITS a
+# shell script (per that script's own header, never runs it); bin/ubx-etc
+# has no executor script at all yet (`bin/ubx-etc-apply` is referenced in
+# bin/ubx-etc's own header as future work and does not exist in this repo).
+# This orchestrator calls exactly as much of each as exists today and
+# prints a clear notice for the rest — it never invents execution
+# machinery that belongs to those other issues.
+set -euo pipefail
 
 prog_name="ubuntnix (ubx)"
+bindir="$(cd "$(dirname "$0")" && pwd)"
+UBX_REBUILD_LIB_PROG="$prog_name"
+export UBX_REBUILD_LIB_PROG
+# shellcheck source=bin/ubx-rebuild-lib
+. "$bindir/ubx-rebuild-lib"
+
+die() {
+  echo "ubx: $*" >&2
+  exit 1
+}
 
 usage() {
   cat <<USAGE
 usage: ubx <command> [args]
 
 commands:
-  rebuild <switch|boot|test>  build and activate a new generation
-  rollback                    revert to the previous generation
-  list-generations            list available generations
-  diff                        show pending changes vs. the running system
-  update                      refresh lockfiles (flake/archive/snap pins)
-  help, --help                show this message
+  rebuild <switch|boot|test> [options]  build/register a generation and
+                                         (per verb) activate it live and/or
+                                         set the GRUB default
+  rollback [N] [options]                 re-converge live domains to
+                                          "previous" (default) or generation
+                                          N, and move the GRUB default back
+  list-generations [options]             list available generations
+  diff [A] [B] [options]                 show the domain-level delta
+                                          between two generations (default:
+                                          previous vs. current)
+  update                                  refresh lockfiles (flake/archive/
+                                          snap pins)
+  help, --help                           show this message
 
-$prog_name is pre-M1: every command above is a stub (SPEC.md §11).
+Run 'ubx <command> --help' for a command's own options. See SPEC.md §4.3,
+§4.5 for the verb semantics this implements.
+
+$prog_name: 'update' is still a pre-M1 stub (SPEC.md §11).
 USAGE
 }
 
@@ -29,6 +86,770 @@ not_implemented() {
   echo "ubx: $1: not implemented (pre-M1)" >&2
   exit 1
 }
+
+# =====================================================================
+# shared plan/report/execute helpers
+#
+# Domain order is FIXED throughout this file: etc, systemd, users —
+# mirrors SPEC.md §4.3's switching table (row 1 combines /etc + systemd
+# units, row 2 is users). Every report this script prints lists domains in
+# exactly this order, regardless of which verb produced it.
+# =====================================================================
+
+peek_next_index() { # ROOT
+  local root="$1"
+  if [ -f "$root/.next-index" ]; then
+    cat "$root/.next-index"
+  else
+    echo 1
+  fi
+}
+
+# summarize_etc_plan PLAN_TSV — prints "ACTIONABLE<TAB>DRIFT" counts.
+summarize_etc_plan() {
+  awk -F'\t' '
+    $1 == "drift" { d++; next }
+    NF > 0 { a++ }
+    END { printf "%d\t%d\n", a + 0, d + 0 }
+  ' "$1"
+}
+
+# summarize_systemd_plan PLAN_JSON — prints the action count. Each action
+# object in the plan's pretty-printed JSON contributes exactly one `"op":`
+# line (the top-level object has no such key of its own), so a plain grep
+# count needs no python3 invocation just to count.
+summarize_systemd_plan() {
+  grep -c '"op":' "$1" || true
+}
+
+# systemd_synthesize_observed OLD_DECLARED_JSON OUT_JSON — the systemd
+# domain's "assume no drift" default observed-state manifest, derived FROM
+# the old generation's own DECLARED manifest (bin/ubx-systemd's declared
+# and observed schemas are NOT the same shape — unlike bin/ubx-etc's,
+# where both sides share one "entries" schema and the old manifest can be
+# reused as-is; see bin/ubx-systemd's header for the two distinct
+# schemas). This synthesizes the observed shape a fully-converged system
+# running exactly the old declaration would report: a unit's sha256 is
+# only present when the old entry `hasContent`; `enabled`/`masked` mirror
+# `enable`/`mask` directly; `active` is approximated as "enabled and not
+# masked" (the common case for a converged unit) — a caller who needs a
+# real, live-observed answer instead passes --systemd-observed (fed from a
+# real `ubx-systemd observe`), bypassing this synthesis entirely.
+systemd_synthesize_observed() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+old_path, out_path = sys.argv[1:3]
+with open(old_path, encoding="utf-8") as f:
+    old = json.load(f)
+
+units = []
+for u in old.get("units", []):
+    enable = bool(u.get("enable", False))
+    mask = bool(u.get("mask", False))
+    units.append({
+        "name": u["name"],
+        "sha256": u["sha256"] if u.get("hasContent") else None,
+        "enabled": enable,
+        "masked": mask,
+        "active": enable and not mask,
+    })
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "units": units}, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+# summarize_users_plan PLAN_JSON — prints "ACTIONABLE<TAB>DRIFT<TAB>ERRORS".
+summarize_users_plan() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+n = (
+    len(p["users"]["create"]) + len(p["users"]["modify"])
+    + len(p["groups"]["create"]) + len(p["membership"]["add"])
+    + len(p["membership"]["remove"]) + len(p["authorized_keys"])
+)
+print(f"{n}\t{len(p['drift'])}\t{len(p['errors'])}")
+PYEOF
+}
+
+# users_plan_report PLAN_JSON — a human-readable render of a users plan
+# (bin/ubx-users has no `report` subcommand of its own, unlike
+# bin/ubx-systemd — this is that missing piece, kept local to bin/ubx
+# since nothing else needs it).
+users_plan_report() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+lines = []
+for u in p["users"]["create"]:
+    lines.append(f"create user: {u['name']}")
+for u in p["users"]["modify"]:
+    lines.append(f"modify user: {u['name']} ({', '.join(sorted(u['changes']))})")
+for g in p["groups"]["create"]:
+    lines.append(f"create group: {g['name']}")
+for m in p["membership"]["remove"]:
+    lines.append(f"remove membership: {m['user']} from {m['group']}")
+for m in p["membership"]["add"]:
+    lines.append(f"add membership: {m['user']} to {m['group']}")
+for a in p["authorized_keys"]:
+    lines.append(f"authorized_keys: {a['user']}")
+
+if not lines and not p["drift"] and not p["errors"]:
+    print("users: nothing to do (fully converged)")
+else:
+    print(f"users: {len(lines)} action(s) planned:")
+    for line in lines:
+        print(f"  - {line}")
+    if p["drift"]:
+        print(f"  drift ({len(p['drift'])}): " + json.dumps(p["drift"], sort_keys=True))
+    if p["errors"]:
+        print(f"  ERRORS ({len(p['errors'])}): " + json.dumps(p["errors"], sort_keys=True))
+PYEOF
+}
+
+# -- plan_domains: computes (never executes) the three domain plans -------
+#
+# Reads DOM_OLD_* / DOM_NEW_* (refs, may be empty) plus the observed/
+# exceptions overrides below from already-set variables, and sets:
+#   DOM_ETC_PLAN / DOM_SYSTEMD_PLAN / DOM_USERS_PLAN   (file path, or "")
+#   DOM_ETC_SKIP / DOM_SYSTEMD_SKIP / DOM_USERS_SKIP    (0/1)
+#   DOM_ETC_TOUCH DOM_ETC_DRIFT
+#   DOM_SYSTEMD_TOUCH
+#   DOM_USERS_TOUCH DOM_USERS_DRIFT
+#   DOM_NEW_SYSTEMD_JSON   (the resolved new systemd manifest.json path,
+#                           used as a --content-dir default at execute time
+#                           -- etc has no executor yet, so no equivalent
+#                           etc content-dir default is needed)
+# A domain is SKIPPED (no plan computed) only when NEITHER the old nor the
+# new ref names anything — "never declared, on either side" (matches
+# bin/ubx-generations' own "legally empty" fields posture). Dies (via
+# `die`, propagating the failing tool's own stderr) on a hard planner
+# refusal (an etc/systemd manifest naming an exception path with a
+# disagreeing refuseRestart flag; a users plan reporting a foreign uid/gid
+# conflict).
+plan_domains() {
+  local workdir="$1"
+
+  DOM_ETC_SKIP=0
+  if [ -z "$DOM_OLD_ETC_REF" ] && [ -z "$DOM_NEW_ETC_REF" ]; then
+    DOM_ETC_SKIP=1
+  fi
+  if [ "$DOM_ETC_SKIP" = 0 ]; then
+    local etc_old_json etc_new_json etc_obs_json
+    etc_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_ETC_REF" "$UBX_REBUILD_EMPTY_ETC_MANIFEST" "$workdir" old-etc)" \
+      || die "could not resolve the old generation's etc manifest"
+    etc_new_json="$(ubx_rebuild_resolve_ref "$DOM_NEW_ETC_REF" "$UBX_REBUILD_EMPTY_ETC_MANIFEST" "$workdir" new-etc)" \
+      || die "could not resolve the new generation's etc manifest"
+    etc_obs_json="$etc_old_json"
+    [ -z "${OPT_ETC_OBSERVED:-}" ] || etc_obs_json="$OPT_ETC_OBSERVED"
+
+    DOM_ETC_PLAN="$workdir/etc-plan.tsv"
+    local etc_args=("$bindir/ubx-etc" plan --old-manifest "$etc_old_json" --new-manifest "$etc_new_json" \
+      --observed-manifest "$etc_obs_json" --out "$DOM_ETC_PLAN")
+    if [ -n "${OPT_ETC_EXCEPTIONS:-}" ]; then
+      etc_args+=(--exceptions "$OPT_ETC_EXCEPTIONS")
+    fi
+    "${etc_args[@]}" || die "ubx-etc plan refused (see its stderr above)"
+    IFS=$'\t' read -r DOM_ETC_TOUCH DOM_ETC_DRIFT < <(summarize_etc_plan "$DOM_ETC_PLAN")
+  else
+    DOM_ETC_PLAN=""
+    DOM_ETC_TOUCH=0
+    DOM_ETC_DRIFT=0
+  fi
+
+  DOM_SYSTEMD_SKIP=0
+  if [ -z "$DOM_OLD_SYSTEMD_REF" ] && [ -z "$DOM_NEW_SYSTEMD_REF" ]; then
+    DOM_SYSTEMD_SKIP=1
+  fi
+  if [ "$DOM_SYSTEMD_SKIP" = 0 ]; then
+    local sysd_old_json sysd_new_json sysd_obs_json
+    sysd_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_SYSTEMD_REF" "$UBX_REBUILD_EMPTY_SYSTEMD_MANIFEST" "$workdir" old-systemd)" \
+      || die "could not resolve the old generation's systemd manifest"
+    sysd_new_json="$(ubx_rebuild_resolve_ref "$DOM_NEW_SYSTEMD_REF" "$UBX_REBUILD_EMPTY_SYSTEMD_MANIFEST" "$workdir" new-systemd)" \
+      || die "could not resolve the new generation's systemd manifest"
+    if [ -n "${OPT_SYSTEMD_OBSERVED:-}" ]; then
+      sysd_obs_json="$OPT_SYSTEMD_OBSERVED"
+    else
+      sysd_obs_json="$workdir/systemd-obs-synth.json"
+      systemd_synthesize_observed "$sysd_old_json" "$sysd_obs_json"
+    fi
+    DOM_NEW_SYSTEMD_JSON="$sysd_new_json"
+
+    DOM_SYSTEMD_PLAN="$workdir/systemd-plan.json"
+    "$bindir/ubx-systemd" plan --old-manifest "$sysd_old_json" --new-manifest "$sysd_new_json" \
+      --observed-manifest "$sysd_obs_json" --out "$DOM_SYSTEMD_PLAN" \
+      || die "ubx-systemd plan refused (see its stderr above)"
+    DOM_SYSTEMD_TOUCH="$(summarize_systemd_plan "$DOM_SYSTEMD_PLAN")"
+  else
+    DOM_SYSTEMD_PLAN=""
+    DOM_SYSTEMD_TOUCH=0
+    DOM_NEW_SYSTEMD_JSON=""
+  fi
+
+  DOM_USERS_SKIP=0
+  if [ -z "$DOM_OLD_USERS_REF" ] && [ -z "$DOM_NEW_USERS_REF" ]; then
+    DOM_USERS_SKIP=1
+  fi
+  if [ "$DOM_USERS_SKIP" = 0 ]; then
+    local users_new_json users_passwd users_group users_shadow users_rc
+    users_new_json="$(ubx_rebuild_resolve_ref "$DOM_NEW_USERS_REF" "$UBX_REBUILD_EMPTY_USERS_MANIFEST" "$workdir" new-users)" \
+      || die "could not resolve the new generation's users manifest"
+    users_passwd="${OPT_PASSWD:-/etc/passwd}"
+    users_group="${OPT_GROUP:-/etc/group}"
+    users_shadow="${OPT_SHADOW:-/etc/shadow}"
+
+    DOM_USERS_PLAN="$workdir/users-plan.json"
+    local users_args=("$bindir/ubx-users" plan --manifest "$users_new_json" --passwd "$users_passwd" \
+      --group "$users_group" --shadow "$users_shadow" --out "$DOM_USERS_PLAN")
+    if [ -n "${OPT_USERS_EXCEPTIONS:-}" ]; then
+      users_args+=(--exceptions "$OPT_USERS_EXCEPTIONS")
+    fi
+    if [ -n "${OPT_HOME_STATE:-}" ]; then
+      users_args+=(--home-state "$OPT_HOME_STATE")
+    fi
+    users_rc=0
+    "${users_args[@]}" || users_rc=$?
+    if [ "$users_rc" -ne 0 ]; then
+      die "ubx-users plan reported hard errors (uid/gid conflicts) — see $DOM_USERS_PLAN"
+    fi
+    IFS=$'\t' read -r DOM_USERS_TOUCH DOM_USERS_DRIFT DOM_USERS_ERRORS < <(summarize_users_plan "$DOM_USERS_PLAN")
+    # Defense in depth: users_rc==0 above should already guarantee
+    # plan["errors"] was empty (bin/ubx-users' cmd_plan exits 1 iff it
+    # isn't) -- re-checking the count itself rather than trusting the
+    # exit code alone mirrors this project's other dual-enforcement
+    # checks (e.g. bin/ubx-systemd re-deriving refuseRestart from a
+    # unit's own suffix instead of trusting the manifest's flag).
+    if [ "$DOM_USERS_ERRORS" != 0 ]; then
+      die "ubx-users plan reported errors but exited 0 (should be unreachable) — refusing to proceed"
+    fi
+  else
+    DOM_USERS_PLAN=""
+    DOM_USERS_TOUCH=0
+    DOM_USERS_DRIFT=0
+    DOM_USERS_ERRORS=0
+  fi
+}
+
+# report_domains VERBOSE — prints the deterministic touched-domains report
+# (SPEC.md §7) from the DOM_* globals plan_domains just set. VERBOSE=1
+# (used by `ubx diff`) prints each domain's full plan content; VERBOSE=0
+# (used by `rebuild`/`rollback`) prints one summary line per domain.
+report_domains() {
+  local verbose="$1"
+
+  if [ "$DOM_ETC_SKIP" = 1 ]; then
+    echo "etc: nothing declared (no old or new /etc manifest)"
+  elif [ "$verbose" = 1 ]; then
+    if [ -s "$DOM_ETC_PLAN" ]; then
+      echo "etc:"
+      # awk (not sed) so a plan file missing a final trailing newline (a
+      # possibility any time a command substitution captured it — command
+      # substitution always strips trailing newlines) still ends its last
+      # printed line cleanly instead of running into whatever prints next.
+      awk '{ print "  " $0 }' "$DOM_ETC_PLAN"
+    else
+      echo "etc: nothing to do (fully converged)"
+    fi
+  else
+    echo "etc: $DOM_ETC_TOUCH action(s) touched ($DOM_ETC_DRIFT drift)"
+  fi
+
+  if [ "$DOM_SYSTEMD_SKIP" = 1 ]; then
+    echo "systemd: nothing declared (no old or new systemd manifest)"
+  elif [ "$verbose" = 1 ]; then
+    "$bindir/ubx-systemd" report --plan "$DOM_SYSTEMD_PLAN"
+  else
+    echo "systemd: $DOM_SYSTEMD_TOUCH action(s) touched"
+  fi
+
+  if [ "$DOM_USERS_SKIP" = 1 ]; then
+    echo "users: nothing declared (no old or new users manifest)"
+  elif [ "$verbose" = 1 ]; then
+    users_plan_report "$DOM_USERS_PLAN"
+  else
+    echo "users: $DOM_USERS_TOUCH action(s) touched ($DOM_USERS_DRIFT drift)"
+  fi
+}
+
+# execute_domains — attempts real activation for the domains that have a
+# real executor (see this file's header). Only ever called for
+# switch/test, never boot, and never in --dry-run mode.
+execute_domains() {
+  local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4"
+
+  if [ "$DOM_ETC_SKIP" = 0 ]; then
+    echo "etc: apply pending — bin/ubx-etc-apply does not exist yet (see docs/etc.md); plan only, nothing written"
+  fi
+
+  if [ "$DOM_SYSTEMD_SKIP" = 0 ]; then
+    local content_dir="$systemd_content_dir"
+    if [ -z "$content_dir" ]; then
+      content_dir="$(dirname "$DOM_NEW_SYSTEMD_JSON")"
+    fi
+    local apply_args=("$bindir/ubx-systemd-apply" --plan "$DOM_SYSTEMD_PLAN" --unit-dir "$systemd_unit_dir" --content-dir "$content_dir")
+    if [ "$apply" = 1 ]; then
+      apply_args+=(--apply)
+    else
+      apply_args+=(--dry-run)
+    fi
+    "${apply_args[@]}"
+  fi
+
+  if [ "$DOM_USERS_SKIP" = 0 ]; then
+    local script="$users_out"
+    "$bindir/ubx-users" execute --plan "$DOM_USERS_PLAN" --format shell --out "$script"
+    echo "users: activation script written to $script (not executed — ubx-users execute only ever emits it; run it as root to converge, or see docs/users.md)"
+  fi
+}
+
+# =====================================================================
+# rebuild
+# =====================================================================
+
+cmd_rebuild_usage() {
+  cat <<USAGE
+usage: ubx rebuild <switch|boot|test> [options]
+
+Registers a new generation (via bin/ubx-generations) and, per verb:
+  switch   activate all live domains now, AND set the GRUB default
+  boot     set the GRUB default only — no live activation
+  test     activate all live domains now, but NEVER touch the GRUB
+           default (a plain reboot returns to the last-good generation)
+
+Generation-creation options (passed through to 'ubx-generations create';
+required unless --dry-run):
+  --rootfs-image PATH --kernel PATH --initrd PATH --root-device DEV
+  --kernel-params PARAMS --title TITLE --snap-manifest PATH
+
+Domain declaration options (all optional — an omitted one means "this
+generation declares nothing new for that domain"):
+  --etc-ref PATH          new generation's /etc manifest (file, or a
+                          directory containing manifest.json)
+  --systemd-ref PATH      new generation's systemd manifest (same shape)
+  --users-manifest PATH   new generation's users/groups manifest (JSON file)
+
+Observed-state overrides (default: assume the OLD generation's own
+manifest already matches reality — i.e. no drift; override to plan
+against a real, observed system instead):
+  --etc-observed FILE --etc-exceptions FILE
+  --systemd-observed FILE
+  --passwd FILE --group FILE --shadow FILE (default /etc/{passwd,group,shadow})
+  --users-exceptions FILE --home-state FILE
+
+Execution options:
+  --root DIR              generations root (default \$UBX_GEN_ROOT, else
+                           /ubx/var/generations)
+  --dry-run                compute and print the touched-domains report
+                           only; registers NO generation, writes NO GRUB
+                           default, executes nothing (needs no root)
+  --apply                  attempt real activation where an executor
+                           exists (today: only bin/ubx-systemd-apply;
+                           requires systemctl on PATH — see its own
+                           --help). Default without --apply: dry-run print.
+  --systemd-unit-dir DIR   (default /etc/systemd/system)
+  --systemd-content-dir DIR (default: alongside the new systemd manifest)
+  --users-out FILE          where to write the generated users activation
+                            shell script (default: a temp file, printed)
+
+See SPEC.md §4.3, §4.5 for the full verb semantics.
+USAGE
+}
+
+do_rebuild() {
+  local verb="$1"
+  shift
+
+  local root="" title="" rootfs_image="" kernel="" initrd="" root_device="" kernel_params="" snap_manifest=""
+  local etc_ref="" systemd_ref="" users_manifest=""
+  local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
+  local apply=0 dry_run=0
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --title) [ $# -ge 2 ] || die "--title requires an argument"; title="$2"; shift 2 ;;
+      --rootfs-image) [ $# -ge 2 ] || die "--rootfs-image requires an argument"; rootfs_image="$2"; shift 2 ;;
+      --kernel) [ $# -ge 2 ] || die "--kernel requires an argument"; kernel="$2"; shift 2 ;;
+      --initrd) [ $# -ge 2 ] || die "--initrd requires an argument"; initrd="$2"; shift 2 ;;
+      --root-device) [ $# -ge 2 ] || die "--root-device requires an argument"; root_device="$2"; shift 2 ;;
+      --kernel-params) [ $# -ge 2 ] || die "--kernel-params requires an argument"; kernel_params="$2"; shift 2 ;;
+      --snap-manifest) [ $# -ge 2 ] || die "--snap-manifest requires an argument"; snap_manifest="$2"; shift 2 ;;
+      --etc-ref) [ $# -ge 2 ] || die "--etc-ref requires an argument"; etc_ref="$2"; shift 2 ;;
+      --systemd-ref) [ $# -ge 2 ] || die "--systemd-ref requires an argument"; systemd_ref="$2"; shift 2 ;;
+      --users-manifest) [ $# -ge 2 ] || die "--users-manifest requires an argument"; users_manifest="$2"; shift 2 ;;
+      --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
+      --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
+      --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
+      --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
+      --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
+      --users-exceptions) [ $# -ge 2 ] || die "--users-exceptions requires an argument"; OPT_USERS_EXCEPTIONS="$2"; shift 2 ;;
+      --home-state) [ $# -ge 2 ] || die "--home-state requires an argument"; OPT_HOME_STATE="$2"; shift 2 ;;
+      --systemd-unit-dir) [ $# -ge 2 ] || die "--systemd-unit-dir requires an argument"; systemd_unit_dir="$2"; shift 2 ;;
+      --systemd-content-dir) [ $# -ge 2 ] || die "--systemd-content-dir requires an argument"; systemd_content_dir="$2"; shift 2 ;;
+      --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      -h | --help) cmd_rebuild_usage; exit 0 ;;
+      *) echo "ubx: rebuild $verb: unknown option: $1" >&2; cmd_rebuild_usage >&2; exit 2 ;;
+    esac
+  done
+
+  [ -n "$root" ] || root="$(ubx_rebuild_default_root)"
+
+  if [ "$dry_run" = 0 ]; then
+    [ -n "$rootfs_image" ] || die "rebuild $verb: --rootfs-image is required (or pass --dry-run)"
+    [ -n "$kernel" ] || die "rebuild $verb: --kernel is required (or pass --dry-run)"
+    [ -n "$initrd" ] || die "rebuild $verb: --initrd is required (or pass --dry-run)"
+    [ -n "$root_device" ] || die "rebuild $verb: --root-device is required (or pass --dry-run)"
+  fi
+
+  local workdir
+  workdir="$(mktemp -d)"
+  # shellcheck disable=SC2064  # intentional: expand $workdir NOW (it is
+  # `local` to this function and would be unset by the time an EXIT trap
+  # set with single quotes fired after the function returned)
+  trap "rm -rf -- '$workdir'" EXIT
+
+  local old_current
+  old_current="$(ubx_rebuild_effective_booted "$root")"
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+    < <(ubx_rebuild_domain_refs "$root" "$old_current")
+  DOM_NEW_ETC_REF="$etc_ref"
+  DOM_NEW_SYSTEMD_REF="$systemd_ref"
+  DOM_NEW_USERS_REF="$users_manifest"
+
+  local new_idx=""
+  if [ "$dry_run" = 0 ]; then
+    local create_args=(create --root "$root" --rootfs-image "$rootfs_image" --kernel "$kernel" \
+      --initrd "$initrd" --root-device "$root_device")
+    [ -z "$title" ] || create_args+=(--title "$title")
+    [ -z "$kernel_params" ] || create_args+=(--kernel-params "$kernel_params")
+    [ -z "$etc_ref" ] || create_args+=(--etc-ref "$etc_ref")
+    [ -z "$users_manifest" ] || create_args+=(--users-manifest "$users_manifest")
+    [ -z "$snap_manifest" ] || create_args+=(--snap-manifest "$snap_manifest")
+    new_idx="$("$bindir/ubx-generations" "${create_args[@]}")" \
+      || die "rebuild $verb: failed to register the new generation"
+    ubx_rebuild_write_sidecar "$root" "$new_idx" "$systemd_ref" \
+      || die "rebuild $verb: failed to record the systemd manifest reference for generation $new_idx"
+  fi
+
+  plan_domains "$workdir"
+
+  if [ "$dry_run" = 1 ]; then
+    local pending
+    pending="$(peek_next_index "$root")"
+    echo "ubx rebuild $verb (dry-run): would register generation $pending (from generation ${old_current:-<none>})"
+  else
+    echo "ubx rebuild $verb: generation $new_idx (from generation ${old_current:-<none>})"
+  fi
+  echo "domains:"
+  report_domains 0 | sed 's/^/  /'
+
+  if [ "$verb" = switch ] || [ "$verb" = test ]; then
+    echo "note: soft-reboot into a changed rootfs image is pending (issue #30) — the image is registered but never hot-swapped by this command"
+    if [ "$dry_run" = 0 ]; then
+      local exec_users_out="$users_out"
+      [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
+      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out"
+      ubx_rebuild_write_booted "$root" "$new_idx"
+    else
+      echo "(dry-run: no execution attempted)"
+    fi
+  fi
+
+  # -- The GRUB-default matrix: switch/boot set it, test NEVER does. -------
+  case "$verb" in
+    switch | boot)
+      if [ "$dry_run" = 1 ]; then
+        local pending2
+        pending2="$(peek_next_index "$root")"
+        echo "grub default: would be set to generation $pending2 (dry-run — nothing written)"
+      else
+        ubx_rebuild_write_grub_default "$root" "$new_idx"
+        echo "grub default: set to generation $new_idx"
+      fi
+      ;;
+    test)
+      echo "grub default: unchanged — 'ubx rebuild test' never touches it (a plain reboot returns to the last-good generation)"
+      ;;
+  esac
+}
+
+cmd_rebuild() {
+  local verb="${1:-}"
+  case "$verb" in
+    switch | boot | test)
+      shift
+      do_rebuild "$verb" "$@"
+      ;;
+    -h | --help)
+      cmd_rebuild_usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+# =====================================================================
+# rollback
+# =====================================================================
+
+cmd_rollback_usage() {
+  cat <<USAGE
+usage: ubx rollback [N] [options]
+
+Re-converges the live domains (etc, systemd, users) to generation N's
+retained manifests (default: the on-disk "previous" generation) and moves
+the GRUB default back to it. N is resolved via
+'ubx-generations rollback-target', so a generation that exists on disk but
+is no longer retained under the given/default retention policy is refused
+(its store artifacts may already be gone).
+
+  --root DIR             generations root (default \$UBX_GEN_ROOT, else
+                         /ubx/var/generations)
+  --retain COUNT|all     retention policy rollback-target validates N
+                         against (default: 5, mirrors that tool's own default)
+  --dry-run              report only; touches no GRUB default, executes
+                         nothing (needs no root)
+  --apply                attempt real activation where an executor exists
+                         (see 'ubx rebuild --help')
+  --etc-observed FILE --etc-exceptions FILE
+  --systemd-observed FILE
+  --passwd FILE --group FILE --shadow FILE (default /etc/{passwd,group,shadow})
+  --users-exceptions FILE --home-state FILE
+  --systemd-unit-dir DIR --systemd-content-dir DIR --users-out FILE
+USAGE
+}
+
+cmd_rollback() {
+  local root="" retain=5 apply=0 dry_run=0 target_arg=""
+  local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --retain) [ $# -ge 2 ] || die "--retain requires an argument"; retain="$2"; shift 2 ;;
+      --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
+      --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
+      --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
+      --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
+      --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
+      --users-exceptions) [ $# -ge 2 ] || die "--users-exceptions requires an argument"; OPT_USERS_EXCEPTIONS="$2"; shift 2 ;;
+      --home-state) [ $# -ge 2 ] || die "--home-state requires an argument"; OPT_HOME_STATE="$2"; shift 2 ;;
+      --systemd-unit-dir) [ $# -ge 2 ] || die "--systemd-unit-dir requires an argument"; systemd_unit_dir="$2"; shift 2 ;;
+      --systemd-content-dir) [ $# -ge 2 ] || die "--systemd-content-dir requires an argument"; systemd_content_dir="$2"; shift 2 ;;
+      --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      -h | --help) cmd_rollback_usage; exit 0 ;;
+      -*)
+        echo "ubx: rollback: unknown option: $1" >&2
+        cmd_rollback_usage >&2
+        exit 2
+        ;;
+      *)
+        if [ -z "$target_arg" ]; then
+          target_arg="$1"
+          shift
+        else
+          echo "ubx: rollback: unexpected argument: $1" >&2
+          cmd_rollback_usage >&2
+          exit 2
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$root" ] || root="$(ubx_rebuild_default_root)"
+  [ -n "$target_arg" ] || target_arg="previous"
+
+  local current previous booted_gen
+  current="$(ubx_rebuild_read_pointer "$root" current)"
+  previous="$(ubx_rebuild_read_pointer "$root" previous)"
+  [ -n "$current" ] || die "rollback: no current generation recorded at $root/current — nothing to roll back from"
+  # The generation to re-converge FROM is whatever this orchestrator last
+  # actually booted/converged live (see bin/ubx-rebuild-lib's header, "the
+  # 'booted' marker") -- NOT necessarily bin/ubx-generations' own "current"
+  # pointer, which only tracks the last REGISTERED generation and can be
+  # stale relative to a previous rollback or a boot-only registration.
+  booted_gen="$(ubx_rebuild_effective_booted "$root")"
+
+  local rt_args=(rollback-target "$target_arg" --root "$root" --retain "$retain" --booted "$booted_gen")
+  [ -z "$previous" ] || rt_args+=(--previous "$previous")
+  local target
+  target="$("$bindir/ubx-generations" "${rt_args[@]}")" || die "rollback: could not resolve target '$target_arg'"
+
+  local workdir
+  workdir="$(mktemp -d)"
+  # shellcheck disable=SC2064  # intentional: expand $workdir NOW (it is
+  # `local` to this function and would be unset by the time an EXIT trap
+  # set with single quotes fired after the function returned)
+  trap "rm -rf -- '$workdir'" EXIT
+
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+    < <(ubx_rebuild_domain_refs "$root" "$booted_gen")
+  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF \
+    < <(ubx_rebuild_domain_refs "$root" "$target")
+
+  plan_domains "$workdir"
+
+  echo "ubx rollback: generation $booted_gen -> $target"
+  echo "domains:"
+  report_domains 0 | sed 's/^/  /'
+
+  if [ "$dry_run" = 0 ]; then
+    local exec_users_out="$users_out"
+    [ -n "$exec_users_out" ] || exec_users_out="$root/$target/rollback-users-activate.sh"
+    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out"
+    ubx_rebuild_write_booted "$root" "$target"
+    ubx_rebuild_write_grub_default "$root" "$target"
+    echo "grub default: set to generation $target"
+  else
+    echo "grub default: would be set to generation $target (dry-run — nothing written)"
+  fi
+}
+
+# =====================================================================
+# list-generations
+# =====================================================================
+
+cmd_list_generations_usage() {
+  cat <<USAGE
+usage: ubx list-generations [--root DIR] [--porcelain]
+
+Wraps 'ubx-generations list' — see 'ubx-generations list --help'.
+USAGE
+}
+
+cmd_list_generations() {
+  local root="" porcelain=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --porcelain) porcelain=1; shift ;;
+      -h | --help) cmd_list_generations_usage; exit 0 ;;
+      *) echo "ubx: list-generations: unknown option: $1" >&2; cmd_list_generations_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$root" ] || root="$(ubx_rebuild_default_root)"
+
+  local args=(list --root "$root")
+  [ "$porcelain" = 0 ] || args+=(--porcelain)
+  "$bindir/ubx-generations" "${args[@]}"
+}
+
+# =====================================================================
+# diff
+# =====================================================================
+
+cmd_diff_usage() {
+  cat <<USAGE
+usage: ubx diff [A] [B] [--root DIR] [options]
+
+Shows the domain-level delta between two generations' manifests (etc,
+systemd, users — see 'ubx rebuild --help' for the shared domain-plan
+concepts). Observed state defaults to A's own manifest (i.e. "assume A is
+exactly converged, show what moving to B would change"); pass the
+--*-observed/--passwd/--group/--shadow overrides for a real, live-drift-
+aware diff instead.
+
+  (no args)    diff previous -> current
+  A            diff current -> A
+  A B          diff A -> B
+
+  --root DIR
+  --etc-observed FILE --etc-exceptions FILE
+  --systemd-observed FILE
+  --passwd FILE --group FILE --shadow FILE
+  --users-exceptions FILE --home-state FILE
+USAGE
+}
+
+cmd_diff() {
+  local root=""
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+  local -a pos=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) [ $# -ge 2 ] || die "--root requires an argument"; root="$2"; shift 2 ;;
+      --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
+      --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
+      --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
+      --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
+      --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
+      --users-exceptions) [ $# -ge 2 ] || die "--users-exceptions requires an argument"; OPT_USERS_EXCEPTIONS="$2"; shift 2 ;;
+      --home-state) [ $# -ge 2 ] || die "--home-state requires an argument"; OPT_HOME_STATE="$2"; shift 2 ;;
+      -h | --help) cmd_diff_usage; exit 0 ;;
+      -*) echo "ubx: diff: unknown option: $1" >&2; cmd_diff_usage >&2; exit 2 ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+
+  [ -n "$root" ] || root="$(ubx_rebuild_default_root)"
+
+  local a="" b=""
+  case "${#pos[@]}" in
+    0)
+      b="$(ubx_rebuild_read_pointer "$root" current)"
+      [ -n "$b" ] || die "diff: no current generation recorded at $root/current"
+      a="$(ubx_rebuild_read_pointer "$root" previous)"
+      ;;
+    1)
+      a="$(ubx_rebuild_effective_booted "$root")"
+      [ -n "$a" ] || die "diff: no current/booted generation recorded at $root (needed as the baseline for a single-argument diff)"
+      b="${pos[0]}"
+      ;;
+    2)
+      a="${pos[0]}"
+      b="${pos[1]}"
+      ;;
+    *)
+      cmd_diff_usage >&2
+      exit 2
+      ;;
+  esac
+
+  local workdir
+  workdir="$(mktemp -d)"
+  # shellcheck disable=SC2064  # intentional: expand $workdir NOW (it is
+  # `local` to this function and would be unset by the time an EXIT trap
+  # set with single quotes fired after the function returned)
+  trap "rm -rf -- '$workdir'" EXIT
+
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+    < <(ubx_rebuild_domain_refs "$root" "$a")
+  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF \
+    < <(ubx_rebuild_domain_refs "$root" "$b")
+
+  plan_domains "$workdir"
+
+  echo "ubx diff: generation ${a:-<none>} -> ${b:-<none>}"
+  report_domains 1
+}
+
+# =====================================================================
+# main
+# =====================================================================
 
 main() {
   local cmd="${1:-}"
@@ -43,18 +864,22 @@ main() {
       exit 2
       ;;
     rebuild)
-      local verb="${2:-}"
-      case "$verb" in
-        switch | boot | test)
-          not_implemented "rebuild $verb"
-          ;;
-        *)
-          usage >&2
-          exit 2
-          ;;
-      esac
+      shift
+      cmd_rebuild "$@"
       ;;
-    rollback | list-generations | diff | update)
+    rollback)
+      shift
+      cmd_rollback "$@"
+      ;;
+    list-generations)
+      shift
+      cmd_list_generations "$@"
+      ;;
+    diff)
+      shift
+      cmd_diff "$@"
+      ;;
+    update)
       not_implemented "$cmd"
       ;;
     *)

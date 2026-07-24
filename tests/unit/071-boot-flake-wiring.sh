@@ -92,6 +92,23 @@ grep -q 'genScript = \.\./bin/ubx-gen-grub-cfg' "$boot_nix" ||
 grep -qF 'source "$genScript"' "$boot_nix" ||
   fail "$boot_nix's grubCfg does not source \$genScript (see that function's own comment on why source, not exec)"
 
+# -- the ubx CLI baked aboard (issue #49 regression guard) ------------------
+#
+# bin/ubx `source`s ubx-rebuild-lib and shells out to sibling tools by
+# $bindir, so the whole bin/ directory must be baked into /ubx/bin -- not
+# just the single script (which made `ubx --help` exit non-zero in-image
+# and reddened main, caught only by the QEMU e2e). Assert boot.nix bakes
+# the directory and copies its contents, so a single-file regression fails
+# here without needing QEMU.
+grep -q 'ubxBin = \.\./bin;' "$boot_nix" ||
+  fail "$boot_nix does not bake the whole ../bin directory (ubxBin) -- ubx's sourced siblings would be missing in-image (issue #49)"
+grep -q 'ubxScript = \.\./bin/ubx;' "$boot_nix" &&
+  fail "$boot_nix still bakes only bin/ubx (ubxScript) -- regressed to the #49 single-file baking"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching literal
+# nix/boot.nix embedded-script text, not expanding in the test's shell.
+grep -qF '"$ubxBin/." "$out/ubx/bin/"' "$boot_nix" ||
+  fail "$boot_nix does not cp the whole \$ubxBin dir into /ubx/bin (issue #49)"
+
 # -- lockfile cross-check ---------------------------------------------------
 #
 # Every package name this file hardcodes (the kernel default, its concrete

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # bin/ubx-scan-deb-ownership — list every entry in a .deb's data.tar that
-# EITHER is not root:root-owned OR carries a setuid/setgid/sticky bit
-# (SPEC.md §4.1/§4.2; GitHub issue #10 PR #36 follow-up: the "Bootable disk
-# image + QEMU e2e" CI job failing to compose the full 168-package locked
-# closure).
+# is not root:root-owned, OR carries a setuid/setgid/sticky bit, OR whose
+# real permission bits are more restrictive than the mode Nix's store-path
+# canonicalization would leave it with (SPEC.md §4.1/§4.2; GitHub issue #10
+# PR #36 follow-up: the "Bootable disk image + QEMU e2e" CI job failing to
+# compose the full 168-package locked closure; GitHub issue #45: store-path
+# canonicalization silently loosening a secrets-adjacent file's real mode).
 #
 # -- The problem this exists to work around ----------------------------
 #
@@ -82,6 +84,70 @@
 # chmod(2) syscall of any kind, so the sandbox restriction never applies
 # to that final step either.
 #
+# -- The CANONICALIZATION follow-up (GitHub issue #45) --------------------
+#
+# The first two triggers above exist because dpkg's OWN unpack-time chown/
+# chmod fails inside this build sandbox. This third trigger is a different
+# kind of problem: it exists because of something that happens AFTER
+# dpkg's unpack has already succeeded cleanly, with no sandbox error at
+# all.
+#
+# nix/compose.nix's composeRootfs writes the composed tree to $out, a Nix
+# store path. Nix registers every store path READ-ONLY at build
+# completion by canonicalizing its permission bits: every regular file
+# becomes exactly 0444, every directory exactly 0555 (see nix/compose.nix's
+# own "Nix canonicalizes every registered store path read-only" comment).
+# That is normally harmless -- it only ever DROPS bits (0755 -> 0555,
+# 0644 -> 0444), and a read-only rootfs does not care that a directory it
+# can no longer write to also lost its own write bit in the metadata. But
+# a small number of real packages ship a root:root file MORE RESTRICTIVE
+# than the canonical mode -- e.g. 0640 or 0600 on something
+# secrets-adjacent -- and for THOSE, canonicalization does not merely drop
+# bits, it ADDS them: 0640 -> 0444 turns ON other-read; 0600 -> 0444 turns
+# ON group-read AND other-read. That is a real permission GRANT the
+# package deliberately withheld, silently reintroduced by the packing
+# pipeline -- a hardening regression, not a cosmetic metadata loss.
+#
+# Neither of the first two triggers catches this: the file is root:root
+# (the OPPOSITE of the first trigger's condition) and carries no
+# setuid/setgid/sticky bit (the second trigger's condition). So this
+# script's scan trigger gains a third, independent leg: select an entry,
+# even root:root and even with no special bit, if its real permission
+# bits are a STRICT SUBSET of the canonical mode for its type (0444 for a
+# file/symlink/hardlink, 0555 for a directory) -- i.e. if canonicalization
+# would turn ON at least one read (or, for a directory, read/execute) bit
+# that the real mode has OFF. See mode_loosens_under_canonicalization()
+# below for the exact bitwise rule this implements. It is deliberately
+# NOT triggered by the opposite case (real bits a strict SUPERSET of
+# canonical, e.g. an ordinary 0755 directory or 0644 file losing bits down
+# to 0555/0444): that direction only ever REMOVES access on a tree nothing
+# writes to once packed, so recording it would only bloat the pseudo-file
+# manifest for no security benefit -- see that function's own comment for
+# the concrete bit-math this rests on.
+#
+# This third trigger reuses the identical downstream mechanism the other
+# two already use, completely unchanged: the caller (nix/compose.nix's
+# scanLines/restoreLines) path-excludes the entry from dpkg's own
+# extraction, restores its real content itself afterward, and records its
+# true mode (and owner -- always 0/0 here) in the same mksquashfs
+# pseudo-file manifest, applied at PACK time -- well after Nix's own
+# canonicalization of the composeRootfs store path has already happened,
+# which is exactly why recording it there, rather than merely relying on
+# dpkg's in-chroot chmod, is required at all: an in-chroot mode never
+# survives past this derivation's own store-path registration, regardless
+# of whether dpkg or this script's restore step is what set it. Nothing
+# about path-exclude/restore ever depended on dpkg being UNABLE to set the
+# mode in the first place -- it only ever depended on some LATER step
+# needing the true value recorded somewhere outside the store path that is
+# about to be canonicalized. dpkg unpacking one of these entries directly
+# would in fact have worked fine (no EINVAL/EPERM survives a plain
+# root:root, no-special-bit chmod); routing it through the same
+# exclude/restore/pseudo-file path anyway costs one extra targeted
+# `tar -x` per selected entry and keeps this script's contract -- and
+# nix/compose.nix's caller-side loop -- identical for every selected
+# entry, with nothing special-cased at the call site for this third
+# reason.
+#
 # -- Residual risk this script does NOT cover ---------------------------
 #
 # This only fixes dpkg's OWN unpack-time extraction chowns. A maintainer
@@ -107,7 +173,9 @@
 # -- Output format --------------------------------------------------------
 #
 # One TAB-separated record per SELECTED entry (non-root-owned, OR carrying
-# a setuid/setgid/sticky bit -- see "The MODE follow-up" above), to
+# a setuid/setgid/sticky bit -- see "The MODE follow-up" above -- OR whose
+# real permission bits are tighter than Nix's store-path canonicalization
+# would leave them -- see "The CANONICALIZATION follow-up" above), to
 # stdout:
 #   <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
 #   path   absolute install path (e.g. /usr/sbin/pam_extrausers_chkpwd)
@@ -137,7 +205,10 @@ usage: ubx-scan-deb-ownership DEBFILE
 
 Lists every entry in DEBFILE's data.tar whose recorded owner is not
 uid=0/gid=0 (root:root), OR whose recorded mode carries a setuid/setgid/
-sticky bit, one TAB-separated record per line:
+sticky bit, OR whose recorded permission bits are more restrictive than
+Nix's store-path canonicalization would leave them (0444 files, 0555
+directories -- see this script's own "CANONICALIZATION follow-up" header
+section), one TAB-separated record per line:
 
   <path><TAB><type><TAB><mode><TAB><uid><TAB><gid>
 
@@ -199,6 +270,65 @@ mode_to_octal() {
   esac
 
   printf '%d%d%d%d' "$special" "$owner" "$group" "$other"
+}
+
+# canonical_digit TYPE_CHAR — the single permission digit (applied
+# identically to owner/group/other) Nix's store-path canonicalization
+# leaves a path of this tar type with: "5" (r-x) for a directory ("d"),
+# "4" (r--) for anything restored the same way a plain file is ("-", "l",
+# "h" -- see this script's own type classification below). Empty output
+# for any other type (device/fifo/socket): canonicalization is not this
+# script's concern for a type it already can't restore at all (see the
+# device/fifo/socket die() below), so mode_loosens_under_canonicalization
+# must never fire for one.
+canonical_digit() {
+  case "$1" in
+    d) printf '5' ;;
+    -|l|h) printf '4' ;;
+  esac
+}
+
+# mode_loosens_under_canonicalization OCTAL_MODE TYPE_CHAR — true (exit 0)
+# iff Nix's post-build store-path canonicalization would SET a permission
+# bit that this entry's real, as-shipped mode has OFF, i.e.
+# canonicalization would GRANT access the package deliberately withheld
+# (GitHub issue #45; see this script's own "CANONICALIZATION follow-up"
+# header section for the full writeup and worked examples).
+#
+# Only the three plain permission digits are compared (OCTAL_MODE's
+# leading special digit is skipped entirely): canonicalization never
+# touches the setuid/setgid/sticky bit one way or the other (Nix simply
+# does not carry a special digit in its own canonical mode at all), and a
+# real special bit already selects this entry via the MODE follow-up
+# trigger above regardless of what this function returns.
+#
+# For each of the owner/group/other digits: canonical_digit's bits, ANDed
+# against the BITWISE COMPLEMENT of the real digit (masked to 3 bits, so
+# bash's arbitrary-width `~` does not leave stray high bits set), is
+# nonzero exactly when canonicalization would turn ON a bit ($cdigit) that
+# the real mode has OFF ($d) -- e.g. real group digit 0 (`---`), canonical
+# group digit 4 (file, `r--`): 4 & ~0 & 7 = 4 & 7 & 7 = 4, nonzero, so a
+# 0600 file's group digit alone is enough to select it (its other digit
+# would too, independently). Conversely, real owner digit 7 (`rwx`,
+# ordinary directory), canonical owner digit 5 (`r-x`): 5 & ~7 & 7 =
+# 5 & 0 & 7 = 0 -- an ordinary, LESS restrictive 0755 directory never
+# selects here, exactly as required (only a real mode STRICTLY TIGHTER
+# than canonical triggers this leg; one merely equal, or looser, must
+# not -- see this script's own header for why bloating the manifest with
+# the harmless, bits-only-dropped direction is deliberately avoided).
+mode_loosens_under_canonicalization() {
+  local octal="$1" type="$2"
+  local cdigit
+  cdigit="$(canonical_digit "$type")"
+  [ -n "$cdigit" ] || return 1   # not a file/dir this scan restores at all
+
+  local d
+  for d in "${octal:1:1}" "${octal:2:1}" "${octal:3:1}"; do
+    if [ $(( cdigit & (~d & 7) )) -ne 0 ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # A dpkg --path-exclude pattern is a shell glob (dpkg.cfg(5)); we only
@@ -315,16 +445,31 @@ scan() {
     octal_mode="$(mode_to_octal "$mode")"
     local special="${octal_mode%???}"   # the leading (setuid/setgid/sticky) digit alone
 
+    # raw_type is computed here (rather than only once an entry is already
+    # selected) for the same reason octal_mode is computed early, above:
+    # since GitHub issue #45's canonicalization trigger (below), the
+    # entry's TYPE, not just its mode, is now part of deciding whether to
+    # select it at all -- the canonical mode compared against differs for
+    # a directory (0555) vs. a plain file/symlink/hardlink (0444).
+    local raw_type="${mode:0:1}"
+
     # Select this entry if EITHER its owner is not root:root (the original
     # trigger -- dpkg's unconditional chown() fails EINVAL under this
     # sandbox's single-id-mapped user namespace) OR its mode carries a
     # setuid/setgid/sticky bit (the mode follow-up -- dpkg's unconditional
     # chmod() to set that bit fails EPERM under the same sandbox,
     # independent of who owns the file: /usr/bin/mount, root:root, 4755,
-    # is the concrete CI failure this exists for). Neither condition alone
-    # is "this script's concern" the way the original comment put it --
-    # both now are.
-    if [ "$uid/$gid" = "0/0" ] && [ "$special" = "0" ]; then
+    # is the concrete CI failure this exists for) OR its real permission
+    # bits are tighter than Nix's store-path canonicalization would leave
+    # them (the canonicalization follow-up, GitHub issue #45: a root:root,
+    # no-special-bit file like a 0600/0640 secret would otherwise emerge
+    # from the packed image WORLD-READABLE -- see
+    # mode_loosens_under_canonicalization()'s own comment for the exact
+    # bitwise rule). None of the three conditions alone is "this script's
+    # concern" the way the very first version of this comment put it --
+    # all three now are.
+    if [ "$uid/$gid" = "0/0" ] && [ "$special" = "0" ] &&
+       ! mode_loosens_under_canonicalization "$octal_mode" "$raw_type"; then
       continue
     fi
 
@@ -336,12 +481,12 @@ scan() {
     # so a selected one is doubly unsupported. Checked here, not earlier,
     # so a root:root, non-special-mode device/fifo/socket entry (outside
     # this script's remit entirely) is never flagged by it.
-    local type="${mode:0:1}"
+    local type="$raw_type"
     case "$type" in
       d) type="d" ;;
       -|l|h) type="f" ;;
       *)
-        die "$deb: '$path' is a selected (non-root-owned and/or set*id/sticky) device/fifo/socket tar entry (mode '$mode', owner $uid/$gid) -- this script has no safe way to restore it (mknod is refused inside this project's build sandbox; see nix/compose.nix's own /dev bind-mount comment), and no package in this project's locked archive set is expected to ship one. Investigate before adding a package that does."
+        die "$deb: '$path' is a selected (non-root-owned and/or set*id/sticky and/or canonicalization-loosened) device/fifo/socket tar entry (mode '$mode', owner $uid/$gid) -- this script has no safe way to restore it (mknod is refused inside this project's build sandbox; see nix/compose.nix's own /dev bind-mount comment), and no package in this project's locked archive set is expected to ship one. Investigate before adding a package that does."
         ;;
     esac
 

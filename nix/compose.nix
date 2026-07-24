@@ -287,7 +287,8 @@ let
       # bin/ubx-scan-deb-ownership's own header for the full design):
       # work around TWO independent, unconditional, unpatchable dpkg
       # unpack-time operations that this chroot's single-id-mapped user
-      # namespace cannot always perform:
+      # namespace cannot always perform, PLUS a third, unrelated problem
+      # that shows up only after unpack succeeds:
       #   - chown(2)-ing every extracted file to the archive's own
       #     recorded owner (verified against dpkg upstream -- see that
       #     script's header for the citation), which fails EINVAL for any
@@ -297,16 +298,33 @@ let
       #     EPERM regardless of who owns it -- the concrete case that
       #     surfaced this was dpkg's own unpack of /usr/bin/mount
       #     (root:root, mode 4755): "error setting permissions of
-      #     './usr/bin/mount': Operation not permitted".
-      # bin/ubx-scan-deb-ownership's scan trigger is therefore two-fold
-      # (non-root owner OR a set*id/sticky mode bit, see that script's own
-      # "MODE follow-up" header section) but the two properties are
-      # deferred by exactly the same mechanism below: OWNER always, and
-      # now MODE's special bits too, are never chown(2)/chmod(2)'d inside
-      # this chroot at all -- both instead travel, via the SAME manifest
-      # line, to squashfsImage's mksquashfs pseudo-file pass (PACK time),
-      # which writes final inode metadata directly with no chown(2)/
-      # chmod(2) syscall of any kind.
+      #     './usr/bin/mount': Operation not permitted";
+      #   - (GitHub issue #45, the canonicalization follow-up) this
+      #     derivation's own $out being canonicalized read-only by Nix at
+      #     registration time (see the "Nix canonicalizes every registered
+      #     store path read-only" comment below), which silently LOOSENS
+      #     a root:root file shipped more restrictive than the canonical
+      #     mode (e.g. 0600/0640 on something secrets-adjacent) up to
+      #     0444 -- turning on a read bit the package deliberately
+      #     withheld. Unlike the first two, dpkg's own unpack of such a
+      #     file never fails at all; the loss happens later, entirely
+      #     outside dpkg.
+      # bin/ubx-scan-deb-ownership's scan trigger is therefore three-fold
+      # (non-root owner, OR a set*id/sticky mode bit, OR real permission
+      # bits tighter than the canonical mode for that path's type -- see
+      # that script's own "MODE follow-up" and "CANONICALIZATION
+      # follow-up" header sections) but all three properties are deferred
+      # by exactly the same mechanism below: OWNER, MODE's special bits,
+      # and now also a too-tight plain mode, are never relied upon to
+      # survive as on-disk metadata inside this chroot/this derivation's
+      # $out -- all three instead travel, via the SAME manifest line, to
+      # squashfsImage's mksquashfs pseudo-file pass (PACK time), which
+      # writes final inode metadata directly with no chown(2)/chmod(2)
+      # syscall of any kind, and -- crucially for the third case -- runs
+      # on an INPUT store path, but produces its OWN, separate output
+      # image, so nothing about squashfsImage's own inode writes is
+      # itself subject to a second round of Nix store-path
+      # canonicalization the way composeRootfs's in-chroot chmod was.
       #
       # Both are ONE-BLOCK-PER-PACKAGE, generated over the SAME `indices`
       # or `checked`-derived order as debCopyLines/unpackLines above, for
@@ -322,10 +340,13 @@ let
       # scanLines runs BEFORE `${unpackLines}` (spliced below), for every
       # package, in the SAME pass:
       #   1. bin/ubx-scan-deb-ownership lists that package's selected
-      #      (non-root-owned and/or set*id/sticky) entries (empty output,
-      #      the common case, for every package in this project's proof
-      #      sets today -- htop/hello/libnl/tzdata ship nothing but plain
-      #      root:root files).
+      #      (non-root-owned, and/or set*id/sticky, and/or -- GitHub issue
+      #      #45 -- real permission bits tighter than the canonical mode
+      #      this store path's own file/directory would otherwise be
+      #      canonicalized to) entries (empty output, the common case, for
+      #      every package in this project's proof sets today --
+      #      htop/hello/libnl/tzdata ship nothing but plain root:root
+      #      files).
       #   2. each entry's path becomes a `path-exclude=` line in a dpkg
       #      config fragment (/etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes,
       #      read automatically by every dpkg invocation below, per

@@ -8,6 +8,7 @@
     "ed",
     "grub-common",
     "grub-pc-bin",
+    "grub2-common",
     "hello",
     "htop",
     "initramfs-tools",

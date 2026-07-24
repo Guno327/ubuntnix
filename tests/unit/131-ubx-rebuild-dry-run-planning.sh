@@ -24,6 +24,13 @@ work="$(mktemp -d)"
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
+# This file is about domain-planning/diff output, not soft-reboot
+# dispatch (see tests/unit/134-*.sh / 135-*.sh for that) -- the fixture
+# 'rebuild switch' calls below register a real generation with a new
+# rootfs image every time, which would otherwise try to invoke a real
+# `systemctl soft-reboot` (issue #30). Stub it out.
+export UBX_SOFT_REBOOT_CMD=true
+
 root="$work/gens"
 
 etc_a="$work/etc-a.json"

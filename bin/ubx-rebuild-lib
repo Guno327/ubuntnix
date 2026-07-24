@@ -200,16 +200,20 @@ UBX_REBUILD_EMPTY_USERS_MANIFEST='{"version": 1, "users": [], "groups": []}'
 # -- GRUB default marker ------------------------------------------------------
 #
 # Real bootloader integration (writing a GRUB environment block / calling
-# grub-editenv, grub-set-default, or equivalent) is soft-reboot/image-swap
-# adjacent activation work this issue explicitly defers (see bin/ubx's own
-# header, "Deferred to #30"). What IS this issue's job, and real today: the
+# grub-editenv, grub-set-default, or equivalent) is still future work — see
+# bin/ubx's own header. What IS this issue's job, and real today: the
 # durable on-disk RECORD of which generation is the GRUB default -- the
 # fact `switch`/`boot` set it and `test` never does is the behavior under
 # test, and it needs zero root/bootloader access to be correct. This marker
 # (`$ROOT/grub-default`, a bare generation number) is that record; a later
 # issue's real bootloader-install step is expected to read it the same way
 # bin/ubx-generations' own `current`/`previous` pointers are read today,
-# and to actually program the bootloader from it.
+# and to actually program the bootloader from it. Issue #30's own soft-
+# reboot activation path (see "Soft-reboot delta classification" below,
+# and bin/ubx's do_rebuild) is a SEPARATE mechanism from this marker: a
+# soft-reboot re-execs userspace into an already-registered generation's
+# rootfs image without ever touching the bootloader, so it neither reads
+# nor writes this file.
 ubx_rebuild_grub_default_path() {
   echo "$1/grub-default"
 }
@@ -287,4 +291,79 @@ ubx_rebuild_effective_booted() {
   else
     ubx_rebuild_read_pointer "$root" current
   fi
+}
+
+# -- Soft-reboot delta classification -----------------------------------------
+#
+# Issue #30: once a generation's rootfs image (and/or kernel) actually
+# changes, `switch`/`test` need to know WHICH of three activation paths
+# applies before bin/ubx decides whether/how to reboot:
+#
+#   kernel     the kernel store path differs. This OVERRIDES an image
+#              change: a new kernel can never be hot-swapped into a
+#              running system (there is no such thing as a live kernel
+#              soft-reboot for this project — see SPEC.md §4.3/§12 R3's
+#              "full reboot is the always-correct fallback"), so a kernel
+#              delta wins even if the rootfs image ALSO changed.
+#   image      the kernel is unchanged but the rootfs image path differs
+#              — the case `systemctl soft-reboot` exists for: userspace
+#              re-execs into the new image without a kernel reboot.
+#   live-only  neither changed; whatever this rebuild touched (etc,
+#              systemd, users) was fully handled by execute_domains
+#              already, no reboot of any kind is needed.
+#
+# OLD_GEN may be "" (the very first rebuild ever run against ROOT, before
+# any generation exists to diff against — see
+# ubx_rebuild_domain_refs' own handling of the same case). There is no
+# "old kernel"/"old image" to compare against, so this isn't really a
+# CHANGE at all; it's only ever classified "image" (a fresh rootfs image
+# is about to become live for the first time, worth calling out the same
+# way a real delta would be) when a new image was actually supplied, and
+# "live-only" otherwise (a --dry-run planning call, or a caller that
+# never passed generation-creation flags).
+# _ubx_rebuild_classify_delta_values OLD_KERNEL OLD_IMAGE NEW_KERNEL
+# NEW_IMAGE — the actual three-way decision above, factored out of
+# ubx_rebuild_classify_delta so a caller that does not (yet) have an
+# on-disk NEW generation to read a manifest from -- e.g. bin/ubx's own
+# `--dry-run` path, which registers no generation at all -- can classify
+# straight from the --rootfs-image/--kernel flags it was given, without
+# duplicating this logic. OLD_KERNEL/OLD_IMAGE empty is exactly "no old
+# generation" (see the public wrapper below for why that's "image" iff a
+# new image is present, else "live-only").
+_ubx_rebuild_classify_delta_values() {
+  local old_kernel="$1" old_image="$2" new_kernel="$3" new_image="$4"
+  if [ -z "$old_kernel" ] && [ -z "$old_image" ]; then
+    if [ -n "$new_image" ]; then
+      echo image
+    else
+      echo live-only
+    fi
+    return 0
+  fi
+
+  if [ "$new_kernel" != "$old_kernel" ]; then
+    echo kernel
+  elif [ "$new_image" != "$old_image" ]; then
+    echo image
+  else
+    echo live-only
+  fi
+}
+
+ubx_rebuild_classify_delta() {
+  local root="$1" old_gen="$2" new_gen="$3"
+  local old_mf new_mf old_kernel old_image new_kernel new_image
+  new_mf="$root/$new_gen/manifest"
+  new_kernel="$(ubx_rebuild_manifest_get "$new_mf" GEN_KERNEL_PATH)"
+  new_image="$(ubx_rebuild_manifest_get "$new_mf" GEN_ROOTFS_IMAGE)"
+
+  old_kernel=""
+  old_image=""
+  if [ -n "$old_gen" ]; then
+    old_mf="$root/$old_gen/manifest"
+    old_kernel="$(ubx_rebuild_manifest_get "$old_mf" GEN_KERNEL_PATH)"
+    old_image="$(ubx_rebuild_manifest_get "$old_mf" GEN_ROOTFS_IMAGE)"
+  fi
+
+  _ubx_rebuild_classify_delta_values "$old_kernel" "$old_image" "$new_kernel" "$new_image"
 }

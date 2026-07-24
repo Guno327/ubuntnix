@@ -28,6 +28,13 @@ work="$(mktemp -d)"
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
+# This file is about the GRUB-default marker, not soft-reboot dispatch
+# (see tests/unit/134-*.sh / 135-*.sh for that) -- every fixture
+# 'rebuild switch'/'test' below registers a new rootfs image, which would
+# otherwise try to invoke a real `systemctl soft-reboot` (issue #30).
+# Stub it out.
+export UBX_SOFT_REBOOT_CMD=true
+
 grub_default_of() { # ROOT
   local f="$1/grub-default"
   if [ -f "$f" ]; then cat "$f"; else echo "<unset>"; fi

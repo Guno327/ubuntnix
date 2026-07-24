@@ -282,7 +282,15 @@ let
         else throw "bootRootfs: bootSpec's kernel package(s) not in the given `packages` list: ${builtins.concatStringsSep ", " missing}";
 
       base = composeRootfs { inherit name preseed system; packages = checkedPackages; };
-      ubxScript = ../bin/ubx;
+      # The whole bin/ directory, not just bin/ubx: the CLI `source`s
+      # `ubx-rebuild-lib` from its own dir and shells out to sibling tools
+      # (ubx-etc/ubx-systemd/ubx-users/ubx-generations) by $bindir, so those
+      # must all be baked aboard or `ubx` fails at load (`set -euo pipefail`
+      # + a failed `source` -> non-zero exit; this is the #49 regression the
+      # QEMU e2e's `ubx --help` check catches). Nix store canonicalization
+      # preserves the exec-bit distinction, so the sourced-only *-lib files
+      # stay non-executable and the runnable tools stay executable.
+      ubxBin = ../bin;
 
       # The writable-state units (SPEC.md §4.2 lists /var, /home, /ubx,
       # /flake as writable paths): plain tmpfs mounts, ordered before
@@ -390,7 +398,7 @@ let
     runInUbuntuBase {
       inherit system;
       name = "boot-rootfs-${name}";
-      env = { inherit base ubxScript; };
+      env = { inherit base ubxBin; };
       script = ''
         ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
 
@@ -420,7 +428,7 @@ let
 
         # -- /ubx store skeleton + the CLI aboard (scope item 3) -----------
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/ubx/bin" "$out/ubx/store" "$out/ubx/var"
-        ubxrun "$UBX_BASE/bin/cp" "$ubxScript" "$out/ubx/bin/ubx"
+        ubxrun "$UBX_BASE/bin/cp" -a "$ubxBin/." "$out/ubx/bin/"
         ubxrun "$UBX_BASE/bin/chmod" +x "$out/ubx/bin/ubx"
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
         ubxrun "$UBX_BASE/bin/ln" -sf /ubx/bin/ubx "$out/usr/local/bin/ubx"

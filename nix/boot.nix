@@ -1508,15 +1508,15 @@ let
   #    rather than shelled out to that tool at Nix build time). Populated
   #    straight onto the ext4 populate tree (switchLoopVarStore, below).
   switchLoopGen1Files =
-    { rootfsImage, kernelPath, initrdPath }: ''
+    { }: ''
       ubxrun "$UBX_BASE/bin/mkdir" -p "$out/generations/1"
       ubxrun "$UBX_BASE/bin/cat" > "$out/generations/1/manifest" <<UBX_M2_MANIFEST_EOF
       GEN_INDEX=1
       GEN_TITLE=switch-loop proof baseline
       GEN_CREATED=1970-01-01T00:00:00Z
-      GEN_ROOTFS_IMAGE=${rootfsImage}
-      GEN_KERNEL_PATH=${kernelPath}
-      GEN_INITRD_PATH=${initrdPath}
+      GEN_ROOTFS_IMAGE=$rootfsImage
+      GEN_KERNEL_PATH=$kernelPath
+      GEN_INITRD_PATH=$initrdPath
       GEN_ROOT_DEVICE=/dev/vda2
       GEN_KERNEL_PARAMS=
       GEN_ETC_REF=/usr/local/share/ubx-switch-loop/gen1/etc-manifest.json
@@ -1541,10 +1541,18 @@ let
     runInUbuntuBase {
       inherit system;
       name = "switch-loop-var-store-${name}";
+      # rootfsImage/kernelPath/initrdPath are derivation-output store paths
+      # (string context). They must reach the script via ENV ATTRS, never
+      # interpolated into the script text, because `runInUbuntuBase` renders
+      # the script through `builtins.toFile`, which rejects any string
+      # carrying a reference to a derivation output (see nix/stdenv.nix's
+      # BOOTSTRAP CAVEAT note). The manifest heredoc below expands them as
+      # ordinary shell variables ($rootfsImage, ...).
+      env = { inherit rootfsImage kernelPath initrdPath; };
       script = ''
         ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
-        ${switchLoopGen1Files { inherit rootfsImage kernelPath initrdPath; }}
+        ${switchLoopGen1Files { }}
       '';
     };
 

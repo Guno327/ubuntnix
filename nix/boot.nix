@@ -1694,8 +1694,14 @@ let
         # ===== prepare scenario 3: `ubx rebuild test` + a deliberate change
         old_systemd_ref="$(manifest_get "$ROOT/3/ubx-extra" SYSTEMD_MANIFEST)"
         old_users_ref="$(manifest_get "$ROOT/3/manifest" GEN_USERS_MANIFEST)"
+        # Reuse scenario 2's generation-3 rootfs image (issue #55 replaced the
+        # baked $ASSETS/gen3/rootfs-image-marker file with a runtime-built
+        # squashfs held in $gen3_rootfs_image) so generation 4's image equals
+        # generation 3's -- keeping the gen3->gen4 delta etc-only/live, exactly
+        # as this scenario asserts (`test` applies live, never soft-reboots,
+        # never touches grub-default).
         "$UBX" rebuild test --root "$ROOT" \
-          --rootfs-image "$(cat "$ASSETS/gen3/rootfs-image-marker")" \
+          --rootfs-image "$gen3_rootfs_image" \
           --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
           --root-device /dev/vda2 \
           --etc-ref "$ASSETS/gen4/etc-manifest.json" \

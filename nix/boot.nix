@@ -270,6 +270,18 @@ let
     , preseed ? { }
     , generationIndex ? 1
     , withE2eAssertService ? false
+    # extraFilesScript — an arbitrary extra chunk of `ubxrun`-style shell,
+    # spliced in AFTER every other file this function writes (see below).
+    # Exists so a SECOND proof (nix/boot.nix's own switch-loop-proof,
+    # GitHub issue #32, milestone M2) can layer its own additional files
+    # — apt/dpkg/snap guard diversions, the switch-loop fixture assets,
+    # the ext4 `/ubx/var` mountpoint + mount unit, the guest driver script
+    # and its unit — onto the SAME bootRootfs machinery M1's own
+    # boot-image-proof uses, without this function needing to know
+    # anything about M2's concerns itself (mirrors `withE2eAssertService`'s
+    # own "proof-only, additive" posture). Empty by default: M1's own
+    # boot-image-proof passes nothing here and is completely unaffected.
+    , extraFilesScript ? ""
     , system ? "x86_64-linux"
     }:
     let
@@ -291,6 +303,29 @@ let
       # preserves the exec-bit distinction, so the sourced-only *-lib files
       # stay non-executable and the runnable tools stay executable.
       ubxBin = ../bin;
+
+      # bin/ubx-etc's `plan` subcommand defaults `--exceptions` (when the
+      # caller -- here, every `ubx rebuild switch|test`/`ubx rollback`
+      # invocation that declares an etc domain -- doesn't pass one
+      # explicitly) to `default_exceptions_file`, which resolves to
+      # "$(dirname "$0")/../etc.exceptions.json" i.e. ONE LEVEL UP FROM
+      # WHATEVER DIRECTORY `ubx` ITSELF RUNS FROM (bin/ubx-etc's own
+      # comment: "mirrors bin/ubx-generations' UBX_GEN_ROOT-vs-default
+      # pattern for the one path this script needs a default for"). On
+      # this image `ubx` runs as /ubx/bin/ubx, so that default resolves to
+      # /ubx/etc.exceptions.json -- a path nothing used to write here, even
+      # though only bin/ (ubxBin, above) is baked aboard, never the repo
+      # root the real etc.exceptions.json lives in. Any real `ubx rebuild`
+      # call that declares an etc domain and doesn't pass --etc-exceptions
+      # explicitly (the switch-loop-proof's own driver script doesn't; see
+      # nix/boot.nix's switch-loop-proof section) dies inside
+      # `ubx-etc plan` with "no such file: /ubx/etc.exceptions.json" before
+      # ever reaching the systemd/users domains -- this was the root cause
+      # of the M2 switch-loop e2e's scenario 1 "ubx rebuild switch exited
+      # 1" failure (UBX-M2-S1-FAIL). Baking the repo's own
+      # etc.exceptions.json to that exact path fixes it for every
+      # bootRootfs-based image, not just this proof.
+      etcExceptionsContent = builtins.readFile ../etc.exceptions.json;
 
       # The writable-state units (SPEC.md §4.2 lists /var, /home, /ubx,
       # /flake as writable paths): plain tmpfs mounts, ordered before
@@ -369,16 +404,43 @@ let
 
       writeUnitLines = builtins.concatStringsSep "\n" (map
         (path:
-          let slug = builtins.replaceStrings [ "/" ] [ "-" ] path; in
+          # systemd REQUIRES a .mount unit's filename to equal the escaped
+          # form of its `Where=` path (systemd.mount(5) / systemd-escape -p
+          # --suffix=mount): "/tmp" -> "tmp.mount", "/home" -> "home.mount",
+          # "/ubx/var" -> "ubx-var.mount". A mount unit whose name does NOT
+          # match its Where= is silently REJECTED by systemd -- which is
+          # exactly why these tmpfs writable-state mounts (formerly named
+          # "ubx-tmp.mount" &c.) never actually took effect, leaving /tmp,
+          # /var and /home on the read-only squashfs. The M1 boot e2e never
+          # wrote to them so it passed regardless; the M2 switch-loop e2e's
+          # `ubx rebuild switch` is the first thing to `mktemp -d` in /tmp,
+          # which surfaced the bug (issue #32). The escaped name for these
+          # single- and multi-segment absolute paths is the path with its
+          # leading slash dropped and remaining slashes turned into dashes
+          # (neither /tmp nor /home contains a literal dash to \x2d-escape).
+          #
+          # NOTE /var is deliberately NOT in the list below: it carries the
+          # compose-time-baked dpkg status database (/var/lib/dpkg) that the
+          # apt/dpkg guards' pass-through READ verbs (`apt-get list`,
+          # `dpkg -l`; SPEC.md §7 / switch-loop scenario 5) need to succeed.
+          # An empty tmpfs would mask it. It stays read-only squashfs here;
+          # a writable-yet-content-preserving /var (overlay or partition,
+          # SPEC.md §4.2) is deferred with the writable generated /etc work.
+          # /tmp must be a real tmpfs (ubx's `mktemp -d`), /home is writable
+          # per §4.2 and empty is harmless (no scenario writes it).
+          let
+            rel = builtins.substring 1 (builtins.stringLength path) path;
+            unitName = (builtins.replaceStrings [ "/" ] [ "-" ] rel) + ".mount";
+          in
           ''
-            ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx${slug}.mount" <<'UBX_UNIT_EOF'
+            ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/${unitName}" <<'UBX_UNIT_EOF'
             ${mountUnit path}
             UBX_UNIT_EOF
             ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/local-fs.target.wants"
-            ubxrun "$UBX_BASE/bin/ln" -sf "../ubx${slug}.mount" \
-              "$out/etc/systemd/system/local-fs.target.wants/ubx${slug}.mount"
+            ubxrun "$UBX_BASE/bin/ln" -sf "../${unitName}" \
+              "$out/etc/systemd/system/local-fs.target.wants/${unitName}"
           '')
-        [ "/var" "/tmp" "/home" ]);
+        [ "/tmp" "/home" ]);
 
       e2eLines =
         if !withE2eAssertService then "" else ''
@@ -433,6 +495,16 @@ let
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
         ubxrun "$UBX_BASE/bin/ln" -sf /ubx/bin/ubx "$out/usr/local/bin/ubx"
 
+        # bin/ubx-etc's default --exceptions path (see the etcExceptionsContent
+        # comment above) resolves to /ubx/etc.exceptions.json when `ubx` runs
+        # as /ubx/bin/ubx -- bake the repo's real etc.exceptions.json there so
+        # any `ubx rebuild`/`ubx rollback` call that declares an etc domain
+        # without an explicit --etc-exceptions still finds a real file instead
+        # of dying with "no such file".
+        ubxrun "$UBX_BASE/bin/cat" > "$out/ubx/etc.exceptions.json" <<'UBX_ETC_EXCEPTIONS_EOF'
+        ${etcExceptionsContent}
+        UBX_ETC_EXCEPTIONS_EOF
+
         # -- the per-generation marker (SPEC.md §4.3's generation model,
         #    kept intentionally tiny for M1 -- a real generation manifest
         #    is GitHub issue #25/M2 scope). "current" plus one marker file
@@ -455,6 +527,8 @@ let
         ${writeUnitLines}
 
         ${e2eLines}
+
+        ${extraFilesScript}
       '';
     };
 
@@ -897,6 +971,932 @@ let
         ubxrun "$UBX_BASE/bin/cp" disk.img "$out/disk.img"
       '';
     };
+
+  # ===========================================================================
+  # switch-loop-proof — SPEC.md §11 M2 exit criterion's QEMU end-to-end
+  # exercise (GitHub issue #32): "NixOS-parity switch loop for
+  # config/service/user domains; image swap via soft-reboot; `test` reverts
+  # on reboot; demonstrated offline rollback". Everything below builds ONE
+  # additional flake output, `packages.switch-loop-proof`, alongside (never
+  # instead of) M1's own `boot-image-proof` -- nothing here touches that
+  # proof's own derivations.
+  #
+  # -- The two crux design decisions (see also tests/e2e/020-qemu-switch-
+  #    e2e.sh's own header, and this repo's PM-facing task notes for #32) --
+  #
+  # 1. PERSISTENCE ACROSS REBOOTS. `ubx rebuild test` reverting on reboot,
+  #    and offline `ubx rollback` surviving one, both need real on-disk
+  #    state that SURVIVES a guest-initiated reboot -- M1's own image has
+  #    no such thing (its `/ubx` tree is baked read-only into the squashfs;
+  #    its `/var`/`/tmp`/`/home` "writable state" is tmpfs, wiped every
+  #    boot). This proof adds a THIRD disk partition -- ext4, built with
+  #    `mke2fs -d` (populate-without-mounting, the exact ext-side analogue
+  #    of `diskImage`'s own FAT/mtools trick -- see that function's header)
+  #    -- mounted at `/ubx/var` (bin/ubx-rebuild-lib's own default
+  #    generations root is `/ubx/var/generations`, so this is the natural,
+  #    minimal writable slice: `/ubx/bin` itself, and every switch-loop
+  #    fixture asset under `/usr/local/share/ubx-switch-loop`, stay in the
+  #    ordinary read-only squashfs). tests/e2e/020-qemu-switch-e2e.sh is
+  #    the host side of this: it boots the SAME writable disk file
+  #    multiple times in a row (no `snapshot=on`), relying on `-no-reboot`
+  #    to make qemu exit every time the guest reboots, and re-launching on
+  #    the same file each time.
+  #
+  #    A real `/etc/systemd/system` write (bin/ubx-systemd-apply --apply's
+  #    default `--unit-dir`) is NOT attempted against this image's actual
+  #    `/etc` (still read-only squashfs, exactly like M1 -- a real
+  #    writable-`/etc` overlay is bigger, separate follow-up work, not
+  #    required for this issue's own exit criterion). The guest driver
+  #    below instead applies to `/run/systemd/system` -- systemd's own,
+  #    always-writable (tmpfs, mounted before almost anything else) SECOND
+  #    unit search path, real `systemctl`/unit-activation semantics with no
+  #    partition-layout surgery required. This is why scenario 3 (below)
+  #    asserts the DURABLE `grub-default`/generation-pointer bookkeeping
+  #    bin/ubx-rebuild-lib actually owns today, not "the live unit tree
+  #    survived a reboot" (`/run` is tmpfs BY DESIGN and is never expected
+  #    to survive one, on this image or any real systemd system).
+  #
+  # 2. WHERE ALTERNATE GENERATIONS COME FROM. No `nix build` runs inside
+  #    QEMU (would need the full flake archive aboard and blow the e2e
+  #    timeout). Instead: generation 1's manifest is hand-written directly
+  #    onto the ext4 `/ubx/var` populate tree at NIX BUILD TIME, in EXACTLY
+  #    the on-disk shape `bin/ubx-generations create` itself produces (see
+  #    `switchLoopGen1Files` below) -- deliberately NOT by invoking
+  #    `bin/ubx-generations` as a subprocess inside the Nix sandbox (it
+  #    calls bare `mktemp`/`awk`/`date` etc. by name, which are not
+  #    reliably on `PATH` inside `runInUbuntuBase`'s minimal build
+  #    environment -- see nix/stdenv.nix's own "BOOTSTRAP CAVEAT"). Every
+  #    LATER generation (2, 3, 4) is instead created FOR REAL, at QEMU
+  #    BOOT TIME, by the guest driver script actually invoking
+  #    `ubx rebuild switch|test` against read-only fixture manifests baked
+  #    into the squashfs at `/usr/local/share/ubx-switch-loop/genN/*` --
+  #    this is the real code path SPEC.md §11 M2 needs exercised, and
+  #    matches this issue's own instruction: pre-bake ASSETS, run the real
+  #    verbs BETWEEN them.
+  #
+  # -- What's a faithful exercise of real code vs. a documented stand-in ---
+  #
+  #  - `ubx rebuild switch|test`, `ubx rollback`, the GRUB-default/booted/
+  #    current bookkeeping, `ubx-systemd` plan+apply (real content, real
+  #    `systemctl`), `ubx-users` plan (real) + the emitted activation
+  #    script (run for real by the driver -- `ubx-users execute` itself
+  #    only ever EMITS a script, by design; see bin/ubx-rebuild-lib's
+  #    header), and the apt/dpkg/snap guards (real scripts, real
+  #    diversion) are ALL exercised for real here.
+  #  - `/etc` activation has NO executor yet (`bin/ubx-etc-apply` does not
+  #    exist -- bin/ubx's own header calls this out explicitly); this
+  #    proof's etc-domain fixtures exist only to exercise the real
+  #    touched-domains PLAN/report bookkeeping, never a live file write.
+  #  - Soft-reboot (scenario 2) invokes `$UBX_SOFT_REBOOT_CMD soft-reboot`
+  #    via a STUB (`ubx-soft-reboot-stub`, just drops a marker file),
+  #    exactly the way bin/ubx's own header documents `UBX_SOFT_REBOOT_CMD`
+  #    existing FOR: "overridable so unit tests can substitute a stub
+  #    script ... which this test harness's containers/CI runners have
+  #    neither the privilege nor the systemd version for". A real
+  #    `systemctl soft-reboot` needs `/run/nextroot` staged with an actual
+  #    alternate rootfs to re-exec into, which is bigger follow-up work
+  #    this issue does not attempt; what IS real here is the delta
+  #    classification that DECIDES to call it (`ubx_rebuild_classify_delta`)
+  #    and the fact that it's called at all for an image-only delta.
+  #    "Package present" for the swapped generation is represented by a
+  #    real, sha256-verified systemd unit's content actually landing and
+  #    starting (the one domain with a real executor today), standing in
+  #    for a literal `.deb` until a real per-generation image-swap
+  #    executor exists.
+  #
+  # See tests/e2e/020-qemu-switch-e2e.sh's own header for the host-side
+  # orchestration this feeds, and `switchLoopDriverScript` below for the
+  # exact guest-side phase machinery and scenario-by-scenario assertions.
+
+  # -- systemd "canary" units: the switch-loop proof's stand-in for real
+  #    application units, existing purely so a switch/test/rollback can be
+  #    observed to have (or have not) touched them. --------------------
+  switchLoopUnitContent = description: markerPath: ''
+    [Unit]
+    Description=${description}
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/sh -c 'mkdir -p /run/ubx-switch-loop && date +%s > ${markerPath}'
+
+    [Install]
+    WantedBy=multi-user.target
+  '';
+
+  switchLoopCanaryA = switchLoopUnitContent
+    "ubx switch-loop proof: canary A (declared in every generation, content never changes)"
+    "/run/ubx-switch-loop/canary-a-ran";
+  switchLoopCanaryBGen1 = switchLoopUnitContent
+    "ubx switch-loop proof: canary B (generation 1 baseline content)"
+    "/run/ubx-switch-loop/canary-b-ran";
+  switchLoopCanaryBGen2 = switchLoopUnitContent
+    "ubx switch-loop proof: canary B (generation 2 -- CHANGED content, scenario 1's restart target)"
+    "/run/ubx-switch-loop/canary-b-gen2-ran";
+  switchLoopCanaryCGen3 = switchLoopUnitContent
+    "ubx switch-loop proof: canary C (new in generation 3 -- scenario 2's 'package landed' stand-in)"
+    "/run/ubx-switch-loop/canary-c-ran";
+
+  # -- fixture manifest builders (bin/ubx-etc / bin/ubx-systemd /
+  #    bin/ubx-users' own JSON schemas -- see each script's header) -------
+  switchLoopSha256 = builtins.hashString "sha256";
+
+  switchLoopSystemdUnitEntry = { name, content, enable ? true, mask ? false }: {
+    inherit name;
+    class = "service";
+    refuseRestart = false;
+    hasContent = true;
+    sha256 = switchLoopSha256 content;
+    inherit enable mask;
+  };
+
+  switchLoopEtcEntry = path: content: {
+    inherit path;
+    sha256 = switchLoopSha256 content;
+    owner = "root";
+    group = "root";
+    mode = "0644";
+  };
+
+  switchLoopUsersEntry = name: {
+    inherit name;
+    uid = null;
+    system = false;
+    shell = "/usr/bin/bash";
+    home = null;
+    createHome = false;
+    groups = [ ];
+    authorizedKeys = [ ];
+  };
+
+  # -- the four generations' domain manifests (gen1's are also the "real,
+  #    baked baseline" this image boots with; gen2/gen3/gen4's are read-
+  #    only fixtures the guest driver feeds to real `ubx rebuild` calls --
+  #    see this section's own header, decision 2). --------------------
+  switchLoopGen1EtcManifest = builtins.toJSON { version = 1; entries = [ ]; };
+  switchLoopGen2EtcManifest = builtins.toJSON {
+    version = 1;
+    entries = [ (switchLoopEtcEntry "switch-loop/hello.txt" "hello v2\n") ];
+  };
+  # No etc change for scenario 2 (image swap) -- same declared content as
+  # generation 2.
+  switchLoopGen3EtcManifest = switchLoopGen2EtcManifest;
+  switchLoopGen4EtcManifest = builtins.toJSON {
+    version = 1;
+    entries = [
+      (switchLoopEtcEntry "switch-loop/hello.txt" "hello v2\n")
+      (switchLoopEtcEntry "switch-loop/test-marker.txt" "test v4 -- scenario 3's deliberate change\n")
+    ];
+  };
+
+  switchLoopGen1SystemdManifest = builtins.toJSON {
+    version = 1;
+    units = [
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-a.service"; content = switchLoopCanaryA; })
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-b.service"; content = switchLoopCanaryBGen1; })
+    ];
+  };
+  switchLoopGen2SystemdManifest = builtins.toJSON {
+    version = 1;
+    units = [
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-a.service"; content = switchLoopCanaryA; })
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-b.service"; content = switchLoopCanaryBGen2; })
+    ];
+  };
+  switchLoopGen3SystemdManifest = builtins.toJSON {
+    version = 1;
+    units = [
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-a.service"; content = switchLoopCanaryA; })
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-b.service"; content = switchLoopCanaryBGen2; })
+      (switchLoopSystemdUnitEntry { name = "ubx-m2-canary-c.service"; content = switchLoopCanaryCGen3; })
+    ];
+  };
+
+  switchLoopGen1UsersManifest = builtins.toJSON { version = 1; users = [ ]; groups = [ ]; };
+  switchLoopGen2UsersManifest = builtins.toJSON {
+    version = 1;
+    users = [ (switchLoopUsersEntry "ubxm2test") ];
+    groups = [ ];
+  };
+
+  # -- the extra-files script layered onto bootRootfs (via its
+  #    `extraFilesScript` parameter) for the switch-loop proof only -------
+  #
+  # Writes, in order: (1) the baseline canary-a/b systemd units for real
+  # (so generation 1's OWN declared state matches boot reality); (2) the
+  # apt/dpkg/snap guard diversions (SPEC.md §7; bin/ubx-guard-* scripts
+  # already exist and are unit-tested -- docs/guards.md's own "deferred
+  # until issue #10's file-injection mechanism lands" now applies, since
+  # that mechanism is exactly bootRootfs's own file-writing pattern this
+  # whole section reuses); (3) every generation's fixture manifests +
+  # systemd content dirs under /usr/local/share/ubx-switch-loop; (4) the
+  # soft-reboot stub; (5) the `/ubx/var` mountpoint directory (the ext4
+  # partition itself is populated and attached by `switchLoopDiskImage`,
+  # not here -- this only needs the empty mountpoint to exist inside the
+  # squashfs); (6) the guest driver script + its two units (the mount unit
+  # and the driver's own oneshot service).
+  switchLoopExtraFilesScript = ''
+    # -- (1) generation 1's baseline systemd unit CONTENT, baked as a
+    #    read-only fixture under gen1/systemd-content (NOT into /etc). The
+    #    baseline is established at RUNTIME by the guest driver copying
+    #    these into /run/systemd/system before the gen1->gen2 switch (see
+    #    switchLoopDriverScript's phase 0). This matters for correctness:
+    #    the switch installs the CHANGED canary-b into that same
+    #    /run/systemd/system dir, and a baseline baked into the read-only
+    #    /etc/systemd/system would SHADOW it -- /etc outranks /run in
+    #    systemd's unit search path -- so `systemctl restart` would re-run
+    #    the OLD content and canary-b's changed content would never activate
+    #    (the S1 failure this replaces). Keeping every unit the switch
+    #    touches in /run lets the override actually take effect.
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content/ubx-m2-canary-a.service" <<'UBX_M2_UNIT_EOF'
+    ${switchLoopCanaryA}
+    UBX_M2_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content/ubx-m2-canary-b.service" <<'UBX_M2_UNIT_EOF'
+    ${switchLoopCanaryBGen1}
+    UBX_M2_UNIT_EOF
+
+    # -- (2) apt/dpkg/snap mutation guards (SPEC.md §7, bin/ubx-guard-lib's
+    #    documented install contract: divert the real binary aside, install
+    #    the guard under the original name, tell it where the real binary
+    #    went via UBX_GUARD_REAL_BIN). `dpkg` is Ubuntu-essential and is
+    #    always present; `apt`/`apt-get` ship with the ubuntu-base tarball
+    #    itself (archive.lock.json's own 169-package "public" set is
+    #    ADDITIONAL debs layered on top of that base, not the base's own
+    #    essential set -- see nix/archive.nix's header) but this script
+    #    checks for them defensively rather than assuming, so a future base
+    #    tarball without them fails soft (a clear warning + an un-diverted
+    #    guard at /usr/local/bin instead of a hard build failure). ---------
+    ubx_m2_install_guard() {
+      # $1 = real command name, $2 = guard script name under /ubx/bin
+      real_path="$out/usr/bin/$1"
+      if [ -e "$real_path" ] && [ ! -L "$real_path" ]; then
+        ubxrun "$UBX_BASE/bin/mv" "$real_path" "$real_path.ubx-real"
+        # UBX_GUARD_REAL_BIN must be the RUNTIME path of the diverted binary
+        # (/usr/bin/<cmd>.ubx-real once this rootfs is the live root), NOT
+        # the build-time "$out"-prefixed store path -- baking the latter
+        # made pass-through read verbs fail at runtime with "UBX_GUARD_REAL_BIN
+        # =/nix/store/...-boot-rootfs.../usr/bin/apt.ubx-real is not an
+        # executable file" (that store path is not mounted on the booted
+        # guest). Blocked verbs never deref it, which is why only the read
+        # verbs surfaced the bug. The heredoc is unquoted, so $1 expands to
+        # the command name at build time.
+        ubxrun "$UBX_BASE/bin/cat" > "$real_path" <<UBX_M2_GUARD_EOF
+    #!/bin/sh
+    export UBX_GUARD_REAL_BIN=/usr/bin/$1.ubx-real
+    exec /ubx/bin/$2 "\$@"
+    UBX_M2_GUARD_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$real_path"
+      else
+        echo "switch-loop-proof: WARNING: $real_path not found in the composed image -- installing the $2 guard at /usr/local/bin/$1 instead, with no real binary to divert (UBX_GUARD_REAL_BIN=/bin/true)" >&2
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
+        ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/$1" <<UBX_M2_GUARD_EOF
+    #!/bin/sh
+    export UBX_GUARD_REAL_BIN=/bin/true
+    exec /ubx/bin/$2 "\$@"
+    UBX_M2_GUARD_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/$1"
+      fi
+    }
+    ubx_m2_install_guard apt ubx-guard-apt
+    ubx_m2_install_guard apt-get ubx-guard-apt
+    ubx_m2_install_guard dpkg ubx-guard-dpkg
+    # `snap` is M3 scope (never composed into this image at all) -- the
+    # guard is still installed, at /usr/local/bin (nothing to divert), so
+    # scenario 5's "snap mutation attempts blocked" exercises the real
+    # bin/ubx-guard-snap decision logic against a blocked (mutating) verb,
+    # which never needs a real snapd underneath it to refuse correctly.
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/snap" <<'UBX_M2_GUARD_EOF'
+    #!/bin/sh
+    export UBX_GUARD_REAL_BIN=/bin/true
+    exec /ubx/bin/ubx-guard-snap "$@"
+    UBX_M2_GUARD_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/snap"
+
+    # -- (3) per-generation fixture manifests + systemd content dirs -----
+    ubxrun "$UBX_BASE/bin/mkdir" -p \
+      "$out/usr/local/share/ubx-switch-loop/gen1" \
+      "$out/usr/local/share/ubx-switch-loop/gen2/systemd-content" \
+      "$out/usr/local/share/ubx-switch-loop/gen3/systemd-content" \
+      "$out/usr/local/share/ubx-switch-loop/gen4"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/etc-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen1EtcManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/systemd-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen1SystemdManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/users-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen1UsersManifest}
+    UBX_M2_JSON_EOF
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/etc-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen2EtcManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/systemd-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen2SystemdManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/users-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen2UsersManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/systemd-content/ubx-m2-canary-b.service" <<'UBX_M2_UNIT_EOF'
+    ${switchLoopCanaryBGen2}
+    UBX_M2_UNIT_EOF
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/etc-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen3EtcManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/systemd-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen3SystemdManifest}
+    UBX_M2_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/systemd-content/ubx-m2-canary-c.service" <<'UBX_M2_UNIT_EOF'
+    ${switchLoopCanaryCGen3}
+    UBX_M2_UNIT_EOF
+    # A plain marker string standing in for "a different rootfs image
+    # store path" -- ubx_rebuild_classify_delta only ever compares this
+    # value for (in)equality against generation 1/2's own GEN_ROOTFS_IMAGE
+    # field (see this section's own header, decision 2); it is never
+    # dereferenced as a real path by anything in this proof.
+    printf 'ubx-m2-switch-loop-gen3-rootfs-image-marker\n' \
+      > "$out/usr/local/share/ubx-switch-loop/gen3/rootfs-image-marker"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen4/etc-manifest.json" <<'UBX_M2_JSON_EOF'
+    ${switchLoopGen4EtcManifest}
+    UBX_M2_JSON_EOF
+
+    # -- (4) the soft-reboot stub (see this section's own header) --------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-soft-reboot-stub" <<'UBX_M2_SCRIPT_EOF'
+    #!/bin/sh
+    # Stands in for `systemctl soft-reboot` (see nix/boot.nix's
+    # switch-loop-proof section header, decision 2, and bin/ubx's own
+    # UBX_SOFT_REBOOT_CMD documentation for why this project's own test
+    # environments already substitute a stub for the real command).
+    mkdir -p /run/ubx-switch-loop
+    : > /run/ubx-switch-loop/soft-reboot-invoked
+    exit 0
+    UBX_M2_SCRIPT_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-soft-reboot-stub"
+
+    # -- (5) the /ubx/var mountpoint (the ext4 partition's own content is
+    #    populated and attached by switchLoopDiskImage/switchLoopVarStore,
+    #    not here) -----------------------------------------------------
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/ubx/var"
+
+    # -- (6) the ext4 mount unit + the guest driver + its unit -----------
+    #
+    # Unit filename MUST equal the systemd-escaped form of `Where=`
+    # (systemd.mount(5)): "/ubx/var" -> "ubx-var.mount" (leading slash
+    # stripped, remaining slashes become dashes) -- unlike an arbitrary
+    # name, this one systemd requires exactly.
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-var.mount" <<'UBX_M2_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix M2 switch-loop proof: persistent /ubx/var (ext4, GitHub issue #32)
+    DefaultDependencies=no
+    Before=local-fs.target
+
+    [Mount]
+    What=/dev/vda3
+    Where=/ubx/var
+    Type=ext4
+    Options=defaults
+
+    [Install]
+    WantedBy=local-fs.target
+    UBX_M2_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/local-fs.target.wants"
+    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-var.mount \
+      "$out/etc/systemd/system/local-fs.target.wants/ubx-var.mount"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-switch-loop-driver" <<'UBX_M2_DRIVER_EOF'
+    ${switchLoopDriverScript}
+    UBX_M2_DRIVER_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-switch-loop-driver"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-switch-loop-driver.service" <<'UBX_M2_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix M2 switch-loop proof driver (tests/e2e/020-qemu-switch-e2e.sh; GitHub issue #32)
+    After=ubx-var.mount multi-user.target
+    Requires=ubx-var.mount multi-user.target
+
+    [Service]
+    Type=oneshot
+    StandardOutput=journal+console
+    StandardError=journal+console
+    ExecStart=/usr/local/bin/ubx-switch-loop-driver
+
+    [Install]
+    WantedBy=multi-user.target
+    UBX_M2_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/multi-user.target.wants"
+    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-switch-loop-driver.service \
+      "$out/etc/systemd/system/multi-user.target.wants/ubx-switch-loop-driver.service"
+  '';
+
+  # -- the guest driver script itself: reads/advances a phase counter on
+  #    the persistent /ubx/var/switch-loop/phase file, and runs exactly
+  #    that phase's scenario(s) -- see this section's own header for the
+  #    full phase-by-phase design (why S1/S2/S5 land in phase 0, S3 needs
+  #    phase 1 after a real reboot, S4 needs phase 2 after a second one).
+  switchLoopDriverScript = ''
+    #!/bin/bash
+    # /usr/local/bin/ubx-switch-loop-driver -- see nix/boot.nix's
+    # switch-loop-proof section (GitHub issue #32) for the full design.
+    # Runs once per boot (ubx-switch-loop-driver.service, WantedBy
+    # multi-user.target); dispatches on a persistent phase counter so it
+    # picks up exactly where the previous boot left off.
+    set -u
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    ASSETS=/usr/local/share/ubx-switch-loop
+    ROOT=/ubx/var/generations
+    STATE=/ubx/var/switch-loop
+    UBX=/ubx/bin/ubx
+
+    mkdir -p "$STATE"
+    phase_file="$STATE/phase"
+    phase=0
+    [ -f "$phase_file" ] && phase="$(cat "$phase_file")"
+
+    mark_fail() { # SCENARIO REASON
+      echo "UBX-M2-$1-FAIL: $2"
+
+      # Surface diagnostic context to the serial console (this script's
+      # stdout) before powering off -- otherwise the only artifact CI
+      # keeps is the one-line marker above and the actual command output
+      # that explains the failure is lost with the ephemeral guest disk.
+      echo "----- BEGIN mark_fail diagnostics -----"
+
+      # Best effort: pull an explicit "... -- see <path>.log" reference
+      # out of the reason string and dump that file first.
+      referenced_log="$(printf '%s\n' "$2" | grep -o '[^ ]*\.log' | tail -n 1)"
+      if [ -n "$referenced_log" ] && [ -f "$referenced_log" ]; then
+        echo "----- BEGIN $referenced_log -----"
+        tail -n 200 "$referenced_log"
+        echo "----- END $referenced_log -----"
+      elif [ -n "$referenced_log" ]; then
+        echo "(referenced log $referenced_log not found)"
+      fi
+
+      echo "----- BEGIN ls -la $STATE -----"
+      ls -la "$STATE" 2> /dev/null
+      echo "----- END ls -la $STATE -----"
+
+      # Fallback: dump every *.log under STATE so nothing is missed even
+      # if the reason string didn't name one (or named one we already
+      # printed above -- duplication here is cheap and safer than a gap).
+      for f in "$STATE"/*.log; do
+        [ -f "$f" ] || continue
+        echo "----- BEGIN $f -----"
+        tail -n 200 "$f"
+        echo "----- END $f -----"
+      done
+
+      echo "----- END mark_fail diagnostics -----"
+      sync
+      systemctl poweroff
+      exit 0
+    }
+
+    advance() { # NEXT_PHASE
+      printf '%s' "$1" > "$phase_file"
+    }
+
+    manifest_get() { # FILE KEY
+      [ -f "$1" ] || { echo ""; return 0; }
+      awk -v key="$2" 'BEGIN{p=key"="} index($0,p)==1{print substr($0,length(p)+1); f=1; exit} END{if(!f) print ""}' "$1"
+    }
+
+    gen1_rootfs_image="$(manifest_get "$ROOT/1/manifest" GEN_ROOTFS_IMAGE)"
+    gen1_kernel="$(manifest_get "$ROOT/1/manifest" GEN_KERNEL_PATH)"
+    gen1_initrd="$(manifest_get "$ROOT/1/manifest" GEN_INITRD_PATH)"
+
+    # Make /etc and /var writable for this boot without losing their
+    # compose-time-baked content: copy each read-only squashfs dir into
+    # tmpfs and bind-mount the copy back over itself.
+    #   /etc -- the users domain's real activation runs useradd/usermod,
+    #     which rewrite /etc/passwd (and group/shadow) via an atomic
+    #     create-temp-then-rename; that needs a writable /etc DIRECTORY (not
+    #     just writable files, so a per-file bind would not suffice), and
+    #     `getent passwd` reads the same /etc/passwd, so it then sees the
+    #     live user.
+    #   /var -- the apt/dpkg guards' pass-through READ verbs (`apt-get
+    #     list`, `dpkg -l`; SPEC.md §7 / scenario 5) read the baked
+    #     /var/lib/dpkg database AND apt opens writable locks under
+    #     /var/lib/apt even to list, so /var must be writable yet keep its
+    #     baked content. An empty tmpfs would destroy the db, which is why
+    #     /var is deliberately NOT in bootRootfs's tmpfs list (it stays
+    #     read-only squashfs at boot); the copy here preserves the db and
+    #     the bind makes it writable.
+    # A real ubuntnix system gets writable generated /etc + /var from the
+    # generation machinery / writable partitions (SPEC.md §4.2; the /etc
+    # executor is issue #54); this stands in so the users primitive and the
+    # read-verb guards -- SPEC.md §11 M2 -- are demonstrated for real. Each
+    # is guarded by a /run marker so it runs once per boot (idempotent
+    # across the driver's phase-by-phase re-runs).
+    for ubx_wdir in etc var; do
+      if [ ! -e "/run/ubx-$ubx_wdir-bound" ]; then
+        mkdir -p "/run/ubx-$ubx_wdir-writable"
+        cp -a "/$ubx_wdir/." "/run/ubx-$ubx_wdir-writable/"
+        mount --bind "/run/ubx-$ubx_wdir-writable" "/$ubx_wdir"
+        : > "/run/ubx-$ubx_wdir-bound"
+      fi
+    done
+
+    case "$phase" in
+      0)
+        # ================= scenario 1: config/service/user switch ======
+        # Establish generation 1's baseline systemd units in the writable,
+        # always-present /run/systemd/system (rather than baking them into
+        # the read-only /etc, which would outrank /run and shadow the
+        # switch's own write below -- see the extraFilesScript's block (1)),
+        # then start them so the gen1->gen2 switch has a real prior state to
+        # converge FROM.
+        mkdir -p /run/systemd/system
+        cp "$ASSETS/gen1/systemd-content/ubx-m2-canary-a.service" \
+           "$ASSETS/gen1/systemd-content/ubx-m2-canary-b.service" \
+           /run/systemd/system/
+        systemctl daemon-reload
+        systemctl start ubx-m2-canary-a.service ubx-m2-canary-b.service
+        [ -f /run/ubx-switch-loop/canary-a-ran ] || mark_fail S1 "baseline canary-a did not run when established in /run"
+        [ -f /run/ubx-switch-loop/canary-b-ran ] || mark_fail S1 "baseline canary-b did not run when established in /run"
+
+        ts_a_before="$(stat -c %Y /run/ubx-switch-loop/canary-a-ran 2>/dev/null || echo 0)"
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$gen1_rootfs_image" --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
+          --root-device /dev/vda2 \
+          --etc-ref "$ASSETS/gen2/etc-manifest.json" \
+          --systemd-ref "$ASSETS/gen2/systemd-manifest.json" \
+          --users-manifest "$ASSETS/gen2/users-manifest.json" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --systemd-content-dir "$ASSETS/gen2/systemd-content" \
+          --users-out "$STATE/gen2-users-activate.sh" \
+          > "$STATE/s1.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail S1 "ubx rebuild switch exited $rc -- see $STATE/s1.log"
+        bash "$STATE/gen2-users-activate.sh" >> "$STATE/s1.log" 2>&1
+        systemctl daemon-reload
+        sleep 1
+        ts_a_after="$(stat -c %Y /run/ubx-switch-loop/canary-a-ran 2>/dev/null || echo 0)"
+        [ "$(readlink "$ROOT/current" 2>/dev/null)" = "2" ] || mark_fail S1 "current generation is not 2 after switch"
+        [ "$ts_a_after" = "$ts_a_before" ] || mark_fail S1 "canary-a (unchanged between gen1/gen2) was restarted anyway"
+        [ -f /run/ubx-switch-loop/canary-b-gen2-ran ] || mark_fail S1 "canary-b's changed content did not activate"
+        getent passwd ubxm2test > /dev/null 2>&1 || mark_fail S1 "declared user ubxm2test is not present"
+        echo "UBX-M2-S1-PASS"
+
+        # ================= scenario 2: image swap / soft-reboot ========
+        export UBX_SOFT_REBOOT_CMD=/usr/local/bin/ubx-soft-reboot-stub
+        rm -f /run/ubx-switch-loop/soft-reboot-invoked
+        boot_id_before="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$(cat "$ASSETS/gen3/rootfs-image-marker")" \
+          --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
+          --root-device /dev/vda2 \
+          --etc-ref "$ASSETS/gen2/etc-manifest.json" \
+          --systemd-ref "$ASSETS/gen3/systemd-manifest.json" \
+          --users-manifest "$ASSETS/gen2/users-manifest.json" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --systemd-content-dir "$ASSETS/gen3/systemd-content" \
+          --users-out "$STATE/gen3-users-activate.sh" \
+          > "$STATE/s2.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail S2 "ubx rebuild switch (image swap) exited $rc -- see $STATE/s2.log"
+        systemctl daemon-reload
+        sleep 1
+        boot_id_after="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+        [ "$(readlink "$ROOT/current" 2>/dev/null)" = "3" ] || mark_fail S2 "current generation is not 3 after the image-swap switch"
+        [ -f /run/ubx-switch-loop/soft-reboot-invoked ] || mark_fail S2 "soft-reboot was not invoked for an image-only delta"
+        [ "$boot_id_before" = "$boot_id_after" ] || mark_fail S2 "boot_id changed -- a full reboot happened where a soft-reboot should have"
+        [ -f /run/ubx-switch-loop/canary-c-ran ] || mark_fail S2 "the new generation's package/unit content did not activate"
+        echo "UBX-M2-S2-PASS"
+
+        # ================= scenario 5: apt/dpkg/snap guards ============
+        s5_log="$STATE/s5.log"
+        : > "$s5_log"
+        if apt-get install -y ubx-m2-should-not-install >> "$s5_log" 2>&1; then
+          mark_fail S5 "apt-get install was not blocked"
+        fi
+        if dpkg -i /nonexistent-ubx-m2.deb >> "$s5_log" 2>&1; then
+          mark_fail S5 "dpkg -i was not blocked"
+        fi
+        if snap install ubx-m2-should-not-install >> "$s5_log" 2>&1; then
+          mark_fail S5 "snap install was not blocked"
+        fi
+        grep -q "managed declaratively" "$s5_log" || mark_fail S5 "guard refusal message missing from $s5_log"
+        # Read/query verbs must pass through the guards (SPEC.md §7). Use
+        # `apt list` (a real apt read verb -- `list` is an apt, not apt-get,
+        # subcommand) and `dpkg -l`; both read the baked /var/lib/dpkg the
+        # driver made writable above. Capture output into the scenario log
+        # so a failure is diagnosable from the serial dump.
+        apt list >> "$s5_log" 2>&1 || mark_fail S5 "a read-only apt verb (list) unexpectedly failed -- see $s5_log"
+        dpkg -l >> "$s5_log" 2>&1 || mark_fail S5 "a read-only dpkg verb (-l) unexpectedly failed -- see $s5_log"
+        echo "UBX-M2-S5-PASS"
+
+        # ===== prepare scenario 3: `ubx rebuild test` + a deliberate change
+        old_systemd_ref="$(manifest_get "$ROOT/3/ubx-extra" SYSTEMD_MANIFEST)"
+        old_users_ref="$(manifest_get "$ROOT/3/manifest" GEN_USERS_MANIFEST)"
+        "$UBX" rebuild test --root "$ROOT" \
+          --rootfs-image "$(cat "$ASSETS/gen3/rootfs-image-marker")" \
+          --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
+          --root-device /dev/vda2 \
+          --etc-ref "$ASSETS/gen4/etc-manifest.json" \
+          --systemd-ref "$old_systemd_ref" \
+          --users-manifest "$old_users_ref" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          > "$STATE/s3-register.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail S3 "ubx rebuild test exited $rc -- see $STATE/s3-register.log"
+        [ "$(readlink "$ROOT/current" 2>/dev/null)" = "4" ] || mark_fail S3 "current generation is not 4 after 'ubx rebuild test'"
+        grub_default_after_test="$(cat "$ROOT/grub-default" 2>/dev/null)"
+        [ "$grub_default_after_test" = "3" ] || mark_fail S3 "'ubx rebuild test' moved grub-default (was 3, now $grub_default_after_test) -- it must never touch it"
+
+        echo "UBX-M2-PHASE0-DONE"
+        advance 1
+        sync
+        systemctl reboot
+        ;;
+
+      1)
+        # ===== scenario 3 assertion: survives a REAL reboot =============
+        #
+        # A plain reboot must have left grub-default exactly where the
+        # last SWITCH (not test) set it, even though `current` moved past
+        # it -- see this section's own header on why this durable marker,
+        # not "which kernel/squashfs GRUB actually booted", is what's
+        # asserted (bin/ubx-rebuild-lib's own header: real bootloader
+        # programming from this marker is still future work).
+        [ "$(cat "$ROOT/grub-default" 2>/dev/null)" = "3" ] || mark_fail S3 "grub-default is not 3 after a real reboot"
+        [ "$(readlink "$ROOT/current" 2>/dev/null)" = "4" ] || mark_fail S3 "current generation regressed after reboot (expected 4)"
+        echo "UBX-M2-S3-PASS"
+
+        # ================= scenario 4: offline rollback =================
+        if ip route show default 2> /dev/null | grep -q .; then
+          mark_fail S4 "a default route exists -- this scenario requires no network to demonstrate an OFFLINE rollback"
+        fi
+        "$UBX" rollback 2 --root "$ROOT" --apply --systemd-unit-dir /run/systemd/system \
+          > "$STATE/s4.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail S4 "ubx rollback exited $rc -- see $STATE/s4.log"
+        [ "$(cat "$ROOT/booted" 2>/dev/null)" = "2" ] || mark_fail S4 "booted marker is not 2 after rollback"
+        [ "$(cat "$ROOT/grub-default" 2>/dev/null)" = "2" ] || mark_fail S4 "grub-default is not 2 after rollback"
+
+        echo "UBX-M2-PHASE1-DONE"
+        advance 2
+        sync
+        systemctl reboot
+        ;;
+
+      2)
+        # ===== scenario 4 assertion: rollback survives a REAL reboot ====
+        [ "$(cat "$ROOT/booted" 2>/dev/null)" = "2" ] || mark_fail S4 "booted marker did not survive the reboot"
+        [ "$(cat "$ROOT/grub-default" 2>/dev/null)" = "2" ] || mark_fail S4 "grub-default did not survive the reboot"
+        echo "UBX-M2-S4-PASS"
+        advance 3
+        sync
+        systemctl poweroff
+        ;;
+
+      *)
+        echo "UBX-M2-DRIVER-FAIL: unknown phase '$phase'"
+        systemctl poweroff
+        ;;
+    esac
+  '';
+
+  # -- switchLoopGen1Files: generation 1's on-disk state, hand-written in
+  #    EXACTLY the shape `bin/ubx-generations create` itself produces (see
+  #    this section's own header, decision 2, for why this is hand-written
+  #    rather than shelled out to that tool at Nix build time). Populated
+  #    straight onto the ext4 populate tree (switchLoopVarStore, below).
+  switchLoopGen1Files =
+    { }: ''
+      ubxrun "$UBX_BASE/bin/mkdir" -p "$out/generations/1"
+      ubxrun "$UBX_BASE/bin/cat" > "$out/generations/1/manifest" <<UBX_M2_MANIFEST_EOF
+      GEN_INDEX=1
+      GEN_TITLE=switch-loop proof baseline
+      GEN_CREATED=1970-01-01T00:00:00Z
+      GEN_ROOTFS_IMAGE=$rootfsImage
+      GEN_KERNEL_PATH=$kernelPath
+      GEN_INITRD_PATH=$initrdPath
+      GEN_ROOT_DEVICE=/dev/vda2
+      GEN_KERNEL_PARAMS=
+      GEN_ETC_REF=/usr/local/share/ubx-switch-loop/gen1/etc-manifest.json
+      GEN_USERS_MANIFEST=/usr/local/share/ubx-switch-loop/gen1/users-manifest.json
+      GEN_SNAP_MANIFEST=
+      UBX_M2_MANIFEST_EOF
+      ubxrun "$UBX_BASE/bin/cat" > "$out/generations/1/ubx-extra" <<'UBX_M2_SIDECAR_EOF'
+      SYSTEMD_MANIFEST=/usr/local/share/ubx-switch-loop/gen1/systemd-manifest.json
+      UBX_M2_SIDECAR_EOF
+      printf '2\n' > "$out/generations/.next-index"
+      printf '1\n' > "$out/generations/grub-default"
+      ubxrun "$UBX_BASE/bin/ln" -s 1 "$out/generations/current"
+      ubxrun "$UBX_BASE/bin/mkdir" -p "$out/switch-loop"
+    '';
+
+  # -- switchLoopVarStore: the CONTENT that becomes /ubx/var's ext4
+  #    filesystem (see switchLoopVarImage below, which runs `mke2fs -d`
+  #    against this directory -- the ext-side analogue of diskImage's own
+  #    FAT/mtools "populate without mounting" trick). ---------------------
+  switchLoopVarStore =
+    { name, rootfsImage, kernelPath, initrdPath, system ? "x86_64-linux" }:
+    runInUbuntuBase {
+      inherit system;
+      name = "switch-loop-var-store-${name}";
+      # rootfsImage/kernelPath/initrdPath are derivation-output store paths
+      # (string context). They must reach the script via ENV ATTRS, never
+      # interpolated into the script text, because `runInUbuntuBase` renders
+      # the script through `builtins.toFile`, which rejects any string
+      # carrying a reference to a derivation output (see nix/stdenv.nix's
+      # BOOTSTRAP CAVEAT note). The manifest heredoc below expands them as
+      # ordinary shell variables ($rootfsImage, ...).
+      env = { inherit rootfsImage kernelPath initrdPath; };
+      script = ''
+        ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
+        ${switchLoopGen1Files { }}
+      '';
+    };
+
+  # -- switchLoopVarImage: mke2fs -d switchLoopVarStore -> $out/ubxvar.img
+  #    (an ext4 filesystem image, populated with no mount(2)/loop-device
+  #    call at all -- mke2fs's own `-d` flag, exactly analogous to
+  #    diskImage's FAT/mtools trick; e2fsprogs + its runtime libs are
+  #    already in archive.lock.json's locked set). ------------------------
+  switchLoopVarImage =
+    { name, varStore, sizeMiB ? 64, system ? "x86_64-linux" }:
+    let
+      tools = toolsFHS {
+        inherit system;
+        name = "switch-loop-e2fsprogs-${name}";
+        packages = [ "e2fsprogs" "libblkid1" "libcom-err2" "libss2" "libuuid1" "libext2fs2t64" ];
+      };
+    in
+    runInUbuntuBase {
+      inherit system;
+      name = "switch-loop-var-image-${name}";
+      env = { inherit varStore tools; };
+      script = ''
+        ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
+        toolrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu:$tools/lib/x86_64-linux-gnu" "$@"; }
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
+        [ -e "$tools/usr/sbin/mke2fs" ] || {
+          echo "switchLoopVarImage: expected tool file not found at $tools/usr/sbin/mke2fs" >&2
+          exit 1
+        }
+        ubxrun "$UBX_BASE/usr/bin/truncate" -s "${toString sizeMiB}M" ubxvar.img
+        toolrun "$tools/usr/sbin/mke2fs" -q -F -t ext4 -L UBXVAR -d "$varStore" ubxvar.img
+        ubxrun "$UBX_BASE/bin/cp" ubxvar.img "$out/ubxvar.img"
+      '';
+    };
+
+  # -- switchLoopDiskImage: `diskImage` (see that function's own header
+  #    for the FAT/squashfs partition layout and the manual MBR/core.img
+  #    embedding this reuses verbatim) plus a THIRD partition -- ext4,
+  #    `varImage`'s content, for `/ubx/var` (see this section's own
+  #    header, decision 1). Deliberately a SEPARATE function rather than a
+  #    generalization of `diskImage` itself: that function's disk-image
+  #    assembly is this project's least-proven, most hand-tuned step (its
+  #    own header says as much), and M1's `boot-image-proof` must stay
+  #    completely unaffected by M2's own image-composition needs.
+  switchLoopDiskImage =
+    { name
+    , squashfs
+    , kernel
+    , grubCfgDrv
+    , flavor
+    , varImage
+    , bootPartitionMiB ? 256
+    , system ? "x86_64-linux"
+    }:
+    let
+      tools = toolsFHS {
+        inherit system;
+        name = "switch-loop-diskimage-${name}";
+        packages = [
+          "grub-pc-bin" "grub-common" "grub2-common"
+          "dosfstools" "mtools" "parted"
+          "libdevmapper1.02.1" "libparted2t64" "libreadline8t64" "libtinfo6"
+        ];
+      };
+    in
+    runInUbuntuBase {
+      inherit system;
+      name = "switch-loop-disk-image-${name}";
+      env = { inherit squashfs kernel grubCfgDrv tools varImage; };
+      script = ''
+        ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
+        toolrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu:$tools/lib/x86_64-linux-gnu" "$@"; }
+
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
+
+        for bin in \
+          "$tools/usr/bin/grub-mkimage" \
+          "$tools/usr/sbin/mkfs.vfat" \
+          "$tools/usr/bin/mmd" \
+          "$tools/usr/bin/mcopy" \
+          "$tools/usr/sbin/parted" \
+          "$tools/usr/lib/grub/i386-pc/boot.img"; do
+          [ -e "$bin" ] || {
+            echo "switchLoopDiskImage: expected tool file not found at $bin" >&2
+            exit 1
+          }
+        done
+
+        version="${flavor}"
+
+        export GCONV_PATH="$UBX_BASE/usr/lib/x86_64-linux-gnu/gconv"
+        [ -d "$GCONV_PATH" ] || {
+          echo "switchLoopDiskImage: gconv modules dir not found at $GCONV_PATH" >&2
+          exit 1
+        }
+
+        # -- 1. partition layout, in MiB -------------------------------
+        squashfs_bytes="$(ubxrun "$UBX_BASE/usr/bin/stat" -c%s "$squashfs/rootfs.squashfs")"
+        var_bytes="$(ubxrun "$UBX_BASE/usr/bin/stat" -c%s "$varImage/ubxvar.img")"
+        mib=$((1024 * 1024))
+        squashfs_mib=$(( (squashfs_bytes + mib - 1) / mib + 32 ))
+        var_mib=$(( (var_bytes + mib - 1) / mib ))
+
+        boot_start_mib=1
+        boot_size_mib=${toString bootPartitionMiB}
+        boot_end_mib=$((boot_start_mib + boot_size_mib))
+        squashfs_end_mib=$((boot_end_mib + squashfs_mib))
+        var_end_mib=$((squashfs_end_mib + var_mib))
+
+        echo "switchLoopDiskImage: boot ''${boot_start_mib}-''${boot_end_mib}MiB, squashfs ''${boot_end_mib}-''${squashfs_end_mib}MiB, ubx-var ''${squashfs_end_mib}-''${var_end_mib}MiB"
+
+        # -- 2. FAT boot partition content (identical to diskImage's own
+        #    step 2 -- see that function's header for why FAT/mtools) ---
+        toolrun "$UBX_BASE/bin/mkdir" -p fatstage/grub/i386-pc
+        toolrun "$UBX_BASE/bin/cp" "$tools"/usr/lib/grub/i386-pc/*.mod fatstage/grub/i386-pc/
+        toolrun "$UBX_BASE/bin/cp" "$grubCfgDrv/grub.cfg" fatstage/grub/grub.cfg
+        toolrun "$UBX_BASE/bin/cp" "$kernel/vmlinuz-$version" "fatstage/vmlinuz-$version"
+        toolrun "$UBX_BASE/bin/cp" "$kernel/initrd.img-$version" "fatstage/initrd.img-$version"
+
+        ubxrun "$UBX_BASE/usr/bin/truncate" -s "''${boot_size_mib}M" fatpart.img
+        toolrun "$tools/usr/sbin/mkfs.vfat" -F 32 -n UBXBOOT fatpart.img > /dev/null
+
+        toolrun "$tools/usr/bin/mmd" -i fatpart.img ::/grub ::/grub/i386-pc
+        for f in fatstage/grub/i386-pc/*.mod; do
+          base_f="$(ubxrun "$UBX_BASE/usr/bin/basename" "$f")"
+          toolrun "$tools/usr/bin/mcopy" -i fatpart.img "$f" "::/grub/i386-pc/$base_f"
+        done
+        toolrun "$tools/usr/bin/mcopy" -i fatpart.img fatstage/grub/grub.cfg ::/grub/grub.cfg
+        toolrun "$tools/usr/bin/mcopy" -i fatpart.img "fatstage/vmlinuz-$version" "::/vmlinuz-$version"
+        toolrun "$tools/usr/bin/mcopy" -i fatpart.img "fatstage/initrd.img-$version" "::/initrd.img-$version"
+
+        # -- 3. GRUB's standalone core.img (identical to diskImage's own
+        #    step 3) ------------------------------------------------------
+        toolrun "$tools/usr/bin/grub-mkimage" \
+          -d "$tools/usr/lib/grub/i386-pc" \
+          -O i386-pc -o core.img -p '(hd0,msdos1)/grub' \
+          biosdisk part_msdos fat normal configfile linux search echo test ls cat halt reboot boot
+
+        # -- 4. partition the raw disk image FILE: THREE partitions now -
+        disk_size_mib=$((var_end_mib + 1))
+        ubxrun "$UBX_BASE/usr/bin/truncate" -s "''${disk_size_mib}M" disk.img
+        toolrun "$tools/usr/sbin/parted" --script disk.img -- \
+          mklabel msdos \
+          mkpart primary fat32 "''${boot_start_mib}MiB" "''${boot_end_mib}MiB" \
+          set 1 boot on \
+          mkpart primary "''${boot_end_mib}MiB" "''${squashfs_end_mib}MiB" \
+          mkpart primary ext4 "''${squashfs_end_mib}MiB" "''${var_end_mib}MiB"
+
+        # -- 5. lay the three partitions' content into place -------------
+        ubxrun "$UBX_BASE/bin/dd" if=fatpart.img of=disk.img bs=1M seek="$boot_start_mib" conv=notrunc status=none
+        ubxrun "$UBX_BASE/bin/dd" if="$squashfs/rootfs.squashfs" of=disk.img bs=1M seek="$boot_end_mib" conv=notrunc status=none
+        ubxrun "$UBX_BASE/bin/dd" if="$varImage/ubxvar.img" of=disk.img bs=1M seek="$squashfs_end_mib" conv=notrunc status=none
+
+        # -- 6. embed GRUB's boot code manually (identical to diskImage's
+        #    own step 6 -- see that function's header for the full
+        #    rationale for why this is done by hand rather than via
+        #    grub-bios-setup) ----------------------------------------------
+        core_bytes="$(ubxrun "$UBX_BASE/usr/bin/stat" -c%s core.img)"
+        core_sectors=$(( (core_bytes + 511) / 512 ))
+        blocklist_len=$(( core_sectors - 1 ))
+
+        gap_sectors=$((boot_start_mib * 2048))
+        if [ $((1 + core_sectors)) -ge "$gap_sectors" ]; then
+          echo "switchLoopDiskImage: core.img no longer fits in the $gap_sectors-sector pre-partition-1 embedding gap" >&2
+          exit 1
+        fi
+
+        ubxrun "$UBX_BASE/bin/dd" \
+          if="$tools/usr/lib/grub/i386-pc/boot.img" of=disk.img \
+          bs=440 count=1 conv=notrunc status=none
+
+        ubxrun "$UBX_BASE/bin/dd" \
+          if=core.img of=disk.img \
+          bs=512 seek=1 conv=notrunc status=none
+
+        len_lo=$((blocklist_len & 255))
+        len_hi=$(((blocklist_len >> 8) & 255))
+        printf "$(printf '\\%03o\\%03o' "$len_lo" "$len_hi")" |
+          ubxrun "$UBX_BASE/bin/dd" of=disk.img bs=1 seek=1020 count=2 conv=notrunc status=none
+
+        ubxrun "$UBX_BASE/bin/cp" disk.img "$out/disk.img"
+      '';
+    };
 in
 {
   flake.lib.boot = {
@@ -980,6 +1980,75 @@ in
         kernel = proofKernel;
         grubCfgDrv = proofGrubCfg;
       };
+
+      # -- the M2 switch-loop-proof (GitHub issue #32; see nix/boot.nix's
+      #    own "switch-loop-proof" section above for the full design). The
+      #    kernel is REUSED from M1's own proofKernel above (unchanged
+      #    flavor/package set -- no need to re-extract vmlinuz/initrd from
+      #    a second, mostly-identical rootfs compose); everything else
+      #    (rootfs, squashfs, the ext4 /ubx/var image, the disk image) is
+      #    this proof's own. -------------------------------------------
+      switchLoopKernelPath = "${proofKernel}/vmlinuz-${flavor}";
+      switchLoopInitrdPath = "${proofKernel}/initrd.img-${flavor}";
+
+      switchLoopRootfs = bootRootfs {
+        inherit system bootSpec;
+        name = "switch-loop-proof";
+        extraFilesScript = switchLoopExtraFilesScript;
+      };
+
+      switchLoopSquashfs = squashfsImage {
+        inherit system;
+        name = "switch-loop-proof";
+        rootfs = switchLoopRootfs;
+      };
+
+      switchLoopRootfsImagePath = "${switchLoopSquashfs}/rootfs.squashfs";
+
+      switchLoopVarStoreDrv = switchLoopVarStore {
+        inherit system;
+        name = "switch-loop-proof";
+        rootfsImage = switchLoopRootfsImagePath;
+        kernelPath = switchLoopKernelPath;
+        initrdPath = switchLoopInitrdPath;
+      };
+
+      switchLoopVarImageDrv = switchLoopVarImage {
+        inherit system;
+        name = "switch-loop-proof";
+        varStore = switchLoopVarStoreDrv;
+      };
+
+      # Same single-entry GRUB menu shape as M1's own proofGeneration
+      # (same kernel, same root device for the squashfs partition -- the
+      # third, ext4 partition needs no GRUB entry of its own, it is mounted
+      # by a systemd .mount unit at boot, not selected at the bootloader).
+      switchLoopGeneration = {
+        index = 1;
+        title = "ubuntnix switch-loop-proof generation 1 (${bootSpec.kernel})";
+        kernelPath = "/vmlinuz-${flavor}";
+        initrdPath = "/initrd.img-${flavor}";
+        rootDevice = "/dev/vda2";
+        kernelParams = bootSpec.kernelParams ++ [
+          "rootfstype=squashfs"
+          "console=ttyS0"
+        ];
+      };
+
+      switchLoopGrubCfgDrv = grubCfg {
+        inherit system;
+        name = "switch-loop-proof";
+        generations = [ switchLoopGeneration ];
+      };
+
+      switchLoopDiskImageDrv = switchLoopDiskImage {
+        inherit system flavor;
+        name = "switch-loop-proof";
+        squashfs = switchLoopSquashfs;
+        kernel = proofKernel;
+        grubCfgDrv = switchLoopGrubCfgDrv;
+        varImage = switchLoopVarImageDrv;
+      };
     in
     {
       packages.boot-kernel-artifacts-proof = proofKernel;
@@ -987,5 +2056,8 @@ in
       # The flake output proof this issue's scope calls for (item 4: "Expose
       # the image as a flake output proof (e.g. .#boot-image-proof)").
       packages.boot-image-proof = proofDiskImage;
+      # SPEC.md §11 M2's own exit-criterion proof (GitHub issue #32) --
+      # tests/e2e/020-qemu-switch-e2e.sh boots this one.
+      packages.switch-loop-proof = switchLoopDiskImageDrv;
     };
 }

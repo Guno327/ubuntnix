@@ -120,9 +120,17 @@ for a in plan.get("actions", []):
     elif op == "daemon-reload":
         emit(["systemctl", "daemon-reload"])
     elif op == "stop":
-        emit(["systemctl", "stop", a["unit"]])
+        # Best-effort teardown: stopping/disabling a unit as part of
+        # REMOVING it must be idempotent. If the unit is not loaded (never
+        # started this boot, or its transient /run unit was wiped by a
+        # reboot) systemctl exits 5 ("Unit ... not loaded"); if its unit
+        # file is already gone, disable exits non-zero too. The desired
+        # end-state (not running, not enabled) already holds in those
+        # cases, so these must not abort convergence -- unlike install/
+        # daemon-reload/enable/start/restart/mask, which stay fatal.
+        lines.append(f"systemctl stop {shlex.quote(a['unit'])} || :")
     elif op == "disable":
-        emit(["systemctl", "disable", a["unit"]])
+        lines.append(f"systemctl disable {shlex.quote(a['unit'])} || :")
     elif op == "mask":
         emit(["systemctl", "mask", a["unit"]])
     elif op == "unmask":
@@ -158,7 +166,11 @@ PYEOF
   # executed as a command).
   local script
   script="$(mktemp)"
-  trap 'rm -f "$script"' EXIT
+  # shellcheck disable=SC2064  # intentional: expand $script NOW (it is
+  # `local` to this function and would be unbound -- fatal under `set -u`
+  # -- by the time an EXIT trap set with single quotes fired after this
+  # function returned; mirrors bin/ubx's do_rebuild's own workdir trap)
+  trap "rm -f '$script'" EXIT
   {
     printf '#!/bin/sh\nset -e\n'
     printf '%s\n' "$commands"

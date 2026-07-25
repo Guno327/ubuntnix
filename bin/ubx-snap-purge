@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# bin/ubx-snap-purge — reconcile-time undeclared-snap PURGE sweep (SPEC.md
+# §7 "the converge report surfaces and removes any drift found (undeclared
+# snaps, ...)"; GitHub issue #63, milestone M3's "drift guard demonstrably
+# blocks and purges undeclared snaps" exit criterion; extends the work
+# started by bin/ubx-guard-snap, GitHub issue #31).
+#
+# -- Why this is a SIBLING script, not more code in bin/ubx-guard-snap ------
+#
+# bin/ubx-guard-snap is an INTERACTIVE-COMMAND INTERCEPTOR: it is installed
+# in place of the real `snap` binary and makes a single block/pass decision
+# about one invocation a human or script just typed, in well under a
+# second, with no filesystem state of its own (see that file's header). A
+# reconcile-time sweep is a completely different lifecycle: it runs as part
+# of `ubx rebuild switch/boot/test` convergence (bin/ubx-rebuild-lib), reads
+# TWO whole-system inputs (the declared manifest and the live installed-snap
+# set), diffs them, and PERFORMS removals of its own accord -- no human
+# typed `snap remove`, so there is no verb to classify. Bolting that onto
+# ubx-guard-snap's argv-classifying `main` would conflate "should I let this
+# one command through" with "what should the whole system's snap set
+# converge to", the same distinction bin/ubx-etc (planner) keeps from
+# bin/ubx-etc-apply (executor) and bin/ubx-systemd keeps from
+# bin/ubx-systemd-apply. A standalone script keeps both call sites (the
+# guard's install-time divert target, and `ubx rebuild`'s reconcile step)
+# independently simple and independently testable.
+#
+# -- Declared-input contract (coupled to issue #60's key-set only) ----------
+#
+# GitHub issue #60 concurrently defines the real declared-snap manifest JSON
+# shape (nix/snaps.nix or similar, on a branch not present in this
+# worktree): a JSON OBJECT keyed by snap name, where each entry carries at
+# least a channel/revision pin, a `classic` boolean, `connections`, and
+# `config`, e.g.:
+#
+#   {
+#     "firefox": {"channel": "stable", "classic": false, "connections": [], "config": {}},
+#     "code":    {"channel": "stable", "classic": true,  "connections": [], "config": {}}
+#   }
+#
+# This script consumes ONLY the top-level set of declared snap NAMES (the
+# object's keys) -- that key-set contract is stable regardless of #60's
+# per-entry field details, so read_declared_snaps below stays a one-line
+# change if #60's per-entry shape evolves. Per-entry contents (channel,
+# classic, connections, config) are #60's business; this script never reads
+# them.
+#
+# Any other top-level shape (a bare array, a scalar, or anything that is not
+# a JSON object) is a malformed manifest -- this script refuses to guess and
+# exits nonzero rather than silently treating it as "nothing declared"
+# (which would purge every installed snap, the single most destructive
+# possible misreading of a malformed input).
+#
+# -- Observed input: the live installed-snap set -----------------------------
+#
+# Read by invoking `$UBX_SNAP_BIN list` (default: "snap") and parsing its
+# standard column-1-is-the-name table output (header line skipped). This
+# mirrors bin/ubx-guard-snap's own PASS-through of `snap list` -- it is
+# exactly the read-only query that guard already lets through untouched.
+#
+# -- Purge seam: UBX_SNAP_BIN (list AND remove, unlike UBX_GUARD_REAL_BIN) --
+#
+# Both the observed-set query above and the actual purge
+# (`$UBX_SNAP_BIN remove --purge NAME`) go through this one injectable
+# command, analogous to bin/ubx-guard-lib's UBX_GUARD_REAL_BIN seam but
+# deliberately a DIFFERENT variable: ubx-guard-lib's seam exists so a guard
+# can hand off to the real binary it fronts; this script's job is the
+# opposite -- it is the thing legitimately choosing to mutate, at reconcile
+# time, with the real `snap` as an implementation detail it drives directly
+# (never through the guard, which would itself block the `remove` this
+# script needs to issue). tests/unit/094-snap-purge.sh points UBX_SNAP_BIN
+# at a recording stub so the whole sweep -- list, diff, purge decisions, and
+# the exact `remove --purge` invocations -- is asserted with no real snapd
+# anywhere near the test run.
+#
+# -- Protected base snaps (spared even if undeclared) ------------------------
+#
+# snapd manages a small set of snaps ITSELF, as prerequisites for running
+# any snap at all, independently of anything this project's flake declares:
+#   snapd                     the snap daemon/tooling itself -- purging it
+#                              would remove the very mechanism this sweep
+#                              (and every other snap operation) depends on.
+#   core, core16, core18,
+#   core20, core22, core24    legacy and per-series "core" base snaps.
+#   bare                      the empty base some minimal snaps build on.
+# These are refcounted and (re)installed by snapd's own dependency
+# resolution as a side effect of installing/refreshing ordinary snaps --
+# never something a declared manifest is expected to name explicitly. A
+# declared manifest that DOES name one of these is not a conflict (the
+# name is simply already spared for two independent reasons instead of
+# one); nothing about the protected set requires the manifest to stay
+# silent about it. See PROTECTED_BASE_SNAPS below for the exact list.
+# This set is intentionally NOT auto-derived from `snap list`'s "Notes"
+# column (which does mark bases/snapd) -- the fixed list makes what is
+# protected and why fully static and auditable in this header, matching
+# how ubx-guard-snap documents its verb matrix as an explicit table rather
+# than something inferred at runtime.
+#
+# -- Purge decision -----------------------------------------------------------
+#
+#   purge_set = observed_snaps - declared_snaps - PROTECTED_BASE_SNAPS
+#
+# Every name in purge_set is removed via `$UBX_SNAP_BIN remove --purge
+# NAME` (--purge, not a plain remove, so no snapshot of the undeclared
+# snap's data is left behind for something the flake never declared in the
+# first place -- consistent with "the flake is the complete truth", SPEC.md
+# §7). Declared snaps and protected-base snaps are left alone regardless of
+# anything else about them.
+#
+# -- --apply / --dry-run (default dry-run) -----------------------------------
+#
+# Mirrors bin/ubx-systemd-apply's and bin/ubx-etc-apply's own posture: by
+# default this script only PRINTS what it would do, one "purge NAME" line
+# per snap in purge_set, sorted, and exits 0 without invoking
+# `$UBX_SNAP_BIN remove` at all. `--apply` actually issues each removal.
+# Either way, "keep" lines for declared and protected-base snaps present on
+# the system are also printed (to stderr, informational only -- exactly
+# bin/ubx-etc's own "drift is informational, printed to stderr" precedent)
+# so a human/CI log shows the full reconciliation, not just the mutations.
+set -euo pipefail
+
+prog_name="ubx-snap-purge"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-snap-purge [--manifest FILE] [--apply | --dry-run]
+
+Reconcile-time sweep: purges every installed snap that is neither in the
+declared manifest nor a protected base snap (see this script's header).
+
+  --manifest FILE   declared-snap manifest JSON: a JSON object keyed by
+                     snap name, e.g. {"firefox": {...}, "code": {...}}
+                     (issue #60's shape; only the top-level keys are read).
+                     If omitted, read from UBX_SNAP_DECLARED_MANIFEST.
+  --apply           actually purge (runs `$UBX_SNAP_BIN remove --purge`)
+  --dry-run         print, don't purge (default)
+
+UBX_SNAP_BIN (default: "snap") is the command used for both listing
+installed snaps and purging them -- see this script's header, "Purge
+seam".
+USAGE
+}
+
+readonly PROTECTED_BASE_SNAPS=(
+  snapd core core16 core18 core20 core22 core24 bare
+)
+
+is_in() {
+  local needle="$1"
+  shift
+  local x
+  for x in "$@"; do
+    [ "$x" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+# read_declared_snaps FILE
+#
+# Prints one declared snap name per line, sorted+de-duplicated. Exits
+# nonzero (via python3's own traceback going to stderr, or a
+# script-generated diagnostic) on any malformed manifest -- see this
+# file's header, "Declared-input contract".
+read_declared_snaps() {
+  local manifest="$1"
+  python3 - "$manifest" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+
+# Issue #60's declared-snap manifest shape: a JSON object keyed by snap
+# name (each value an entry with channel/revision, classic, connections,
+# config -- this script reads only the KEYS, see this file's header).
+if not isinstance(data, dict):
+    print(f"ubx-snap-purge: manifest is not a JSON object keyed by snap "
+          f"name (got {type(data).__name__}): {path}", file=sys.stderr)
+    sys.exit(1)
+
+out = set()
+for n in data.keys():
+    if not isinstance(n, str) or not n:
+        print(f"ubx-snap-purge: manifest contains a non-string or empty "
+              f"snap name key: {n!r}", file=sys.stderr)
+        sys.exit(1)
+    out.add(n)
+
+for n in sorted(out):
+    print(n)
+PYEOF
+}
+
+# list_installed_snaps
+#
+# Prints one installed snap name per line (parsed from `$UBX_SNAP_BIN
+# list`'s standard table output: header line skipped, first
+# whitespace-separated column of every remaining line taken as the name).
+list_installed_snaps() {
+  local snap_bin="${UBX_SNAP_BIN:-snap}"
+  local out
+  if ! out="$("$snap_bin" list 2>&1)"; then
+    die "'$snap_bin list' failed -- cannot determine the installed snap set, refusing to guess (output: $out)"
+  fi
+  printf '%s\n' "$out" | awk 'NR>1 && NF>0 {print $1}'
+}
+
+main() {
+  local manifest="${UBX_SNAP_DECLARED_MANIFEST:-}" mode="dry-run"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --manifest)
+        [ $# -ge 2 ] || die "--manifest requires an argument"
+        manifest="$2"
+        shift 2
+        ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *)
+        echo "$prog_name: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+  [ -n "$manifest" ] || die "--manifest is required (or set UBX_SNAP_DECLARED_MANIFEST)"
+  [ -f "$manifest" ] || die "no such file: $manifest"
+
+  local declared_list observed_list
+  declared_list="$(read_declared_snaps "$manifest")"
+  observed_list="$(list_installed_snaps)"
+
+  local -a declared=() observed=() purge_set=()
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] && declared+=("$line")
+  done <<< "$declared_list"
+  while IFS= read -r line; do
+    [ -n "$line" ] && observed+=("$line")
+  done <<< "$observed_list"
+
+  local name
+  for name in "${observed[@]}"; do
+    if is_in "$name" "${declared[@]:-}"; then
+      echo "$prog_name: keep (declared): $name" >&2
+      continue
+    fi
+    if is_in "$name" "${PROTECTED_BASE_SNAPS[@]}"; then
+      echo "$prog_name: keep (protected base): $name" >&2
+      continue
+    fi
+    purge_set+=("$name")
+  done
+
+  # Sorted, for deterministic output regardless of `snap list`'s own order.
+  if [ "${#purge_set[@]}" -gt 0 ]; then
+    mapfile -t purge_set < <(printf '%s\n' "${purge_set[@]}" | sort)
+  fi
+
+  local snap_bin="${UBX_SNAP_BIN:-snap}"
+  local failed=0
+  for name in "${purge_set[@]:-}"; do
+    [ -n "$name" ] || continue
+    echo "purge $name"
+    if [ "$mode" = "apply" ]; then
+      if ! "$snap_bin" remove --purge "$name" >&2; then
+        echo "$prog_name: failed to purge '$name'" >&2
+        failed=1
+      fi
+    fi
+  done
+
+  [ "$failed" -eq 0 ] || exit 1
+  exit 0
+}
+
+main "$@"

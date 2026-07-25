@@ -129,6 +129,38 @@ behavior that are genuinely identical across all three commands:
   silently doing nothing, or recursing into the guard itself if an install
   mechanism ever reused the guard's own name for something).
 
+## Reconcile-time purge sweep (M3, issue #63)
+
+The three guards above only ever stop a *human typing a command*; they
+have no opinion about snaps that are already installed. `bin/ubx-snap-purge`
+is the other half of `SPEC.md` §7's drift-prevention bullet list — "the
+converge report surfaces and removes any drift found (undeclared snaps,
+...)" — a separate, standalone script (not more code in
+`bin/ubx-guard-snap`: see that script's own header, "Why this is a SIBLING
+script") intended to run as part of `ubx rebuild switch/boot/test`
+convergence rather than as an installed command interceptor.
+
+It takes two inputs — a declared-snap manifest (`--manifest FILE`, JSON: a
+top-level object keyed by snap name, per issue #60's manifest shape, e.g.
+`{"firefox": {"channel": ..., "classic": ..., "connections": ..., "config": ...}}`
+— only the top-level KEYS are read; see the script's header,
+"Declared-input contract") and the live installed-snap set (`$UBX_SNAP_BIN
+list`, default binary name `snap`) — and
+purges (`remove --purge`) every installed snap that is in neither the
+manifest nor the fixed, documented protected-base-snap set (`snapd`,
+`core`/`core16`/`core18`/`core20`/`core22`/`core24`, `bare` — snapd's own
+prerequisites, never something a declared manifest is expected to name).
+Like `bin/ubx-systemd-apply`/`bin/ubx-etc-apply`, it defaults to
+`--dry-run` (print the plan, purge nothing) and only mutates under
+`--apply`. `tests/unit/094-ubx-snap-purge.sh` exercises all of this with a
+recording stub in place of `UBX_SNAP_BIN` — no real snapd involved.
+
+Wiring this sweep into `ubx rebuild`'s actual convergence sequence is, like
+the three guards' own image installation, deferred: it needs issue #60's
+manifest shape to land first (this script's `--manifest` contract is
+written to consume whatever that turns out to be, without needing a
+follow-up edit here).
+
 (what-is-deferred)=
 
 ## What is deferred

@@ -419,6 +419,27 @@ plan_domains() {
     DOM_USERS_DRIFT=0
     DOM_USERS_ERRORS=0
   fi
+
+  # -- snap (GitHub issue #66) -------------------------------------------
+  #
+  # Unlike etc/systemd/users, there is no separate plan/observed-state
+  # step here: bin/ubx-snap-purge does its OWN observation (a live `snap
+  # list`) and diffs it against the declared manifest directly -- this
+  # block only resolves DOM_NEW_SNAP_REF to a real manifest.json path (the
+  # real per-generation manifest nix/snap.nix's renderManifest produces,
+  # issue #60) for execute_domains to hand it. Skipped (like every other
+  # domain) only when NEITHER the old nor the new generation declares
+  # anything for this domain.
+  DOM_SNAP_SKIP=0
+  if [ -z "$DOM_OLD_SNAP_REF" ] && [ -z "$DOM_NEW_SNAP_REF" ]; then
+    DOM_SNAP_SKIP=1
+  fi
+  if [ "$DOM_SNAP_SKIP" = 0 ]; then
+    DOM_NEW_SNAP_JSON="$(ubx_rebuild_resolve_ref "$DOM_NEW_SNAP_REF" "$UBX_REBUILD_EMPTY_SNAP_MANIFEST" "$workdir" new-snap)" \
+      || die "could not resolve the new generation's snap manifest"
+  else
+    DOM_NEW_SNAP_JSON=""
+  fi
 }
 
 # report_domains VERBOSE — prints the deterministic touched-domains report
@@ -465,8 +486,18 @@ report_domains() {
 # execute_domains — attempts real activation for the domains that have a
 # real executor (see this file's header). Only ever called for
 # switch/test, never boot, and never in --dry-run mode.
+#
+# VERB (GitHub issue #66's snap-purge sweep only -- "" from bin/ubx's own
+# cmd_rollback, which deliberately never triggers a snap purge; see the
+# snap block below) selects bin/ubx-snap-purge's dry-run/apply mode:
+# `switch` honors the caller's own --apply/--dry-run exactly like
+# etc/systemd above; `test` NEVER passes --apply, even when APPLY=1 --
+# purging is destructive (it removes installed snap payloads) and `ubx
+# rebuild test` is meant to be safely re-tried/rolled back from (a plain
+# reboot already returns to the last-good generation, SPEC.md §4.3) without
+# first destroying anything undeclared on the live system.
 execute_domains() {
-  local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4" etc_content_dir="$5" etc_dir="$6"
+  local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4" etc_content_dir="$5" etc_dir="$6" verb="${7:-}"
 
   if [ "$DOM_ETC_SKIP" = 0 ]; then
     local content_dir="$etc_content_dir"
@@ -501,6 +532,16 @@ execute_domains() {
     "$bindir/ubx-users" execute --plan "$DOM_USERS_PLAN" --format shell --out "$script"
     echo "users: activation script written to $script (not executed — ubx-users execute only ever emits it; run it as root to converge, or see docs/users.md)"
   fi
+
+  if [ "$DOM_SNAP_SKIP" = 0 ] && { [ "$verb" = switch ] || [ "$verb" = test ]; }; then
+    local snap_purge_args=("$bindir/ubx-snap-purge" --manifest "$DOM_NEW_SNAP_JSON")
+    if [ "$apply" = 1 ] && [ "$verb" = switch ]; then
+      snap_purge_args+=(--apply)
+    else
+      snap_purge_args+=(--dry-run)
+    fi
+    "${snap_purge_args[@]}"
+  fi
 }
 
 # =====================================================================
@@ -520,7 +561,15 @@ Registers a new generation (via bin/ubx-generations) and, per verb:
 Generation-creation options (passed through to 'ubx-generations create';
 required unless --dry-run):
   --rootfs-image PATH --kernel PATH --initrd PATH --root-device DEV
-  --kernel-params PARAMS --title TITLE --snap-manifest PATH
+  --kernel-params PARAMS --title TITLE
+  --snap-manifest PATH   also doubles as this generation's declared snap
+                         manifest (nix/snap.nix's per-generation manifest,
+                         issue #60): 'switch'/'test' feed it straight to
+                         'ubx-snap-purge' as the reconcile-time undeclared-
+                         snap purge sweep (GitHub issue #66) -- 'test'
+                         always runs it dry-run, regardless of --apply.
+                         Omitted entirely means "nothing declared for this
+                         domain", same as every other domain below.
 
 Domain declaration options (all optional — an omitted one means "this
 generation declares nothing new for that domain"):
@@ -623,11 +672,12 @@ do_rebuild() {
 
   local old_current
   old_current="$(ubx_rebuild_effective_booted "$root")"
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
     < <(ubx_rebuild_domain_refs "$root" "$old_current")
   DOM_NEW_ETC_REF="$etc_ref"
   DOM_NEW_SYSTEMD_REF="$systemd_ref"
   DOM_NEW_USERS_REF="$users_manifest"
+  DOM_NEW_SNAP_REF="$snap_manifest"
 
   local new_idx=""
   if [ "$dry_run" = 0 ]; then
@@ -660,7 +710,7 @@ do_rebuild() {
     if [ "$dry_run" = 0 ]; then
       local exec_users_out="$users_out"
       [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
-      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir"
+      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "$verb"
       ubx_rebuild_write_booted "$root" "$new_idx"
 
       # -- Soft-reboot activation (issue #30) -----------------------------
@@ -854,9 +904,9 @@ cmd_rollback() {
   # set with single quotes fired after the function returned)
   trap "rm -rf -- '$workdir'" EXIT
 
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
     < <(ubx_rebuild_domain_refs "$root" "$booted_gen")
-  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF \
+  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF DOM_NEW_SNAP_REF \
     < <(ubx_rebuild_domain_refs "$root" "$target")
 
   plan_domains "$workdir"
@@ -868,7 +918,11 @@ cmd_rollback() {
   if [ "$dry_run" = 0 ]; then
     local exec_users_out="$users_out"
     [ -n "$exec_users_out" ] || exec_users_out="$root/$target/rollback-users-activate.sh"
-    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir"
+    # VERB is deliberately omitted (empty) here -- see execute_domains'
+    # own header: `ubx rollback` never triggers the snap-purge sweep
+    # (GitHub issue #66 scoped this to `ubx rebuild switch|test` only), even
+    # though a target generation may itself declare a snap manifest.
+    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" ""
     ubx_rebuild_write_booted "$root" "$target"
     ubx_rebuild_write_grub_default "$root" "$target"
     echo "grub default: set to generation $target"
@@ -987,9 +1041,9 @@ cmd_diff() {
   # set with single quotes fired after the function returned)
   trap "rm -rf -- '$workdir'" EXIT
 
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF \
+  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
     < <(ubx_rebuild_domain_refs "$root" "$a")
-  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF \
+  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF DOM_NEW_SNAP_REF \
     < <(ubx_rebuild_domain_refs "$root" "$b")
 
   plan_domains "$workdir"

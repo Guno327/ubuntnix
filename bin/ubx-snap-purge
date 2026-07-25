@@ -24,31 +24,42 @@
 # guard's install-time divert target, and `ubx rebuild`'s reconcile step)
 # independently simple and independently testable.
 #
-# -- Declared-input contract (coupled to issue #60's key-set only) ----------
+# -- Declared-input contract (coupled to issue #60's real manifest shape,
+#    wired in by issue #66) ---------------------------------------------
 #
-# GitHub issue #60 concurrently defines the real declared-snap manifest JSON
-# shape (nix/snaps.nix or similar, on a branch not present in this
-# worktree): a JSON OBJECT keyed by snap name, where each entry carries at
-# least a channel/revision pin, a `classic` boolean, `connections`, and
-# `config`, e.g.:
+# GitHub issue #60's REAL declared-snap manifest (nix/snap.nix's
+# `compileManifest`/`renderManifest`, documented in docs/snap.md) is a JSON
+# OBJECT with a top-level "snaps" ARRAY of per-entry objects, each carrying
+# at least a `name`, plus channel/revision, a `classic` boolean, publisher
+# info, `connections`, and `config`, e.g.:
 #
 #   {
-#     "firefox": {"channel": "stable", "classic": false, "connections": [], "config": {}},
-#     "code":    {"channel": "stable", "classic": true,  "connections": [], "config": {}}
+#     "version": 1,
+#     "snaps": [
+#       {"name": "firefox", "channel": "stable", "revision": 4090, "classic": false, "connections": [], "config": {}},
+#       {"name": "code",    "channel": "stable", "revision": 123,  "classic": true,  "connections": [], "config": {}}
+#     ]
 #   }
 #
-# This script consumes ONLY the top-level set of declared snap NAMES (the
-# object's keys) -- that key-set contract is stable regardless of #60's
-# per-entry field details, so read_declared_snaps below stays a one-line
-# change if #60's per-entry shape evolves. Per-entry contents (channel,
+# (An earlier draft of this header assumed a top-level JSON OBJECT KEYED BY
+# NAME instead -- that shape was never what #60 actually shipped;
+# read_declared_snaps below was updated by issue #66, which wired this
+# script into `ubx rebuild`, to match #60's real "snaps" array exactly
+# rather than inventing a second manifest format alongside it.)
+#
+# This script consumes ONLY each entry's `name` field -- that is the
+# minimal, stable contract regardless of #60's other per-entry field
+# details, so read_declared_snaps below stays a small, localized change if
+# #60's per-entry shape ever evolves further. Per-entry contents (channel,
 # classic, connections, config) are #60's business; this script never reads
 # them.
 #
-# Any other top-level shape (a bare array, a scalar, or anything that is not
-# a JSON object) is a malformed manifest -- this script refuses to guess and
-# exits nonzero rather than silently treating it as "nothing declared"
-# (which would purge every installed snap, the single most destructive
-# possible misreading of a malformed input).
+# Any other top-level shape (not a JSON object, no top-level "snaps" array,
+# or a "snaps" entry missing a non-empty string `name`) is a malformed
+# manifest -- this script refuses to guess and exits nonzero rather than
+# silently treating it as "nothing declared" (which would purge every
+# installed snap, the single most destructive possible misreading of a
+# malformed input).
 #
 # -- Observed input: the live installed-snap set -----------------------------
 #
@@ -132,10 +143,11 @@ usage: ubx-snap-purge [--manifest FILE] [--apply | --dry-run]
 Reconcile-time sweep: purges every installed snap that is neither in the
 declared manifest nor a protected base snap (see this script's header).
 
-  --manifest FILE   declared-snap manifest JSON: a JSON object keyed by
-                     snap name, e.g. {"firefox": {...}, "code": {...}}
-                     (issue #60's shape; only the top-level keys are read).
-                     If omitted, read from UBX_SNAP_DECLARED_MANIFEST.
+  --manifest FILE   declared-snap manifest JSON: a JSON object with a
+                     top-level "snaps" array of per-entry objects, e.g.
+                     {"version": 1, "snaps": [{"name": "firefox", ...}]}
+                     (issue #60's real shape; only each entry's "name" is
+                     read). If omitted, read from UBX_SNAP_DECLARED_MANIFEST.
   --apply           actually purge (runs `$UBX_SNAP_BIN remove --purge`)
   --dry-run         print, don't purge (default)
 
@@ -175,21 +187,28 @@ path = sys.argv[1]
 with open(path, encoding="utf-8") as f:
     data = json.load(f)
 
-# Issue #60's declared-snap manifest shape: a JSON object keyed by snap
-# name (each value an entry with channel/revision, classic, connections,
-# config -- this script reads only the KEYS, see this file's header).
-if not isinstance(data, dict):
-    print(f"ubx-snap-purge: manifest is not a JSON object keyed by snap "
-          f"name (got {type(data).__name__}): {path}", file=sys.stderr)
+# Issue #60's REAL declared-snap manifest shape (nix/snap.nix's
+# compileManifest/renderManifest, docs/snap.md): a JSON object with a
+# top-level "snaps" array of per-entry objects, each carrying at least a
+# "name" (plus channel/revision, classic, publisher info, connections,
+# config -- this script reads only each entry's "name", see this file's
+# header).
+if not isinstance(data, dict) or not isinstance(data.get("snaps"), list):
+    print(f"ubx-snap-purge: manifest is not a JSON object with a "
+          f"top-level 'snaps' array (issue #60's shape) "
+          f"(got {type(data).__name__ if not isinstance(data, dict) else 'object with no snaps array'}): {path}",
+          file=sys.stderr)
     sys.exit(1)
 
 out = set()
-for n in data.keys():
-    if not isinstance(n, str) or not n:
-        print(f"ubx-snap-purge: manifest contains a non-string or empty "
-              f"snap name key: {n!r}", file=sys.stderr)
+for entry in data["snaps"]:
+    name = entry.get("name") if isinstance(entry, dict) else None
+    if not isinstance(name, str) or not name:
+        print(f"ubx-snap-purge: manifest's 'snaps' array contains an "
+              f"entry with a missing, non-string, or empty 'name': "
+              f"{entry!r}", file=sys.stderr)
         sys.exit(1)
-    out.add(n)
+    out.add(name)
 
 for n in sorted(out):
     print(n)

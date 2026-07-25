@@ -44,14 +44,14 @@
 #     the mechanism + unit tests only.
 # Live activation of the three domains this orchestrator DOES run
 # end-to-end is itself gated by how far each domain's own executor got in
-# its own issue: bin/ubx-systemd-apply is a real (dry-run-by-default,
-# `--apply`-gated) executor; bin/ubx-users' `execute` only ever EMITS a
-# shell script (per that script's own header, never runs it); bin/ubx-etc
-# has no executor script at all yet (`bin/ubx-etc-apply` is referenced in
-# bin/ubx-etc's own header as future work and does not exist in this repo).
-# This orchestrator calls exactly as much of each as exists today and
-# prints a clear notice for the rest — it never invents execution
-# machinery that belongs to those other issues.
+# its own issue: bin/ubx-etc-apply and bin/ubx-systemd-apply are both real
+# (dry-run-by-default, `--apply`-gated) executors (issue #54 added the
+# former, mirroring the latter's own pattern almost exactly — see
+# bin/ubx-etc-apply's header); bin/ubx-users' `execute` only ever EMITS a
+# shell script (per that script's own header, never runs it). This
+# orchestrator calls exactly as much of each as exists today and prints a
+# clear notice for the rest — it never invents execution machinery that
+# belongs to those other issues.
 set -euo pipefail
 
 prog_name="ubuntnix (ubx)"
@@ -242,10 +242,12 @@ PYEOF
 #   DOM_ETC_TOUCH DOM_ETC_DRIFT
 #   DOM_SYSTEMD_TOUCH
 #   DOM_USERS_TOUCH DOM_USERS_DRIFT
+#   DOM_NEW_ETC_JSON       (the resolved new etc manifest.json path, used as
+#                           a --content-dir default at execute time, exactly
+#                           DOM_NEW_SYSTEMD_JSON's own role for the systemd
+#                           domain)
 #   DOM_NEW_SYSTEMD_JSON   (the resolved new systemd manifest.json path,
-#                           used as a --content-dir default at execute time
-#                           -- etc has no executor yet, so no equivalent
-#                           etc content-dir default is needed)
+#                           used as a --content-dir default at execute time)
 # A domain is SKIPPED (no plan computed) only when NEITHER the old nor the
 # new ref names anything — "never declared, on either side" (matches
 # bin/ubx-generations' own "legally empty" fields posture). Dies (via
@@ -277,10 +279,12 @@ plan_domains() {
     fi
     "${etc_args[@]}" || die "ubx-etc plan refused (see its stderr above)"
     IFS=$'\t' read -r DOM_ETC_TOUCH DOM_ETC_DRIFT < <(summarize_etc_plan "$DOM_ETC_PLAN")
+    DOM_NEW_ETC_JSON="$etc_new_json"
   else
     DOM_ETC_PLAN=""
     DOM_ETC_TOUCH=0
     DOM_ETC_DRIFT=0
+    DOM_NEW_ETC_JSON=""
   fi
 
   DOM_SYSTEMD_SKIP=0
@@ -401,10 +405,20 @@ report_domains() {
 # real executor (see this file's header). Only ever called for
 # switch/test, never boot, and never in --dry-run mode.
 execute_domains() {
-  local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4"
+  local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4" etc_content_dir="$5" etc_dir="$6"
 
   if [ "$DOM_ETC_SKIP" = 0 ]; then
-    echo "etc: apply pending — bin/ubx-etc-apply does not exist yet (see docs/etc.md); plan only, nothing written"
+    local content_dir="$etc_content_dir"
+    if [ -z "$content_dir" ]; then
+      content_dir="$(dirname "$DOM_NEW_ETC_JSON")"
+    fi
+    local etc_apply_args=("$bindir/ubx-etc-apply" --plan "$DOM_ETC_PLAN" --content-dir "$content_dir" --etc-dir "$etc_dir")
+    if [ "$apply" = 1 ]; then
+      etc_apply_args+=(--apply)
+    else
+      etc_apply_args+=(--dry-run)
+    fi
+    "${etc_apply_args[@]}"
   fi
 
   if [ "$DOM_SYSTEMD_SKIP" = 0 ]; then
@@ -469,11 +483,15 @@ Execution options:
                            only; registers NO generation, writes NO GRUB
                            default, executes nothing (needs no root)
   --apply                  attempt real activation where an executor
-                           exists (today: only bin/ubx-systemd-apply;
-                           requires systemctl on PATH — see its own
-                           --help). Default without --apply: dry-run print.
+                           exists (bin/ubx-etc-apply, bin/ubx-systemd-apply;
+                           the latter requires systemctl on PATH — see its
+                           own --help). Default without --apply: dry-run
+                           print.
   --systemd-unit-dir DIR   (default /etc/systemd/system)
   --systemd-content-dir DIR (default: alongside the new systemd manifest)
+  --etc-dir DIR             the real (or, for tests, temp) /etc root
+                            bin/ubx-etc-apply targets (default /etc)
+  --etc-content-dir DIR     (default: alongside the new etc manifest)
   --users-out FILE          where to write the generated users activation
                             shell script (default: a temp file, printed)
 
@@ -488,6 +506,7 @@ do_rebuild() {
   local root="" title="" rootfs_image="" kernel="" initrd="" root_device="" kernel_params="" snap_manifest=""
   local etc_ref="" systemd_ref="" users_manifest=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
+  local etc_dir="/etc" etc_content_dir=""
   local apply=0 dry_run=0
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
@@ -515,6 +534,8 @@ do_rebuild() {
       --home-state) [ $# -ge 2 ] || die "--home-state requires an argument"; OPT_HOME_STATE="$2"; shift 2 ;;
       --systemd-unit-dir) [ $# -ge 2 ] || die "--systemd-unit-dir requires an argument"; systemd_unit_dir="$2"; shift 2 ;;
       --systemd-content-dir) [ $# -ge 2 ] || die "--systemd-content-dir requires an argument"; systemd_content_dir="$2"; shift 2 ;;
+      --etc-dir) [ $# -ge 2 ] || die "--etc-dir requires an argument"; etc_dir="$2"; shift 2 ;;
+      --etc-content-dir) [ $# -ge 2 ] || die "--etc-content-dir requires an argument"; etc_content_dir="$2"; shift 2 ;;
       --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -578,7 +599,7 @@ do_rebuild() {
     if [ "$dry_run" = 0 ]; then
       local exec_users_out="$users_out"
       [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
-      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out"
+      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir"
       ubx_rebuild_write_booted "$root" "$new_idx"
 
       # -- Soft-reboot activation (issue #30) -----------------------------
@@ -693,12 +714,14 @@ is no longer retained under the given/default retention policy is refused
   --passwd FILE --group FILE --shadow FILE (default /etc/{passwd,group,shadow})
   --users-exceptions FILE --home-state FILE
   --systemd-unit-dir DIR --systemd-content-dir DIR --users-out FILE
+  --etc-dir DIR --etc-content-dir DIR
 USAGE
 }
 
 cmd_rollback() {
   local root="" retain=5 apply=0 dry_run=0 target_arg=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
+  local etc_dir="/etc" etc_content_dir=""
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
 
@@ -716,6 +739,8 @@ cmd_rollback() {
       --home-state) [ $# -ge 2 ] || die "--home-state requires an argument"; OPT_HOME_STATE="$2"; shift 2 ;;
       --systemd-unit-dir) [ $# -ge 2 ] || die "--systemd-unit-dir requires an argument"; systemd_unit_dir="$2"; shift 2 ;;
       --systemd-content-dir) [ $# -ge 2 ] || die "--systemd-content-dir requires an argument"; systemd_content_dir="$2"; shift 2 ;;
+      --etc-dir) [ $# -ge 2 ] || die "--etc-dir requires an argument"; etc_dir="$2"; shift 2 ;;
+      --etc-content-dir) [ $# -ge 2 ] || die "--etc-content-dir requires an argument"; etc_content_dir="$2"; shift 2 ;;
       --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -778,7 +803,7 @@ cmd_rollback() {
   if [ "$dry_run" = 0 ]; then
     local exec_users_out="$users_out"
     [ -n "$exec_users_out" ] || exec_users_out="$root/$target/rollback-users-activate.sh"
-    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out"
+    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir"
     ubx_rebuild_write_booted "$root" "$target"
     ubx_rebuild_write_grub_default "$root" "$target"
     echo "grub default: set to generation $target"

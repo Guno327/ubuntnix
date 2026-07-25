@@ -1574,8 +1574,13 @@ let
           mark_fail S5 "snap install was not blocked"
         fi
         grep -q "managed declaratively" "$s5_log" || mark_fail S5 "guard refusal message missing from $s5_log"
-        apt-get list > /dev/null 2>&1 || mark_fail S5 "a read-only apt-get verb (list) unexpectedly failed"
-        dpkg -l > /dev/null 2>&1 || mark_fail S5 "a read-only dpkg verb (-l) unexpectedly failed"
+        # Read/query verbs must pass through the guards (SPEC.md §7). Use
+        # `apt list` (a real apt read verb -- `list` is an apt, not apt-get,
+        # subcommand) and `dpkg -l`; both read the baked /var/lib/dpkg the
+        # driver made writable above. Capture output into the scenario log
+        # so a failure is diagnosable from the serial dump.
+        apt list >> "$s5_log" 2>&1 || mark_fail S5 "a read-only apt verb (list) unexpectedly failed -- see $s5_log"
+        dpkg -l >> "$s5_log" 2>&1 || mark_fail S5 "a read-only dpkg verb (-l) unexpectedly failed -- see $s5_log"
         echo "UBX-M2-S5-PASS"
 
         # ===== prepare scenario 3: `ubx rebuild test` + a deliberate change

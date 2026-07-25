@@ -417,7 +417,17 @@ let
           # which surfaced the bug (issue #32). The escaped name for these
           # single- and multi-segment absolute paths is the path with its
           # leading slash dropped and remaining slashes turned into dashes
-          # (none of /var,/tmp,/home contain a literal dash to \x2d-escape).
+          # (neither /tmp nor /home contains a literal dash to \x2d-escape).
+          #
+          # NOTE /var is deliberately NOT in the list below: it carries the
+          # compose-time-baked dpkg status database (/var/lib/dpkg) that the
+          # apt/dpkg guards' pass-through READ verbs (`apt-get list`,
+          # `dpkg -l`; SPEC.md §7 / switch-loop scenario 5) need to succeed.
+          # An empty tmpfs would mask it. It stays read-only squashfs here;
+          # a writable-yet-content-preserving /var (overlay or partition,
+          # SPEC.md §4.2) is deferred with the writable generated /etc work.
+          # /tmp must be a real tmpfs (ubx's `mktemp -d`), /home is writable
+          # per §4.2 and empty is harmless (no scenario writes it).
           let
             rel = builtins.substring 1 (builtins.stringLength path) path;
             unitName = (builtins.replaceStrings [ "/" ] [ "-" ] rel) + ".mount";
@@ -430,7 +440,7 @@ let
             ubxrun "$UBX_BASE/bin/ln" -sf "../${unitName}" \
               "$out/etc/systemd/system/local-fs.target.wants/${unitName}"
           '')
-        [ "/var" "/tmp" "/home" ]);
+        [ "/tmp" "/home" ]);
 
       e2eLines =
         if !withE2eAssertService then "" else ''
@@ -1452,25 +1462,37 @@ let
     gen1_kernel="$(manifest_get "$ROOT/1/manifest" GEN_KERNEL_PATH)"
     gen1_initrd="$(manifest_get "$ROOT/1/manifest" GEN_INITRD_PATH)"
 
-    # Make /etc writable for this boot. The users domain's real activation
-    # runs useradd/usermod, which rewrite /etc/passwd (and group/shadow) via
-    # an atomic create-temp-then-rename -- that needs a writable /etc
-    # DIRECTORY, not just writable files, so bind-mounting the individual
-    # files would not suffice. The rootfs /etc is read-only squashfs, so
-    # copy it into tmpfs and bind-mount that back over /etc: the emitted
-    # user-activation script writes there, and `getent passwd`, reading the
-    # same /etc/passwd, then sees the live user. (A real ubuntnix system
-    # gets its writable generated /etc from the generation machinery; the
-    # switch-loop proof's own /etc executor is issue #54. This stands in so
-    # the users primitive -- SPEC.md §11 M2 -- is demonstrated for real.)
-    # Guarded by a /run marker so it runs once per boot (idempotent across
-    # the driver's phase-by-phase re-runs).
-    if [ ! -e /run/ubx-etc-bound ]; then
-      mkdir -p /run/ubx-etc-writable
-      cp -a /etc/. /run/ubx-etc-writable/
-      mount --bind /run/ubx-etc-writable /etc
-      : > /run/ubx-etc-bound
-    fi
+    # Make /etc and /var writable for this boot without losing their
+    # compose-time-baked content: copy each read-only squashfs dir into
+    # tmpfs and bind-mount the copy back over itself.
+    #   /etc -- the users domain's real activation runs useradd/usermod,
+    #     which rewrite /etc/passwd (and group/shadow) via an atomic
+    #     create-temp-then-rename; that needs a writable /etc DIRECTORY (not
+    #     just writable files, so a per-file bind would not suffice), and
+    #     `getent passwd` reads the same /etc/passwd, so it then sees the
+    #     live user.
+    #   /var -- the apt/dpkg guards' pass-through READ verbs (`apt-get
+    #     list`, `dpkg -l`; SPEC.md §7 / scenario 5) read the baked
+    #     /var/lib/dpkg database AND apt opens writable locks under
+    #     /var/lib/apt even to list, so /var must be writable yet keep its
+    #     baked content. An empty tmpfs would destroy the db, which is why
+    #     /var is deliberately NOT in bootRootfs's tmpfs list (it stays
+    #     read-only squashfs at boot); the copy here preserves the db and
+    #     the bind makes it writable.
+    # A real ubuntnix system gets writable generated /etc + /var from the
+    # generation machinery / writable partitions (SPEC.md §4.2; the /etc
+    # executor is issue #54); this stands in so the users primitive and the
+    # read-verb guards -- SPEC.md §11 M2 -- are demonstrated for real. Each
+    # is guarded by a /run marker so it runs once per boot (idempotent
+    # across the driver's phase-by-phase re-runs).
+    for ubx_wdir in etc var; do
+      if [ ! -e "/run/ubx-$ubx_wdir-bound" ]; then
+        mkdir -p "/run/ubx-$ubx_wdir-writable"
+        cp -a "/$ubx_wdir/." "/run/ubx-$ubx_wdir-writable/"
+        mount --bind "/run/ubx-$ubx_wdir-writable" "/$ubx_wdir"
+        : > "/run/ubx-$ubx_wdir-bound"
+      fi
+    done
 
     case "$phase" in
       0)

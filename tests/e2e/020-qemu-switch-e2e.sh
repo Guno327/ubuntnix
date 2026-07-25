@@ -22,6 +22,23 @@
 # hang), the same "trust only what the guest itself asserted to serial"
 # posture tests/e2e/010-qemu-boot-e2e.sh already documents.
 #
+# -- Scenario 2's real /run/nextroot staging (GitHub issue #55) -----------
+#
+# UBX-M2-S2-PASS itself is unchanged, but as of issue #55 the guest driver
+# additionally attempts a REAL `/run/nextroot` staging step (a real
+# `mount -t squashfs` of a real fixture image it builds at runtime with its
+# own installed `mksquashfs`, exercising bin/ubx's real
+# UBX_NEXTROOT_STAGE_CMD default) before falling through to the same
+# `ubx-soft-reboot-stub` scenario 2 always used for the reboot call itself
+# (see nix/boot.nix's switch-loop-proof section header for exactly why a
+# REAL `systemctl soft-reboot` re-exec stays out of scope). This host
+# script does not require the resulting `UBX-M2-S2-REAL-STAGING-PASS`
+# marker -- only the five UBX-M2-Sn-PASS markers below are load-bearing --
+# because the guest legitimately falls back to the pre-#55 stand-in (and
+# only emits an UBX-M2-S2-NOTE line, not a FAIL) if its runtime lacks
+# `mksquashfs` for any reason. A CI run's serial log (--keep-log) will show
+# which path a given boot actually took.
+#
 # -- Why this needs MULTIPLE qemu launches over ONE disk ---------------------
 #
 # Unlike 010's throwaway, `-drive ...,snapshot=on` boot (guest writes

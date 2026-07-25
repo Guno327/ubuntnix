@@ -1049,22 +1049,35 @@ let
   #    and scenarios 1/3 assert the landed bytes directly off live /etc,
   #    not just the touched-domains PLAN/report bookkeeping (GitHub issue
   #    #57).
-  #  - Soft-reboot (scenario 2) invokes `$UBX_SOFT_REBOOT_CMD soft-reboot`
-  #    via a STUB (`ubx-soft-reboot-stub`, just drops a marker file),
-  #    exactly the way bin/ubx's own header documents `UBX_SOFT_REBOOT_CMD`
-  #    existing FOR: "overridable so unit tests can substitute a stub
-  #    script ... which this test harness's containers/CI runners have
-  #    neither the privilege nor the systemd version for". A real
-  #    `systemctl soft-reboot` needs `/run/nextroot` staged with an actual
-  #    alternate rootfs to re-exec into, which is bigger follow-up work
-  #    this issue does not attempt; what IS real here is the delta
-  #    classification that DECIDES to call it (`ubx_rebuild_classify_delta`)
-  #    and the fact that it's called at all for an image-only delta.
-  #    "Package present" for the swapped generation is represented by a
-  #    real, sha256-verified systemd unit's content actually landing and
-  #    starting (the one domain with a real executor today), standing in
-  #    for a literal `.deb` until a real per-generation image-swap
-  #    executor exists.
+  #  - Soft-reboot (scenario 2, GitHub issue #55) is now REAL up through
+  #    the `/run/nextroot` STAGING step: the guest driver builds a small,
+  #    real squashfs image at RUNTIME with its own on-board `mksquashfs`
+  #    (squashfs-tools ships in archive.lock.json's public/locked set, so
+  #    it is already installed in this composed rootfs -- no new build-time
+  #    Nix plumbing needed), passes it as `--rootfs-image`, and leaves
+  #    `UBX_NEXTROOT_STAGE_CMD` UNSET so `ubx rebuild switch` runs bin/ubx's
+  #    real default `_ubx_stage_nextroot` -- a genuine `mount -t squashfs
+  #    -o ro <image> /run/nextroot`, with real root privilege, inside the
+  #    guest. The scenario then asserts /run/nextroot is really a
+  #    mountpoint carrying that image's own content before tearing it back
+  #    down. `$UBX_SOFT_REBOOT_CMD soft-reboot` itself STILL goes through a
+  #    stub (`ubx-soft-reboot-stub`, just drops a marker file), exactly the
+  #    way bin/ubx's own header documents `UBX_SOFT_REBOOT_CMD` existing
+  #    FOR -- because a real re-exec into /run/nextroot needs a full second
+  #    bootable userspace already staged there (systemd, every binary/unit
+  #    this very driver depends on to keep running post-re-exec), not just
+  #    a marker file; building one is bigger follow-up work this issue does
+  #    not attempt, and firing a real `systemctl soft-reboot` at a
+  #    non-bootable /run/nextroot risks hanging the guest with no useful
+  #    signal rather than a clean, diagnosable failure. What IS real here,
+  #    beyond scenario 2's pre-#55 baseline: the actual mount(8) call that
+  #    was the missing half of the mechanism (bin/ubx's `image)` branch used
+  #    to just call `$UBX_SOFT_REBOOT_CMD soft-reboot` with nothing staged
+  #    at all -- see bin/ubx's own header). "Package present" for the
+  #    swapped generation is represented by a real, sha256-verified systemd
+  #    unit's content actually landing and starting (the one domain with a
+  #    real executor today), standing in for a literal `.deb` until a real
+  #    per-generation image-swap executor exists.
   #
   # See tests/e2e/020-qemu-switch-e2e.sh's own header for the host-side
   # orchestration this feeds, and `switchLoopDriverScript` below for the
@@ -1338,13 +1351,12 @@ let
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/etc-content/switch-loop/hello.txt" <<'UBX_M2_ETC_EOF'
     ${switchLoopEtcHelloV2Content}
     UBX_M2_ETC_EOF
-    # A plain marker string standing in for "a different rootfs image
-    # store path" -- ubx_rebuild_classify_delta only ever compares this
-    # value for (in)equality against generation 1/2's own GEN_ROOTFS_IMAGE
-    # field (see this section's own header, decision 2); it is never
-    # dereferenced as a real path by anything in this proof.
-    printf 'ubx-m2-switch-loop-gen3-rootfs-image-marker\n' \
-      > "$out/usr/local/share/ubx-switch-loop/gen3/rootfs-image-marker"
+    # Generation 3's rootfs image is no longer a baked-in marker STRING
+    # (issue #55): it is now a real squashfs image the guest driver itself
+    # builds at RUNTIME, from a fresh per-boot marker, with this rootfs's
+    # own installed mksquashfs -- see switchLoopDriverScript's phase 0,
+    # scenario 2, and this section's own header, decision under "Soft-
+    # reboot (scenario 2, GitHub issue #55)". Nothing to bake here.
 
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen4/etc-manifest.json" <<'UBX_M2_JSON_EOF'
     ${switchLoopGen4EtcManifest}
@@ -1581,11 +1593,45 @@ let
         echo "UBX-M2-S1-PASS"
 
         # ================= scenario 2: image swap / soft-reboot ========
+        # Issue #55: drive REAL /run/nextroot staging when this guest can
+        # build a real fixture squashfs image for it (mksquashfs is part
+        # of this rootfs's own installed package set -- see nix/boot.nix's
+        # own header, "Soft-reboot (scenario 2 ...)"); fall back to the
+        # pre-#55 marker-string stand-in otherwise, so a guest that for any
+        # reason lacks mksquashfs at runtime still exercises the rest of
+        # this scenario rather than spuriously failing it.
+        s2_real_staging=0
+        if command -v mksquashfs > /dev/null 2>&1; then
+          gen3_marker="ubx-m2-s2-nextroot-marker-$$-$(date +%s)"
+          rm -rf /run/ubx-switch-loop/gen3-src
+          mkdir -p /run/ubx-switch-loop/gen3-src
+          printf '%s\n' "$gen3_marker" > /run/ubx-switch-loop/gen3-src/marker
+          gen3_rootfs_image="$STATE/gen3-rootfs.squashfs"
+          rm -f "$gen3_rootfs_image"
+          if mksquashfs /run/ubx-switch-loop/gen3-src "$gen3_rootfs_image" -noappend -no-progress \
+               > "$STATE/s2-mksquashfs.log" 2>&1 && [ -f "$gen3_rootfs_image" ]; then
+            s2_real_staging=1
+          else
+            echo "UBX-M2-S2-NOTE: could not build a real fixture squashfs with this guest's own mksquashfs -- falling back to the marker-string stand-in, see $STATE/s2-mksquashfs.log"
+          fi
+        else
+          echo "UBX-M2-S2-NOTE: mksquashfs not found on PATH -- falling back to the marker-string stand-in for scenario 2's rootfs image"
+        fi
+        if [ "$s2_real_staging" -eq 0 ]; then
+          gen3_rootfs_image="ubx-m2-switch-loop-gen3-rootfs-image-marker"
+        fi
+
+        # `systemctl soft-reboot` itself still goes through a stub
+        # (ubx-soft-reboot-stub) regardless of s2_real_staging -- see this
+        # file's own header for exactly why a REAL re-exec is out of scope
+        # here (it would need a full second bootable userspace staged at
+        # /run/nextroot, not just a marker file).
         export UBX_SOFT_REBOOT_CMD=/usr/local/bin/ubx-soft-reboot-stub
         rm -f /run/ubx-switch-loop/soft-reboot-invoked
+        umount /run/nextroot 2> /dev/null || true
         boot_id_before="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
         "$UBX" rebuild switch --root "$ROOT" \
-          --rootfs-image "$(cat "$ASSETS/gen3/rootfs-image-marker")" \
+          --rootfs-image "$gen3_rootfs_image" \
           --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
           --root-device /dev/vda2 \
           --etc-ref "$ASSETS/gen2/etc-manifest.json" \
@@ -1605,6 +1651,22 @@ let
         [ -f /run/ubx-switch-loop/soft-reboot-invoked ] || mark_fail S2 "soft-reboot was not invoked for an image-only delta"
         [ "$boot_id_before" = "$boot_id_after" ] || mark_fail S2 "boot_id changed -- a full reboot happened where a soft-reboot should have"
         [ -f /run/ubx-switch-loop/canary-c-ran ] || mark_fail S2 "the new generation's package/unit content did not activate"
+
+        if [ "$s2_real_staging" -eq 1 ]; then
+          # -- issue #55's actual new coverage: bin/ubx's real
+          #    UBX_NEXTROOT_STAGE_CMD default (_ubx_stage_nextroot) must
+          #    have really `mount`ed gen3_rootfs_image at /run/nextroot,
+          #    with real root privilege, during the `ubx rebuild switch`
+          #    call above (UBX_NEXTROOT_STAGE_CMD was left unset). ---------
+          mountpoint -q /run/nextroot \
+            || mark_fail S2 "bin/ubx's real UBX_NEXTROOT_STAGE_CMD default did not leave /run/nextroot mounted -- real staging did not happen"
+          [ "$(cat /run/nextroot/marker 2>/dev/null)" = "$gen3_marker" ] \
+            || mark_fail S2 "/run/nextroot is mounted but its content does not match generation 3's own staged image"
+          umount /run/nextroot || mark_fail S2 "could not unmount /run/nextroot after staging assertions"
+          echo "UBX-M2-S2-REAL-STAGING-PASS"
+        else
+          echo "UBX-M2-S2-NOTE: this boot could not exercise real /run/nextroot staging (see the NOTE above) -- scenario 2 still passed via the pre-#55 marker-string stand-in"
+        fi
         echo "UBX-M2-S2-PASS"
 
         # ================= scenario 5: apt/dpkg/snap guards ============
@@ -1632,8 +1694,14 @@ let
         # ===== prepare scenario 3: `ubx rebuild test` + a deliberate change
         old_systemd_ref="$(manifest_get "$ROOT/3/ubx-extra" SYSTEMD_MANIFEST)"
         old_users_ref="$(manifest_get "$ROOT/3/manifest" GEN_USERS_MANIFEST)"
+        # Reuse scenario 2's generation-3 rootfs image (issue #55 replaced the
+        # baked $ASSETS/gen3/rootfs-image-marker file with a runtime-built
+        # squashfs held in $gen3_rootfs_image) so generation 4's image equals
+        # generation 3's -- keeping the gen3->gen4 delta etc-only/live, exactly
+        # as this scenario asserts (`test` applies live, never soft-reboots,
+        # never touches grub-default).
         "$UBX" rebuild test --root "$ROOT" \
-          --rootfs-image "$(cat "$ASSETS/gen3/rootfs-image-marker")" \
+          --rootfs-image "$gen3_rootfs_image" \
           --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
           --root-device /dev/vda2 \
           --etc-ref "$ASSETS/gen4/etc-manifest.json" \

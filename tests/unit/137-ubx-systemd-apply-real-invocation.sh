@@ -122,6 +122,7 @@ contains "$(cat "$STUB_SYSTEMCTL_LOG" 2> /dev/null)" "restart canary.service" ||
 #    Must exit 0.
 # =====================================================================
 export UBX_SOFT_REBOOT_CMD=true # not exercised here (no image delta); guard anyway
+export UBX_NEXTROOT_STAGE_CMD=true # ditto, since issue #55 (nextroot staging)
 
 root="$work/gens"
 etc_ref="$work/etc.json"

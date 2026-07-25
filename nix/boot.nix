@@ -304,6 +304,29 @@ let
       # stay non-executable and the runnable tools stay executable.
       ubxBin = ../bin;
 
+      # bin/ubx-etc's `plan` subcommand defaults `--exceptions` (when the
+      # caller -- here, every `ubx rebuild switch|test`/`ubx rollback`
+      # invocation that declares an etc domain -- doesn't pass one
+      # explicitly) to `default_exceptions_file`, which resolves to
+      # "$(dirname "$0")/../etc.exceptions.json" i.e. ONE LEVEL UP FROM
+      # WHATEVER DIRECTORY `ubx` ITSELF RUNS FROM (bin/ubx-etc's own
+      # comment: "mirrors bin/ubx-generations' UBX_GEN_ROOT-vs-default
+      # pattern for the one path this script needs a default for"). On
+      # this image `ubx` runs as /ubx/bin/ubx, so that default resolves to
+      # /ubx/etc.exceptions.json -- a path nothing used to write here, even
+      # though only bin/ (ubxBin, above) is baked aboard, never the repo
+      # root the real etc.exceptions.json lives in. Any real `ubx rebuild`
+      # call that declares an etc domain and doesn't pass --etc-exceptions
+      # explicitly (the switch-loop-proof's own driver script doesn't; see
+      # nix/boot.nix's switch-loop-proof section) dies inside
+      # `ubx-etc plan` with "no such file: /ubx/etc.exceptions.json" before
+      # ever reaching the systemd/users domains -- this was the root cause
+      # of the M2 switch-loop e2e's scenario 1 "ubx rebuild switch exited
+      # 1" failure (UBX-M2-S1-FAIL). Baking the repo's own
+      # etc.exceptions.json to that exact path fixes it for every
+      # bootRootfs-based image, not just this proof.
+      etcExceptionsContent = builtins.readFile ../etc.exceptions.json;
+
       # The writable-state units (SPEC.md §4.2 lists /var, /home, /ubx,
       # /flake as writable paths): plain tmpfs mounts, ordered before
       # local-fs.target so they're in place well before any service that
@@ -444,6 +467,16 @@ let
         ubxrun "$UBX_BASE/bin/chmod" +x "$out/ubx/bin/ubx"
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
         ubxrun "$UBX_BASE/bin/ln" -sf /ubx/bin/ubx "$out/usr/local/bin/ubx"
+
+        # bin/ubx-etc's default --exceptions path (see the etcExceptionsContent
+        # comment above) resolves to /ubx/etc.exceptions.json when `ubx` runs
+        # as /ubx/bin/ubx -- bake the repo's real etc.exceptions.json there so
+        # any `ubx rebuild`/`ubx rollback` call that declares an etc domain
+        # without an explicit --etc-exceptions still finds a real file instead
+        # of dying with "no such file".
+        ubxrun "$UBX_BASE/bin/cat" > "$out/ubx/etc.exceptions.json" <<'UBX_ETC_EXCEPTIONS_EOF'
+        ${etcExceptionsContent}
+        UBX_ETC_EXCEPTIONS_EOF
 
         # -- the per-generation marker (SPEC.md §4.3's generation model,
         #    kept intentionally tiny for M1 -- a real generation manifest
@@ -1344,6 +1377,39 @@ let
 
     mark_fail() { # SCENARIO REASON
       echo "UBX-M2-$1-FAIL: $2"
+
+      # Surface diagnostic context to the serial console (this script's
+      # stdout) before powering off -- otherwise the only artifact CI
+      # keeps is the one-line marker above and the actual command output
+      # that explains the failure is lost with the ephemeral guest disk.
+      echo "----- BEGIN mark_fail diagnostics -----"
+
+      # Best effort: pull an explicit "... -- see <path>.log" reference
+      # out of the reason string and dump that file first.
+      referenced_log="$(printf '%s\n' "$2" | grep -o '[^ ]*\.log' | tail -n 1)"
+      if [ -n "$referenced_log" ] && [ -f "$referenced_log" ]; then
+        echo "----- BEGIN $referenced_log -----"
+        tail -n 200 "$referenced_log"
+        echo "----- END $referenced_log -----"
+      elif [ -n "$referenced_log" ]; then
+        echo "(referenced log $referenced_log not found)"
+      fi
+
+      echo "----- BEGIN ls -la $STATE -----"
+      ls -la "$STATE" 2> /dev/null
+      echo "----- END ls -la $STATE -----"
+
+      # Fallback: dump every *.log under STATE so nothing is missed even
+      # if the reason string didn't name one (or named one we already
+      # printed above -- duplication here is cheap and safer than a gap).
+      for f in "$STATE"/*.log; do
+        [ -f "$f" ] || continue
+        echo "----- BEGIN $f -----"
+        tail -n 200 "$f"
+        echo "----- END $f -----"
+      done
+
+      echo "----- END mark_fail diagnostics -----"
       sync
       systemctl poweroff
       exit 0

@@ -1,0 +1,14 @@
+{
+  "_comment": "ubuntnix declared snap set (SPEC.md §4.3, §4.4, §4.5, §5, §6; GitHub issue #60, milestone M3). This is the committed input bin/ubx-snap-resolve (the `ubx update` snap-pins portion) resolves against the Snap Store to produce snaps.lock.json. Its shape mirrors `ubuntnix.snaps.<name>` (SPEC.md §6's `ubuntnix.snaps.firefox = { revision = 4090; connections = [ \"camera\" ]; config = { ... }; };` example) -- kept here as a plain JSON file (readable by tooling with no `nix` binary, same reasoning archive.packages.json's header gives) until a real `ubuntnix.snaps` module option exists to declare it from instead (M2+ module-system scope; see bin/ubx-snap-resolve's header for the migration note nix/snap.nix's own header repeats). `channel` always drives resolution (which track/risk/branch to ask the Store about); `revision`, when non-null, additionally PINS the exact revision that channel must resolve to -- the resolver hard-fails if the Store's current channel revision disagrees (see bin/ubx-snap-resolve's build_resolved). `allowUnverifiedPublishers` is the system-wide default for SPEC.md §5's 'verified provenance by default' policy; per-entry `unverifiedPublisher` opts an individual snap in regardless (SPEC.md §4.5's 'a per-system (and per-snap) toggle'). Seeded 2026-07-25 with a single small snap, hello-world (Canonical's own smoke-test snap, verified publisher, strictly confined, zero interesting interfaces) -- exactly the kind of minimal fixture archive.packages.json's own header describes seeding with for its first declared set.",
+  "allowUnverifiedPublishers": false,
+  "snaps": {
+    "hello-world": {
+      "channel": "stable",
+      "revision": null,
+      "classic": false,
+      "connections": [],
+      "config": {},
+      "unverifiedPublisher": false
+    }
+  }
+}

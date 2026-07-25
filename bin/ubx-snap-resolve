@@ -1,0 +1,792 @@
+#!/usr/bin/env bash
+# bin/ubx-snap-resolve — Snap Store resolution: declared snaps
+# (snaps.packages.json) -> pinned snaps.lock.json (SPEC.md §4.3, §4.4,
+# §4.5, §5, §6; GitHub issue #60, milestone M3: "snap lockfile + resolver").
+#
+# -- Mirrors bin/ubx-resolve's own shape, deliberately -----------------------
+#
+# This is the snap-domain sibling of bin/ubx-resolve (see that script's
+# header for the fuller "why does this live outside Nix, as a script under
+# bin/" argument — the same reasoning applies verbatim: resolution answers
+# "what does the declared snap set resolve to *right now*, against the
+# Snap Store as it stands", which is the opposite of what a Nix derivation
+# is for). nix/snap.nix's job is to CONSUME the lockfile this script
+# PRODUCES (fetch + hash-verify each pinned `.snap`/`.assert` as a
+# fixed-output derivation; see that file's header), never to perform
+# resolution itself. `ubx update`'s snap-pins portion (SPEC.md §4.5) shells
+# out to this script, exactly like its archive-pins portion shells out to
+# bin/ubx-resolve.
+#
+# -- The declared set: snaps.packages.json -----------------------------------
+#
+# A committed, plain-JSON file at the repo root — same "readable with no
+# `nix` binary" reasoning archive.packages.json's header gives, and the
+# same interim stand-in for a real `ubuntnix.snaps.<name>` module option
+# (nix/snap.nix's `validate`/`compileManifest` are ready for that option to
+# call once real module evaluation exists — see that file's header). Shape:
+#   {
+#     "allowUnverifiedPublishers": false,
+#     "snaps": {
+#       "<name>": {
+#         "channel": "stable",           # required; track[/risk[/branch]]
+#         "revision": 4090,               # default null; see below
+#         "classic": false,               # default false
+#         "connections": [ "network" ],   # default []; plug/slot names
+#         "config": { "key": "value" },   # default {}; `snap set` values
+#         "unverifiedPublisher": false    # default false; per-snap opt-in
+#       }
+#     }
+#   }
+# `allowUnverifiedPublishers` is the SYSTEM-wide default for SPEC.md §5's
+# "verified provenance by default" policy; `unverifiedPublisher` on an
+# individual entry opts THAT snap in regardless of the system default
+# (SPEC.md §4.5's "a per-system (and per-snap) toggle"). A snap whose
+# publisher the Store reports as unverified is refused at lockfile-emission
+# time unless one of the two says otherwise — see `emit_lockfile` below.
+#
+# `channel` always drives resolution (which track/risk/branch to ask the
+# Store about); `revision`, left `null` by default, additionally PINS the
+# exact revision that channel is expected to resolve to (SPEC.md §6's
+# `ubuntnix.snaps.firefox = { revision = 4090; ... };` primitive). When set,
+# `build_resolved` (below) hard-fails if the Store-resolved revision for
+# that channel disagrees with the pin — the same "never silently accept a
+# different answer than what was declared" posture bin/ubx-resolve's
+# snapshot pinning takes, just checked here instead of baked into the Store
+# query itself (the Store resolves by channel, not by asking for "channel X
+# but only if it's revision Y").
+#
+# -- The injectable Store-access seam ----------------------------------------
+#
+# Real Store access (network, and the host's own `snap` client) is gated
+# behind ONE seam, `UBX_SNAP_RESOLVE_CMD` — the same "UBX_*_CMD" convention
+# bin/ubx (UBX_SOFT_REBOOT_CMD / UBX_NEXTROOT_STAGE_CMD) and
+# bin/ubx-etc-apply already establish: an environment variable naming a
+# command, defaulted to a real internal implementation, invoked with a
+# small fixed argv and expected to communicate over stdout/exit-status
+# only. Here: `"$UBX_SNAP_RESOLVE_CMD" NAME CHANNEL REVISION_PIN` (the third
+# argument is the declared `revision` pin as a decimal string, or "" when
+# unset — always passed, never omitted, so a stub's argv-parsing never has
+# to guess whether a pin was given), expected to print one JSON object to
+# stdout —
+#   { "revision": <int>, "publisher": <string>,
+#     "publisherVerified": <bool>, "snapUrl": <string>,
+#     "snapSha256": <64 hex>, "snapSize": <positive int>,
+#     "assertUrl": <string>, "assertSha256": <64 hex> }
+# — and a nonzero exit on failure. Unit tests (tests/unit/144-*) point this
+# at a small recording stub instead of the real network path, so the whole
+# declared-set -> lockfile pipeline is exercisable offline
+# (tests/README.md's "unit tests must not require root, network, or KVM"
+# rule) even though the DEFAULT implementation (`_ubx_snap_resolve_real`,
+# below) is unapologetically impure.
+#
+# `_ubx_snap_resolve_real` shells out to the host's own `snap` client
+# (present on every supported host, same "reuse Canonical's own tooling"
+# posture bin/ubx-resolve's header gives for apt-get) — `snap download`
+# fetches the real, signed `.snap` payload plus its concatenated assertion
+# chain (`.assert`) for a given channel, and `snap info` is consulted for
+# the Store's publisher-verification flag. Mirrors bin/ubx-resolve's "never
+# trust index metadata blindly": every `sha256` this script ever records is
+# recomputed locally from the actually-downloaded bytes, never taken from
+# any tool's own self-report.
+#
+# -- Emission: schema, sort order, dual-enforced publisher policy -----------
+#
+# `emit_lockfile`, like bin/ubx-resolve's function of the same name, is a
+# PURE function of already-resolved tuples: no network, no `snap` client,
+# just validate + enforce the publisher policy + sort-by-name +
+# JSON-serialize with the fixed (indent=2, ensure_ascii=False, trailing
+# newline) format matching the committed snaps.lock.json byte-for-byte.
+# Reachable two ways: the real path (`resolve`, below), or
+# `--emit-lockfile FILE` (a testing hook identical in spirit to
+# bin/ubx-resolve's own: skip declaration parsing and the Store entirely,
+# feed a fixture JSON array of already-resolved tuples straight into the
+# same validate/policy/sort/format logic). Each resolved tuple additionally
+# carries `_unverifiedPublisherAllowed` (computed once, in `build_resolved`,
+# from the declared entry's own `unverifiedPublisher` OR the declaration's
+# `allowUnverifiedPublishers`) purely so this policy check stays testable
+# in isolation via `--emit-lockfile`; it is NOT part of the persisted
+# schema and is stripped before the file is written. nix/snap.nix's
+# `compileManifest` re-derives and re-enforces this exact policy
+# independently at eval time — the same dual-enforcement posture
+# bin/ubx-systemd/nix/systemd.nix take for the refuse-restart class table.
+#
+# Schema emitted (identical to nix/snap.nix's header comment and
+# tests/lib/validate-snap-lockfile.py, the one shared schema definition):
+#   { "version": 1,
+#     "snaps": [ { name, channel, revision, classic, publisher,
+#                  publisherVerified, connections, config,
+#                  snap: { url, sha256, size },
+#                  assert: { url, sha256 } }, ... sorted by name ] }
+set -euo pipefail
+
+prog_name="ubx-snap-resolve"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<USAGE
+usage: ubx-snap-resolve [options]
+       ubx-snap-resolve --check-declaration [--declaration FILE]
+       ubx-snap-resolve --emit-lockfile FILE [options]
+
+Resolves the declared snap set (default: snaps.packages.json) against the
+Snap Store (real access gated behind the UBX_SNAP_RESOLVE_CMD seam -- see
+this script's header) and writes the resolved (name, channel, revision,
+classic, publisher, publisherVerified, connections, config, snap, assert)
+tuples to a snap lockfile (default: snaps.lock.json) in the exact schema
+nix/snap.nix validates.
+
+options:
+  --declaration FILE    declaration file to resolve
+                         (default: snaps.packages.json)
+  --out FILE             lockfile to write (default: snaps.lock.json)
+  --resolve-cmd CMD      the Store-access seam to invoke as "CMD NAME
+                         CHANNEL REVISION_PIN" for each declared snap
+                         (REVISION_PIN is "" when the declaration leaves
+                         revision unset) (default: \$UBX_SNAP_RESOLVE_CMD,
+                         else the real internal implementation, which
+                         shells out to the host's own 'snap' client)
+  --check-declaration    validate the declaration file and exit 0/1.
+                         No network, no snap client.
+  --emit-lockfile FILE   testing/composition hook: skip declaration parsing
+                         and the Store entirely. FILE is a JSON array of
+                         already-resolved package tuples; emits them
+                         through the exact same validate/policy/sort/format
+                         logic real resolution uses.
+  -h, --help             show this message
+
+Real resolution requires network access to the Snap Store and the host's
+own 'snap' client (present on every supported host). --check-declaration
+and --emit-lockfile require neither.
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+# -- declaration parsing/validation (no network, no snap client) ------------
+#
+# On success, prints the fully-normalized declaration (defaults filled in)
+# as compact JSON to stdout, for `build_resolved` to consume. On failure,
+# prints every violation found to stderr (mirrors bin/ubx-resolve's own
+# validate_declaration / nix/*.nix's `validate` functions: one report
+# enumerating every problem, not just the first) and returns nonzero.
+validate_declaration() {
+  local file="$1"
+  [ -f "$file" ] || die "declaration file does not exist: $file"
+  python3 - "$file" <<'PYEOF'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+errors = []
+
+
+def fail(msg):
+    errors.append(msg)
+
+
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except OSError as e:
+    print(f"FAIL: could not read {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"FAIL: {path} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    print(f"FAIL: {path} top level is not a JSON object", file=sys.stderr)
+    sys.exit(1)
+
+allow_unverified = data.get("allowUnverifiedPublishers", False)
+if not isinstance(allow_unverified, bool):
+    fail(f"'allowUnverifiedPublishers' must be a boolean, got {allow_unverified!r}")
+    allow_unverified = False
+
+snaps = data.get("snaps")
+if not isinstance(snaps, dict) or not snaps:
+    fail("'snaps' must be a non-empty object")
+    snaps = {}
+
+# Snap Store naming rule (real snapd enforces the same shape): lowercase
+# alphanumerics and single hyphens, no leading/trailing/doubled hyphen, and
+# at least one letter (rules out an all-digit name, which snapd also
+# rejects) -- see snapd's own `snap.ValidateName`.
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# Plug/slot interface names and `snap set` keys share the same identifier
+# grammar; `snap set` keys may additionally be dotted (nested config).
+IDENT_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+CONFIG_KEY_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(\.[a-z0-9]+(-[a-z0-9]+)*)*$")
+RISK_RE = r"(?:stable|candidate|beta|edge)"
+TRACK_RE = r"[a-z0-9][a-z0-9._-]*"
+CHANNEL_RE = re.compile(rf"^(?:{TRACK_RE}/)?{RISK_RE}(?:/{TRACK_RE})?$")
+
+normalized = {}
+for name in sorted(snaps):
+    entry = snaps[name]
+    label = f"snaps.{name!r}"
+
+    if not NAME_RE.match(name) or not re.search("[a-z]", name):
+        fail(f"{label}: not a valid snap name (want lowercase alphanumerics/hyphens, at least one letter, no leading/trailing/doubled hyphen)")
+
+    if not isinstance(entry, dict):
+        fail(f"{label} must be an object")
+        continue
+
+    channel = entry.get("channel")
+    if not isinstance(channel, str) or not CHANNEL_RE.match(channel):
+        fail(f"{label}.channel must match [track/]{{stable|candidate|beta|edge}}[/branch], got {channel!r}")
+        channel = None
+
+    revision = entry.get("revision")
+    if revision is not None and (
+        not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0
+    ):
+        fail(f"{label}.revision must be null or a positive integer, got {revision!r}")
+        revision = None
+
+    classic = entry.get("classic", False)
+    if not isinstance(classic, bool):
+        fail(f"{label}.classic must be a boolean, got {classic!r}")
+        classic = False
+
+    connections = entry.get("connections", [])
+    if not isinstance(connections, list):
+        fail(f"{label}.connections must be a list, got {connections!r}")
+        connections = []
+    else:
+        for i, c in enumerate(connections):
+            if not isinstance(c, str) or not IDENT_RE.match(c):
+                fail(f"{label}.connections[{i}] is not a valid interface name: {c!r}")
+
+    config = entry.get("config", {})
+    if not isinstance(config, dict):
+        fail(f"{label}.config must be an object, got {config!r}")
+        config = {}
+    else:
+        for k in config:
+            if not isinstance(k, str) or not CONFIG_KEY_RE.match(k):
+                fail(f"{label}.config has an invalid key (want dotted lowercase identifiers): {k!r}")
+
+    unverified = entry.get("unverifiedPublisher", False)
+    if not isinstance(unverified, bool):
+        fail(f"{label}.unverifiedPublisher must be a boolean, got {unverified!r}")
+        unverified = False
+
+    normalized[name] = {
+        "channel": channel,
+        "revision": revision,
+        "classic": classic,
+        "connections": connections,
+        "config": config,
+        "unverifiedPublisher": unverified,
+    }
+
+if errors:
+    print(f"FAIL: {path} failed schema validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps({"allowUnverifiedPublishers": allow_unverified, "snaps": normalized}))
+PYEOF
+}
+
+# -- real resolution: declaration -> Store seam -> resolved tuples ----------
+#
+# build_resolved NORMALIZED_DECLARATION_JSON RESOLVE_CMD
+#
+# Invokes "$RESOLVE_CMD NAME CHANNEL" once per declared snap (sorted by
+# name), merges the seam's reported fields with the declared ones, and
+# prints a JSON array of resolved tuples to stdout -- the same role
+# bin/ubx-resolve's build_resolved plays for debs, minus the two-pass
+# print-uris/download split (a snap's revision/hashes/publisher are all
+# reported by ONE seam call here, unlike apt's solve-then-fetch split).
+build_resolved() {
+  local decl_json="$1" resolve_cmd="$2"
+  python3 - "$decl_json" "$resolve_cmd" <<'PYEOF'
+import json
+import subprocess
+import sys
+
+decl_json, resolve_cmd = sys.argv[1:3]
+decl = json.loads(decl_json)
+allow_unverified = decl["allowUnverifiedPublishers"]
+
+REQUIRED_SEAM_FIELDS = (
+    "revision", "publisher", "publisherVerified",
+    "snapUrl", "snapSha256", "snapSize", "assertUrl", "assertSha256",
+)
+
+resolved = []
+for name in sorted(decl["snaps"]):
+    entry = decl["snaps"][name]
+    channel = entry["channel"]
+    revision_pin = entry.get("revision")
+
+    proc = subprocess.run(
+        [resolve_cmd, name, channel, "" if revision_pin is None else str(revision_pin)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(
+            f"error: {resolve_cmd!r} failed resolving {name!r} ({channel}): {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        seam = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        print(f"error: {resolve_cmd!r} did not print valid JSON for {name!r}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(seam, dict):
+        print(f"error: {resolve_cmd!r} did not print a JSON object for {name!r}", file=sys.stderr)
+        sys.exit(1)
+    missing = [f for f in REQUIRED_SEAM_FIELDS if f not in seam]
+    if missing:
+        print(
+            f"error: {resolve_cmd!r}'s output for {name!r} is missing required field(s): {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # A declared revision pin is a hard requirement, never a hint: if the
+    # channel's current Store revision has moved past (or never was) the
+    # pinned one, that is a drift the declaration must be updated to
+    # acknowledge explicitly, not something resolution silently papers
+    # over (mirrors bin/ubx-resolve's own "never trust... blindly" posture,
+    # applied to the pin itself rather than to a hash).
+    if revision_pin is not None and seam["revision"] != revision_pin:
+        print(
+            f"error: {name!r} is pinned to revision {revision_pin} but channel "
+            f"{channel!r} resolved to revision {seam['revision']!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    resolved.append({
+        "name": name,
+        "channel": channel,
+        "classic": entry["classic"],
+        "connections": entry["connections"],
+        "config": entry["config"],
+        "revision": seam["revision"],
+        "publisher": seam["publisher"],
+        "publisherVerified": seam["publisherVerified"],
+        "snap": {
+            "url": seam["snapUrl"],
+            "sha256": seam["snapSha256"],
+            "size": seam["snapSize"],
+        },
+        "assert": {
+            "url": seam["assertUrl"],
+            "sha256": seam["assertSha256"],
+        },
+        "_unverifiedPublisherAllowed": bool(entry["unverifiedPublisher"]) or bool(allow_unverified),
+    })
+
+json.dump(resolved, sys.stdout)
+PYEOF
+}
+
+# -- lockfile emission (no network, no snap client) --------------------------
+#
+# emit_lockfile RESOLVED_JSON OUT_FILE
+#
+# See this script's header, "Emission". Writes atomically (OUT_FILE.tmp,
+# then rename) so a validation failure never leaves a partial/corrupt file.
+emit_lockfile() {
+  local resolved_file="$1" out_file="$2"
+  python3 - "$resolved_file" "$out_file" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+resolved_file, out_file = sys.argv[1:3]
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+try:
+    with open(resolved_file, encoding="utf-8") as f:
+        resolved = json.load(f)
+except OSError as e:
+    print(f"error: could not read {resolved_file}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"error: {resolved_file} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(resolved, list) or not resolved:
+    print(
+        f"error: {resolved_file} must contain a non-empty JSON array of resolved snap tuples",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+errors = []
+seen = set()
+for i, s in enumerate(resolved):
+    label = f"resolved[{i}]"
+    if not isinstance(s, dict):
+        errors.append(f"{label} is not an object")
+        continue
+
+    name = s.get("name")
+    if isinstance(name, str):
+        label = f"{label} ({name!r})"
+
+    missing = [f for f in ("name", "channel", "classic", "revision", "publisher", "publisherVerified", "snap", "assert") if f not in s]
+    if missing:
+        errors.append(f"{label} missing required field(s): {', '.join(missing)}")
+        continue
+
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        errors.append(f"{label} has an invalid name: {name!r}")
+    elif name in seen:
+        errors.append(f"duplicate snap name: {name!r}")
+    seen.add(name)
+
+    if not isinstance(s["channel"], str) or not s["channel"]:
+        errors.append(f"{label} 'channel' must be a non-empty string")
+
+    if not isinstance(s["classic"], bool):
+        errors.append(f"{label} 'classic' must be a boolean")
+
+    revision = s["revision"]
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+        errors.append(f"{label} has an invalid revision (want a positive integer): {revision!r}")
+
+    if not isinstance(s["publisher"], str) or not s["publisher"]:
+        errors.append(f"{label} 'publisher' must be a non-empty string")
+
+    verified = s["publisherVerified"]
+    if not isinstance(verified, bool):
+        errors.append(f"{label} 'publisherVerified' must be a boolean")
+        verified = True  # avoid a spurious second error below
+
+    snap = s["snap"]
+    if not isinstance(snap, dict) or not all(k in snap for k in ("url", "sha256", "size")):
+        errors.append(f"{label} 'snap' must be an object with url/sha256/size")
+    else:
+        if not isinstance(snap["sha256"], str) or not SHA256_RE.match(snap["sha256"]):
+            errors.append(f"{label} 'snap.sha256' is malformed (want 64 lowercase hex chars): {snap['sha256']!r}")
+        if not isinstance(snap["size"], int) or isinstance(snap["size"], bool) or snap["size"] <= 0:
+            errors.append(f"{label} 'snap.size' must be a positive integer: {snap['size']!r}")
+        if not isinstance(snap["url"], str) or not snap["url"]:
+            errors.append(f"{label} 'snap.url' must be a non-empty string")
+
+    assertion = s["assert"]
+    if not isinstance(assertion, dict) or not all(k in assertion for k in ("url", "sha256")):
+        errors.append(f"{label} 'assert' must be an object with url/sha256")
+    else:
+        if not isinstance(assertion["sha256"], str) or not SHA256_RE.match(assertion["sha256"]):
+            errors.append(f"{label} 'assert.sha256' is malformed (want 64 lowercase hex chars): {assertion['sha256']!r}")
+        if not isinstance(assertion["url"], str) or not assertion["url"]:
+            errors.append(f"{label} 'assert.url' must be a non-empty string")
+
+    connections = s.get("connections", [])
+    if not isinstance(connections, list) or not all(isinstance(c, str) for c in connections):
+        errors.append(f"{label} 'connections' must be a list of strings")
+
+    config = s.get("config", {})
+    if not isinstance(config, dict):
+        errors.append(f"{label} 'config' must be an object")
+
+    # -- SPEC.md §4.5/§5 verified-publisher-by-default policy, enforced HERE
+    # (dual-enforced again, independently, by nix/snap.nix's
+    # compileManifest -- see this script's header) --------------------------
+    if not errors and not verified and not bool(s.get("_unverifiedPublisherAllowed", False)):
+        errors.append(
+            f"{label} publisher {s['publisher']!r} is not verified, and neither "
+            "this snap's 'unverifiedPublisher' nor the declaration's "
+            "'allowUnverifiedPublishers' opts in (SPEC.md §4.5/§5: verified "
+            "provenance by default)"
+        )
+
+if errors:
+    print("error: resolved snap data failed validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+REQUIRED = ("name", "channel", "revision", "classic", "publisher", "publisherVerified", "connections", "config", "snap", "assert")
+snaps = sorted(
+    (
+        {
+            **{k: s[k] for k in REQUIRED if k in s and k not in ("connections", "config")},
+            "connections": s.get("connections", []),
+            "config": s.get("config", {}),
+        }
+        for s in resolved
+    ),
+    key=lambda s: s["name"],
+)
+
+lockfile = {
+    "_comment": (
+        "ubuntnix snap lockfile (SPEC.md §4.3, §4.4; GitHub issue #60, "
+        "milestone M3). Generated by bin/ubx-snap-resolve: Snap Store "
+        "resolution of the declared snap set in snaps.packages.json -- see "
+        "bin/ubx-snap-resolve's header for the full mechanism. Consumed by "
+        "nix/snap.nix via builtins.fromJSON; see that file for fetch "
+        "mechanics and tests/lib/validate-snap-lockfile.py for the schema "
+        "this file is held to. Every snap.sha256/assert.sha256 below was "
+        "recomputed by bin/ubx-snap-resolve from the actually-downloaded "
+        "bytes -- the Store's own self-reported metadata is never trusted "
+        "blindly. Snaps are sorted by name for a stable diff and a "
+        "byte-identical re-resolution given unchanged inputs. Every entry "
+        "here already passed the verified-publisher policy (SPEC.md "
+        "§4.5/§5) at resolve time; nix/snap.nix re-enforces the identical "
+        "policy independently at eval time."
+    ),
+    "version": 1,
+    "snaps": snaps,
+}
+
+text = json.dumps(lockfile, indent=2, ensure_ascii=False) + "\n"
+
+tmp_out = out_file + ".tmp"
+with open(tmp_out, "w", encoding="utf-8") as f:
+    f.write(text)
+os.replace(tmp_out, out_file)
+
+print(f"wrote {len(snaps)} snap(s) to {out_file}")
+PYEOF
+}
+
+# -- the real (impure) Store-access seam: UBX_SNAP_RESOLVE_CMD's default ----
+#
+# _ubx_snap_resolve_real NAME CHANNEL REVISION_PIN — shells out to the
+# host's own `snap` client. `snap download --basename=X [--revision=N]`
+# writes X.snap (the real, signed payload) and X.assert (a LOCAL,
+# snapd-concatenated assertion chain: snap-revision, snap-declaration,
+# account, account-key) — that local chain is used ONLY to read back the
+# resolved revision and the snap-id (assertions are a simple "headers,
+# blank line, body" text format, not JSON; this project has no reason to
+# depend on snapd's own Go assertion-parsing library just to read a few
+# header lines back out of a file the same invocation just wrote).
+#
+# IMPORTANT: the snap-id is then used to separately fetch, over plain
+# HTTPS, the ONE assertion this project actually PINS: the snap-declaration
+# assertion at its own stable, independently-re-fetchable API URL
+# (api.snapcraft.io's `/v1/snaps/assertions/snap-declaration/16/<snap-id>`
+# — confirmed reachable and stable by hand against the real Store while
+# authoring this script). This is NOT the same bytes as the local
+# `X.assert` file `snap download` wrote (that file also folds in
+# snap-revision/account/account-key, which have no equivalent single
+# stable URL a `<nix/fetchurl.nix>` fixed-output derivation could
+# deterministically re-GET) — hashing the local combined file here, then
+# recording a URL that serves something else entirely, would pin a hash
+# nix/snap.nix's fetch could never actually reproduce (a permanent hash
+# mismatch). Pinning exactly the snap-declaration assertion is a
+# deliberate, documented scope reduction versus a real `snap ack`'s full
+# assertion chain (see docs/snap.md): it is enough to bind a snap name to
+# its snap-id and publisher-id (the fact nix/snap.nix's own policy
+# re-enforcement, and a real signature-checking `snap ack`, would need),
+# but a fully offline `snap ack` of the sideloaded payload additionally
+# needs the snap-revision/account/account-key assertions, which are a
+# tracked gap, not silently glossed over.
+#
+# `snap info` is separately consulted for the Store's own
+# publisher-verification flag (its "publisher:" line carries a trailing
+# checkmark for a verified publisher). Every sha256 recorded is computed
+# locally from bytes this function itself fetched, never taken from any
+# tool's self-report (mirrors bin/ubx-resolve's own "never trust index
+# metadata blindly").
+#
+# This function is NEVER exercised by tests/unit/ (no network, no snap
+# client, no snapd in this harness's containers) -- tests/unit/144 points
+# UBX_SNAP_RESOLVE_CMD at a recording stub instead. It is exercised only by
+# a human/CI with real snapd + network access, exactly like
+# bin/ubx-resolve's own `resolve()` is exercised only by CI's "resolve" job.
+_ubx_snap_resolve_real() {
+  local name="$1" channel="$2" revision_pin="$3"
+  command -v snap > /dev/null 2>&1 || die "'snap' not found on PATH -- real resolution needs the host's own snapd client"
+
+  local work
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064  # intentional: expand $work NOW
+  trap "rm -rf '$work'" RETURN
+
+  local download_args=(--channel="$channel" --basename="$work/pkg" "$name")
+  [ -z "$revision_pin" ] || download_args=(--channel="$channel" --revision="$revision_pin" --basename="$work/pkg" "$name")
+  snap download "${download_args[@]}" 1>&2 \
+    || die "snap download failed for $name ($channel)"
+  [ -f "$work/pkg.snap" ] && [ -f "$work/pkg.assert" ] \
+    || die "snap download did not produce the expected $work/pkg.snap + $work/pkg.assert"
+
+  python3 - "$name" "$channel" "$work/pkg.snap" "$work/pkg.assert" <<'PYEOF'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+name, channel, snap_path, assert_path = sys.argv[1:5]
+
+
+def sha256_of_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+snap_sha256 = sha256_of_file(snap_path)
+snap_size = os.path.getsize(snap_path)
+
+revision = None
+snap_id = None
+publisher_id = None
+with open(assert_path, encoding="utf-8", errors="replace") as f:
+    text = f.read()
+# Best-effort: scan every "key: value" header line across every
+# concatenated assertion block (revision/publisher-id come from the
+# snap-revision block; snap-id/publisher-id are also present in the
+# snap-declaration block) — later occurrences win, which is harmless here
+# since every block agrees on the shared fields for a single resolved
+# snap.
+for line in text.splitlines():
+    if line.startswith("snap-revision:"):
+        try:
+            revision = int(line.split(":", 1)[1].strip())
+        except ValueError:
+            pass
+    elif line.startswith("snap-id:"):
+        snap_id = line.split(":", 1)[1].strip()
+    elif line.startswith("developer-id:") or line.startswith("publisher-id:"):
+        publisher_id = line.split(":", 1)[1].strip()
+
+if revision is None or snap_id is None or publisher_id is None:
+    print(f"error: could not parse the assertion chain for {name!r} (need snap-revision/snap-id/publisher-id)", file=sys.stderr)
+    sys.exit(1)
+
+# Fetch the ONE assertion this project pins -- see this function's header,
+# "IMPORTANT" -- from its own stable, independently-re-fetchable URL.
+# Series "16" is the only assertion-service series that exists for snaps
+# to date.
+assert_url = f"https://api.snapcraft.io/api/v1/snaps/assertions/snap-declaration/16/{snap_id}"
+req = urllib.request.Request(assert_url, headers={"Accept": "application/x.ubuntu.assertion"})
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        assert_bytes = resp.read()
+except Exception as e:
+    print(f"error: fetching the snap-declaration assertion for {name!r} ({snap_id}) failed: {e}", file=sys.stderr)
+    sys.exit(1)
+assert_sha256 = sha256_of_bytes(assert_bytes)
+
+info = subprocess.run(
+    ["snap", "info", f"--channel={channel}", name], capture_output=True, text=True
+)
+publisher_name = publisher_id
+verified = False
+for line in info.stdout.splitlines():
+    if line.strip().startswith("publisher:"):
+        val = line.split(":", 1)[1].strip()
+        verified = "✓" in val
+        publisher_name = val.replace("✓", "").strip()
+
+result = {
+    "revision": revision,
+    "publisher": publisher_name,
+    "publisherVerified": verified,
+    # api.snapcraft.io's documented, confirmed-working per-revision
+    # download URL; recorded for nix/snap.nix's fixed-output fetch, same
+    # role bin/ubx-resolve's recorded `path` plays for a pinned deb.
+    "snapUrl": f"https://api.snapcraft.io/api/v1/snaps/download/{snap_id}_{revision}.snap",
+    "snapSha256": snap_sha256,
+    "snapSize": snap_size,
+    "assertUrl": assert_url,
+    "assertSha256": assert_sha256,
+}
+json.dump(result, sys.stdout)
+PYEOF
+}
+
+resolve() {
+  local declaration_file="$1" out_file="$2" resolve_cmd="$3"
+
+  local decl_tmp resolved_tmp
+  decl_tmp="$(mktemp)"
+  resolved_tmp="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand the paths now, not at trap time
+  trap "rm -f '$decl_tmp' '$resolved_tmp'" EXIT
+
+  validate_declaration "$declaration_file" > "$decl_tmp" || exit 1
+  build_resolved "$(cat "$decl_tmp")" "$resolve_cmd" > "$resolved_tmp"
+  emit_lockfile "$resolved_tmp" "$out_file"
+}
+
+main() {
+  local declaration_file="$script_dir/../snaps.packages.json"
+  local out_file="$script_dir/../snaps.lock.json"
+  local resolve_cmd="${UBX_SNAP_RESOLVE_CMD:-_ubx_snap_resolve_real}"
+  local check_only=0
+  local emit_from=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --declaration)
+        [ $# -ge 2 ] || die "--declaration requires an argument"
+        declaration_file="$2"
+        shift 2
+        ;;
+      --out)
+        [ $# -ge 2 ] || die "--out requires an argument"
+        out_file="$2"
+        shift 2
+        ;;
+      --resolve-cmd)
+        [ $# -ge 2 ] || die "--resolve-cmd requires an argument"
+        resolve_cmd="$2"
+        shift 2
+        ;;
+      --check-declaration)
+        check_only=1
+        shift
+        ;;
+      --emit-lockfile)
+        [ $# -ge 2 ] || die "--emit-lockfile requires an argument"
+        emit_from="$2"
+        shift 2
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "$prog_name: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [ "$check_only" = 1 ]; then
+    validate_declaration "$declaration_file" > /dev/null
+    echo "$prog_name: $declaration_file: OK"
+    exit 0
+  fi
+
+  if [ -n "$emit_from" ]; then
+    [ -f "$emit_from" ] || die "resolved-snap file does not exist: $emit_from"
+    emit_lockfile "$emit_from" "$out_file"
+    exit 0
+  fi
+
+  resolve "$declaration_file" "$out_file" "$resolve_cmd"
+}
+
+main "$@"

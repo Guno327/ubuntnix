@@ -131,6 +131,107 @@ jobs:
             cat mismatch.log
             exit 1
           }
+      # Declared snap surface + snap lockfile + vendoring proof (SPEC.md
+      # §4.3, §4.4, §4.5, §6; issue #60, M3): nix/snap.nix's compileManifest
+      # + renderManifest evaluated end to end against a small fixture
+      # declaration (one snap, hello-world) cross-referenced against the
+      # REAL committed snaps.lock.json -- the one part of this issue that
+      # can only be exercised where a real `nix` binary exists; the
+      # resolver half (bin/ubx-snap-resolve) is unit-tested without one
+      # under tests/unit/14x (see nix/snap.nix's own header, "What this
+      # file is, and what it deliberately is NOT").
+      #
+      # `--option sandbox relaxed`: same reason as stdenv-proof/
+      # archive-fetch-proof above -- built via runInUbuntuBase, which
+      # transitively depends on nix/stdenv.nix's one `__noChroot = true`
+      # derivation.
+      - name: Build snap-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#snap-proof -L -o result-snap-proof
+          sudo chown -R "$USER" result-snap-proof
+      - name: Assert snap-proof manifest
+        run: |
+          [ -s result-snap-proof ] || { echo "no snap-proof manifest produced"; exit 1; }
+          python3 -c "
+          import json
+          m = json.load(open('result-snap-proof'))
+          assert m['version'] == 1, m
+          snaps = {s['name']: s for s in m['snaps']}
+          assert 'hello-world' in snaps, snaps
+          s = snaps['hello-world']
+          assert s['channel'] == 'stable', s
+          assert s['publisherVerified'] is True, s
+          print('snap-proof manifest OK:', s)
+          "
+      # snap-fetch-proof (issue #60, mirrors archive-fetch-proof above):
+      # depends on EVERY pinned snaps.lock.json entry's `.snap`/`.assert`
+      # FODs (forcing Nix to actually fetch-and-verify each one against its
+      # pinned sha256) and writes a deterministic manifest recording a
+      # sha256sum RECOMPUTED INSIDE THE SANDBOX for each.
+      - name: Build snap-fetch-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#snap-fetch-proof -L
+          sudo chown "$USER" result
+      - name: Assert snap-fetch-proof output
+        run: |
+          grep -q 'MARKER=ubuntnix-snap-fetch-proof-v1' result
+          grep -q 'snap name=hello-world' result
+      # Negative case (issue #60, mirrors archive-hash-mismatch-proof
+      # above): snap-hash-mismatch-proof fetches a real pinned snap
+      # payload's URL but with a deliberately WRONG sha256. This build MUST
+      # FAIL with Nix's own "hash mismatch" error.
+      - name: Build snap-hash-mismatch-proof (expected to fail)
+        run: |
+          if sudo nix --extra-experimental-features 'nix-command flakes' build .#snap-hash-mismatch-proof -L >snap-mismatch.log 2>&1; then
+            echo "snap-hash-mismatch-proof built successfully — it must fail (hash verification is broken)" >&2
+            cat snap-mismatch.log
+            exit 1
+          fi
+          grep -qi 'hash mismatch' snap-mismatch.log || {
+            echo "snap-hash-mismatch-proof failed, but not with a hash mismatch — unexpected failure mode" >&2
+            cat snap-mismatch.log
+            exit 1
+          }
+      # Live snap-declaration assertion drift check (SPEC.md §4.3, §4.4;
+      # issue #60, M3). nix/snap.nix's `fetchAssert` no longer touches the
+      # network at all -- it reads the COMMITTED, VENDORED
+      # snaps/assertions/<name>_<revision>.snap-declaration file (see that
+      # file's header, "Vendoring"), because api.snapcraft.io's
+      # snap-declaration assertion endpoint content-negotiates on the
+      # `Accept` request header (real signed assertion bytes WITH
+      # `Accept: application/x.ubuntu.assertion`; a small, useless JSON
+      # wrapper with no/any other Accept -- which is ALL a plain GET, and
+      # therefore ALL a `<nix/fetchurl.nix>` fixed-output derivation, can
+      # ever send). That means snap-fetch-proof above no longer catches
+      # Canonical re-signing a snap-declaration out from under the vendored
+      # file/lockfile pin -- this step, plain bash + curl (NOT a Nix
+      # build), closes that gap by fetching the LIVE assertion with the
+      # correct header and diffing its sha256 against both the committed
+      # vendored file and the lockfile's own `assert.sha256` pin. Fails the
+      # job loudly (`set -euo pipefail`, explicit mismatch checks) on any
+      # disagreement, since a silent pass here would be worse than no
+      # check at all.
+      - name: Verify vendored snap-declaration assertion matches the live Snap Store
+        run: |
+          set -euo pipefail
+          vendored="snaps/assertions/hello-world_29.snap-declaration"
+          [ -f "$vendored" ] || { echo "missing vendored assertion file: $vendored" >&2; exit 1; }
+          pinned_sha256="$(python3 -c "import json; print(json.load(open('snaps.lock.json'))['snaps'][0]['assert']['sha256'])")"
+          vendored_sha256="$(sha256sum "$vendored" | cut -d' ' -f1)"
+          [ "$vendored_sha256" = "$pinned_sha256" ] || {
+            echo "committed vendored file $vendored (sha256 $vendored_sha256) does not match snaps.lock.json's assert.sha256 ($pinned_sha256) -- the two are supposed to be kept in lockstep by bin/ubx-snap-resolve" >&2
+            exit 1
+          }
+          assert_url="https://api.snapcraft.io/api/v1/snaps/assertions/snap-declaration/16/buPKUD3TKqCOgLEjjHx5kSiCpIs5cMuQ"
+          live="$(mktemp)"
+          curl -fsSL -H 'Accept: application/x.ubuntu.assertion' -o "$live" "$assert_url"
+          live_sha256="$(sha256sum "$live" | cut -d' ' -f1)"
+          rm -f "$live"
+          [ "$live_sha256" = "$pinned_sha256" ] || {
+            echo "the LIVE snap-declaration assertion at $assert_url now hashes to $live_sha256, but the committed vendored file/lockfile pin $pinned_sha256 -- Canonical appears to have re-signed the assertion; re-run bin/ubx-snap-resolve and commit the regenerated snaps/assertions/hello-world_29.snap-declaration + snaps.lock.json" >&2
+            exit 1
+          }
+          echo "live snap-declaration assertion matches the committed vendored file and lockfile pin ($pinned_sha256)"
       # Generated /etc proof (SPEC.md §4.2/§4.3; issue #26, M2):
       # nix/etc.nix's `render` evaluated end to end against a small fixture
       # declaration (two entries: a `text` file and a `text` file with

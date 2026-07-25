@@ -130,8 +130,9 @@ export STUB_PURGE_RECORD="$purge_record"
 out="$(run_rebuild "$root2" switch --apply 2>&1)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "'rebuild switch --apply' should exit 0, got $rc: $out"
-[ -f "$purge_record" ] && [ "$(cat "$purge_record")" = "htop-snap" ] \
-  || fail "'rebuild switch --apply' should have really purged exactly 'htop-snap', recorded: $(cat "$purge_record" 2>/dev/null)"
+if [ ! -f "$purge_record" ] || [ "$(cat "$purge_record")" != "htop-snap" ]; then
+  fail "'rebuild switch --apply' should have really purged exactly 'htop-snap', recorded: $(cat "$purge_record" 2>/dev/null)"
+fi
 
 # =====================================================================
 # 3) `rebuild test --apply`: NEVER passes --apply through to

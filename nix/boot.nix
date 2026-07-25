@@ -1232,9 +1232,18 @@ let
       real_path="$out/usr/bin/$1"
       if [ -e "$real_path" ] && [ ! -L "$real_path" ]; then
         ubxrun "$UBX_BASE/bin/mv" "$real_path" "$real_path.ubx-real"
+        # UBX_GUARD_REAL_BIN must be the RUNTIME path of the diverted binary
+        # (/usr/bin/<cmd>.ubx-real once this rootfs is the live root), NOT
+        # the build-time "$out"-prefixed store path -- baking the latter
+        # made pass-through read verbs fail at runtime with "UBX_GUARD_REAL_BIN
+        # =/nix/store/...-boot-rootfs.../usr/bin/apt.ubx-real is not an
+        # executable file" (that store path is not mounted on the booted
+        # guest). Blocked verbs never deref it, which is why only the read
+        # verbs surfaced the bug. The heredoc is unquoted, so $1 expands to
+        # the command name at build time.
         ubxrun "$UBX_BASE/bin/cat" > "$real_path" <<UBX_M2_GUARD_EOF
     #!/bin/sh
-    export UBX_GUARD_REAL_BIN=$real_path.ubx-real
+    export UBX_GUARD_REAL_BIN=/usr/bin/$1.ubx-real
     exec /ubx/bin/$2 "\$@"
     UBX_M2_GUARD_EOF
         ubxrun "$UBX_BASE/bin/chmod" +x "$real_path"

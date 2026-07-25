@@ -1186,18 +1186,25 @@ let
   # squashfs); (6) the guest driver script + its two units (the mount unit
   # and the driver's own oneshot service).
   switchLoopExtraFilesScript = ''
-    # -- (1) generation 1's baseline systemd units, for real -------------
-    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-m2-canary-a.service" <<'UBX_M2_UNIT_EOF'
+    # -- (1) generation 1's baseline systemd unit CONTENT, baked as a
+    #    read-only fixture under gen1/systemd-content (NOT into /etc). The
+    #    baseline is established at RUNTIME by the guest driver copying
+    #    these into /run/systemd/system before the gen1->gen2 switch (see
+    #    switchLoopDriverScript's phase 0). This matters for correctness:
+    #    the switch installs the CHANGED canary-b into that same
+    #    /run/systemd/system dir, and a baseline baked into the read-only
+    #    /etc/systemd/system would SHADOW it -- /etc outranks /run in
+    #    systemd's unit search path -- so `systemctl restart` would re-run
+    #    the OLD content and canary-b's changed content would never activate
+    #    (the S1 failure this replaces). Keeping every unit the switch
+    #    touches in /run lets the override actually take effect.
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content/ubx-m2-canary-a.service" <<'UBX_M2_UNIT_EOF'
     ${switchLoopCanaryA}
     UBX_M2_UNIT_EOF
-    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-m2-canary-b.service" <<'UBX_M2_UNIT_EOF'
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/systemd-content/ubx-m2-canary-b.service" <<'UBX_M2_UNIT_EOF'
     ${switchLoopCanaryBGen1}
     UBX_M2_UNIT_EOF
-    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/multi-user.target.wants"
-    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-m2-canary-a.service \
-      "$out/etc/systemd/system/multi-user.target.wants/ubx-m2-canary-a.service"
-    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-m2-canary-b.service \
-      "$out/etc/systemd/system/multi-user.target.wants/ubx-m2-canary-b.service"
 
     # -- (2) apt/dpkg/snap mutation guards (SPEC.md §7, bin/ubx-guard-lib's
     #    documented install contract: divert the real binary aside, install
@@ -1448,6 +1455,21 @@ let
     case "$phase" in
       0)
         # ================= scenario 1: config/service/user switch ======
+        # Establish generation 1's baseline systemd units in the writable,
+        # always-present /run/systemd/system (rather than baking them into
+        # the read-only /etc, which would outrank /run and shadow the
+        # switch's own write below -- see the extraFilesScript's block (1)),
+        # then start them so the gen1->gen2 switch has a real prior state to
+        # converge FROM.
+        mkdir -p /run/systemd/system
+        cp "$ASSETS/gen1/systemd-content/ubx-m2-canary-a.service" \
+           "$ASSETS/gen1/systemd-content/ubx-m2-canary-b.service" \
+           /run/systemd/system/
+        systemctl daemon-reload
+        systemctl start ubx-m2-canary-a.service ubx-m2-canary-b.service
+        [ -f /run/ubx-switch-loop/canary-a-ran ] || mark_fail S1 "baseline canary-a did not run when established in /run"
+        [ -f /run/ubx-switch-loop/canary-b-ran ] || mark_fail S1 "baseline canary-b did not run when established in /run"
+
         ts_a_before="$(stat -c %Y /run/ubx-switch-loop/canary-a-ran 2>/dev/null || echo 0)"
         "$UBX" rebuild switch --root "$ROOT" \
           --rootfs-image "$gen1_rootfs_image" --kernel "$gen1_kernel" --initrd "$gen1_initrd" \

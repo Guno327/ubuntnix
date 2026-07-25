@@ -618,8 +618,9 @@ _ubx_snap_resolve_real() {
   [ -z "$revision_pin" ] || download_args=(--channel="$channel" --revision="$revision_pin" --basename="$work/pkg" "$name")
   snap download "${download_args[@]}" 1>&2 \
     || die "snap download failed for $name ($channel)"
-  [ -f "$work/pkg.snap" ] && [ -f "$work/pkg.assert" ] \
-    || die "snap download did not produce the expected $work/pkg.snap + $work/pkg.assert"
+  if [ ! -f "$work/pkg.snap" ] || [ ! -f "$work/pkg.assert" ]; then
+    die "snap download did not produce the expected $work/pkg.snap + $work/pkg.assert"
+  fi
 
   python3 - "$name" "$channel" "$work/pkg.snap" "$work/pkg.assert" <<'PYEOF'
 import hashlib

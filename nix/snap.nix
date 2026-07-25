@@ -171,10 +171,10 @@ let
   checkLockEntry = e:
     let
       hasAll = e ? name && e ? channel && e ? revision && e ? classic
-        && e ? publisher && e ? publisherVerified && e ? snap && e ? assert;
+        && e ? publisher && e ? publisherVerified && e ? snap && e ? "assert";
       label = if e ? name then "snaps.lock.json entry \"${toString e.name}\"" else "a snaps.lock.json entry";
       snapOk = hasAll && e.snap ? sha256 && builtins.isString e.snap.sha256 && builtins.match sha256Re e.snap.sha256 != null;
-      assertOk = hasAll && e.assert ? sha256 && builtins.isString e.assert.sha256 && builtins.match sha256Re e.assert.sha256 != null;
+      assertOk = hasAll && e."assert" ? sha256 && builtins.isString e."assert".sha256 && builtins.match sha256Re e."assert".sha256 != null;
       revisionOk = hasAll && builtins.isInt e.revision && e.revision > 0;
     in
     (if hasAll then [ ] else [ "${label} is missing one of the required fields (name/channel/revision/classic/publisher/publisherVerified/snap/assert)" ])
@@ -354,8 +354,8 @@ let
 
   fetchAssert = entry:
     import <nix/fetchurl.nix> {
-      url = entry.assert.url;
-      sha256 = entry.assert.sha256;
+      url = entry."assert".url;
+      sha256 = entry."assert".sha256;
       name = sanitizeStoreName "${entry.name}_${toString entry.revision}.assert";
     };
 
@@ -367,7 +367,7 @@ let
       name = entry.name;
       value = {
         snap = fetchSnap entry;
-        assert = fetchAssert entry;
+        "assert" = fetchAssert entry;
       };
     })
     lockEntries);
@@ -433,7 +433,7 @@ in
             let entry = entryAt i; in
             [
               { name = snapEnvName i; value = snaps.${entry.name}.snap; }
-              { name = assertEnvName i; value = snaps.${entry.name}.assert; }
+              { name = assertEnvName i; value = snaps.${entry.name}."assert"; }
             ])
           indices);
 

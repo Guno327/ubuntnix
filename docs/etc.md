@@ -14,8 +14,10 @@ applies that plan to a real `/etc` — writing, chowning (when run as root),
 chmod'ing, and removing files exactly as the plan describes — dry-run by
 default, gated behind `--apply`. `ubx rebuild switch|test` and
 `ubx rollback` wire it in automatically (see "Applying: `bin/ubx-etc-apply`"
-below); real QEMU switch-loop end-to-end coverage of the whole chain is
-still separate, later work.
+below); the real QEMU switch-loop end-to-end proof (`nix/boot.nix`'s
+switch-loop section, GitHub issue #57) now runs `ubx-etc-apply` for real
+against a live, writable `/etc` and asserts the landed file content
+directly, not just the touched-domains plan/report bookkeeping.
 ```
 
 ## The declaration surface
@@ -187,6 +189,7 @@ automatically once a generation declares an `/etc` manifest — see
 
 `nix/etc.nix`, `bin/ubx-etc plan`/`observe`/`exceptions`, and
 `bin/ubx-etc-apply` all land at milestone **M2** (`SPEC.md` §11, issues
-#26, #54). A real QEMU switch-loop end-to-end exercise of the whole chain
-is later work, tracked alongside {doc}`generations`' own activation/GC
-follow-ups.
+#26, #54). The real QEMU switch-loop end-to-end exercise of the whole
+chain (GitHub issue #57) now runs alongside `nix/boot.nix`'s other M2
+switch-loop scenarios, tracked alongside {doc}`generations`' own
+activation/GC follow-ups.

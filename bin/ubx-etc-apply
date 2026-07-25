@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# bin/ubx-etc-apply — THIN `/etc` activation EXECUTOR (SPEC.md §4.2
+# "generated `/etc`", §4.3 switching-table row 1 "generate + diff + restart
+# changed units", §7 drift reporting; GitHub issue #26's own forward
+# reference, GitHub issue #54, milestone M2).
+#
+# Consumes a plan produced by `bin/ubx-etc plan` (TAB-separated
+# ACTION/PATH/OWNER/GROUP/MODE/SHA256 lines — see that script's header for
+# the exact schema) and issues the exact filesystem calls it describes, IN
+# THE PLAN'S OWN ORDER (the plan is already sorted by path — this script
+# never re-sorts, groups, or second-guesses a single decision the planner
+# already made). Mirrors bin/ubx-systemd-apply's own executor pattern
+# almost line for line — see that script's header for the precedent this
+# follows: a deliberately dumb, thin executor, `--apply`-gated, dry-run by
+# default, printing exactly the commands it would run either way.
+#
+# -- Content source: --content-dir/<path> -----------------------------------
+#
+# The plan itself only carries a target sha256, never raw bytes (same
+# reasoning as bin/ubx-systemd-apply's --content-dir option). Real content
+# lives at `--content-dir/<path>` — exactly nix/etc.nix's `render`'s own
+# `$out/tree/<path>` layout (see that file's header, "Interface with
+# bin/ubx-etc / bin/ubx-etc-apply"); a real `ubx rebuild switch` points
+# --content-dir at that tree (or, today, alongside a hand-supplied
+# manifest.json fixture — see bin/ubx's own --etc-content-dir default,
+# which mirrors --systemd-content-dir's identical "alongside the manifest"
+# default rather than assuming a real nix-composed tree/ subdirectory,
+# since nix/etc.nix's wiring into nix/compose.nix does not exist yet
+# either).
+#
+# -- Per-action behavior ------------------------------------------------
+#
+#   create / update-content   atomically install --content-dir/PATH to
+#                              --etc-dir/PATH with the plan's target mode
+#                              (and owner/group — see "Privilege" below),
+#                              creating parent directories as needed.
+#                              GNU `install -D` is used deliberately, not a
+#                              bare `cp`: coreutils' `install` builds the
+#                              destination in a temp file in the SAME
+#                              directory and renames it into place, so a
+#                              reader never observes a partially-written
+#                              target — the same atomic-write guarantee
+#                              bin/ubx-etc's own `write_out` gives its
+#                              manifest/plan outputs, just at the `install`
+#                              layer instead of a hand-rolled mktemp+mv (no
+#                              reason to reimplement what the coreutils
+#                              tool this project already depends on already
+#                              does correctly).
+#   update-metadata            re-apply owner/group/mode to an
+#                              already-content-correct file; never rewrites
+#                              its bytes.
+#   remove                     `rm -f` the target. Idempotent by
+#                              construction (see bin/ubx-systemd-apply's
+#                              recent "idempotent teardown" fix, which this
+#                              mirrors): removing a path that is already
+#                              gone is the desired end state holding, not a
+#                              failure — `rm -f` never errors on a missing
+#                              path, so no special-case handling is needed
+#                              here the way bin/ubx-systemd-apply needed one
+#                              for `systemctl stop`/`disable`.
+#   drift                      informational only (SPEC.md §7: drift is
+#                              surfaced, not touched here — purge policy
+#                              belongs to a later converge-report
+#                              component). Never becomes a filesystem call
+#                              in either --dry-run or --apply; printed to
+#                              STDERR immediately, in both modes, since it
+#                              is not part of the command sequence this
+#                              script's own stdout otherwise prints/runs
+#                              (see below).
+#
+# -- Privilege: testable without root, real ownership only as root ----------
+#
+# Applying arbitrary owner/group to a file requires root (or the right
+# CAP_CHOWN) in any real Unix — this executor must still be exercisable by
+# this project's own unit tests, which run unprivileged (tests/README.md's
+# "no root, no network" posture). The choice made here: owner/group are
+# only ever applied (via `install -D`'s own `-o`/`-g` flags for
+# create/update-content, or a separate `chown` for update-metadata) when
+# this process's effective uid is 0. When not running as root, those flags/
+# calls are simply never emitted — not attempted-then-swallowed — so a
+# content-only apply into a user-owned temp `--etc-dir` exits 0 with
+# correct content and mode, and a genuine failure (e.g. a bad owner name,
+# or a permissions problem while actually running as root) is never
+# silently hidden: every command this script DOES emit still runs under
+# `set -e` inside the same fatal-by-default temp script
+# bin/ubx-systemd-apply's own `--apply` branch uses, so a real error still
+# aborts with a non-zero exit. `mode` (chmod) is always applied regardless
+# of privilege — chmod on a file you own never requires root.
+set -euo pipefail
+
+prog_name="ubx-etc-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-etc-apply --plan FILE [--content-dir DIR] [--etc-dir DIR] [--apply | --dry-run]
+
+Consumes a plan produced by `bin/ubx-etc plan` and issues the
+corresponding install/chown/chmod/rm calls, in the plan's own order.
+
+  --plan FILE       the plan TSV to apply (required)
+  --content-dir DIR where a create/update-content action's source bytes are
+                     read from, as --content-dir/PATH (default: ".")
+  --etc-dir DIR      the real (or, for tests, temp) /etc root every action
+                     targets (default: /etc)
+  --apply            actually run commands
+  --dry-run          print, don't run (default)
+
+Owner/group are only ever applied when running as root (euid 0) — see this
+script's header, "Privilege". `drift` lines are always printed to stderr,
+in both modes, and never become a filesystem call.
+USAGE
+}
+
+main() {
+  local plan="" content_dir="." etc_dir="/etc" mode="dry-run"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --content-dir) [ $# -ge 2 ] || die "--content-dir requires an argument"; content_dir="$2"; shift 2 ;;
+      --etc-dir) [ $# -ge 2 ] || die "--etc-dir requires an argument"; etc_dir="$2"; shift 2 ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+
+  local can_chown=0
+  [ "$(id -u)" != 0 ] || can_chown=1
+
+  local commands
+  commands="$(python3 - "$plan" "$content_dir" "$etc_dir" "$can_chown" <<'PYEOF'
+import shlex
+import sys
+
+plan_path, content_dir, etc_dir, can_chown = sys.argv[1:5]
+can_chown = can_chown == "1"
+
+lines = []
+
+
+def emit(argv):
+    lines.append(" ".join(shlex.quote(a) for a in argv))
+
+
+with open(plan_path, encoding="utf-8") as f:
+    for raw in f:
+        raw = raw.rstrip("\n")
+        if not raw:
+            continue
+        fields = raw.split("\t")
+        if len(fields) != 6:
+            print(f"ubx-etc-apply: malformed plan line (want 6 TAB-separated fields, got {len(fields)}): {raw!r}", file=sys.stderr)
+            sys.exit(1)
+        action, path, owner, group, fmode, sha256 = fields
+        target = f"{etc_dir}/{path}"
+        src = f"{content_dir}/{path}"
+
+        if action in ("create", "update-content"):
+            argv = ["install", "-D", "-m", fmode]
+            if can_chown:
+                argv += ["-o", owner, "-g", group]
+            argv += [src, target]
+            emit(argv)
+        elif action == "update-metadata":
+            emit(["chmod", fmode, target])
+            if can_chown:
+                emit(["chown", f"{owner}:{group}", target])
+        elif action == "remove":
+            emit(["rm", "-f", target])
+        elif action == "drift":
+            # Informational only -- never a filesystem call (see this
+            # script's header). Printed straight to stderr, immediately,
+            # in BOTH --dry-run and --apply -- unlike the mutating actions
+            # above, this is not part of the command sequence this
+            # script's stdout otherwise prints (--dry-run) or executes
+            # (--apply), so it must not wait for that branch to decide
+            # anything.
+            print(
+                f"ubx-etc-apply: drift: {path} (observed owner={owner} group={group} mode={fmode} sha256={sha256}) -- no action taken",
+                file=sys.stderr,
+            )
+        else:  # pragma: no cover -- defensive; bin/ubx-etc never emits this
+            print(f"ubx-etc-apply: unknown plan action: {action!r}", file=sys.stderr)
+            sys.exit(1)
+
+print("\n".join(lines))
+PYEOF
+  )"
+
+  if [ "$mode" = "dry-run" ]; then
+    if [ -n "$commands" ]; then
+      printf '%s\n' "$commands"
+    fi
+    exit 0
+  fi
+
+  # --apply: run each command line via a temp script, same pattern
+  # bin/ubx-systemd-apply's own --apply branch uses (see that script's
+  # tests/unit/137 for exactly why the trap below expands $script NOW,
+  # double-quoted, rather than lazily at EXIT-trap-fire time).
+  local script
+  script="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $script NOW
+  trap "rm -f '$script'" EXIT
+  {
+    printf '#!/bin/sh\nset -e\n'
+    printf '%s\n' "$commands"
+  } > "$script"
+  chmod +x "$script"
+  "$script"
+}
+
+main "$@"

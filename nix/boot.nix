@@ -1037,16 +1037,18 @@ let
   # -- What's a faithful exercise of real code vs. a documented stand-in ---
   #
   #  - `ubx rebuild switch|test`, `ubx rollback`, the GRUB-default/booted/
-  #    current bookkeeping, `ubx-systemd` plan+apply (real content, real
-  #    `systemctl`), `ubx-users` plan (real) + the emitted activation
-  #    script (run for real by the driver -- `ubx-users execute` itself
-  #    only ever EMITS a script, by design; see bin/ubx-rebuild-lib's
-  #    header), and the apt/dpkg/snap guards (real scripts, real
-  #    diversion) are ALL exercised for real here.
-  #  - `/etc` activation has NO executor yet (`bin/ubx-etc-apply` does not
-  #    exist -- bin/ubx's own header calls this out explicitly); this
-  #    proof's etc-domain fixtures exist only to exercise the real
-  #    touched-domains PLAN/report bookkeeping, never a live file write.
+  #    current bookkeeping, `ubx-etc` plan+apply (real content, real
+  #    `install -D` onto the writable /etc bind-mount below), `ubx-systemd`
+  #    plan+apply (real content, real `systemctl`), `ubx-users` plan (real)
+  #    + the emitted activation script (run for real by the driver --
+  #    `ubx-users execute` itself only ever EMITS a script, by design; see
+  #    bin/ubx-rebuild-lib's header), and the apt/dpkg/snap guards (real
+  #    scripts, real diversion) are ALL exercised for real here.
+  #  - `/etc` activation (`bin/ubx-etc-apply`, issue #54) runs for real
+  #    against this boot's writable /etc bind-mount (see decision 1 below)
+  #    and scenarios 1/3 assert the landed bytes directly off live /etc,
+  #    not just the touched-domains PLAN/report bookkeeping (GitHub issue
+  #    #57).
   #  - Soft-reboot (scenario 2) invokes `$UBX_SOFT_REBOOT_CMD soft-reboot`
   #    via a STUB (`ubx-soft-reboot-stub`, just drops a marker file),
   #    exactly the way bin/ubx's own header documents `UBX_SOFT_REBOOT_CMD`
@@ -1133,10 +1135,18 @@ let
   #    baked baseline" this image boots with; gen2/gen3/gen4's are read-
   #    only fixtures the guest driver feeds to real `ubx rebuild` calls --
   #    see this section's own header, decision 2). --------------------
+  # Content bytes for the two etc-managed fixture files -- let-bound once
+  # so the manifest builders below (which hash them into `sha256`) and the
+  # extraFilesScript staging (which writes the same bytes under each
+  # generation's `etc-content/` dir, read at runtime via `--etc-content-dir`)
+  # can never drift apart.
+  switchLoopEtcHelloV2Content = "hello v2\n";
+  switchLoopEtcTestMarkerContent = "test v4 -- scenario 3's deliberate change\n";
+
   switchLoopGen1EtcManifest = builtins.toJSON { version = 1; entries = [ ]; };
   switchLoopGen2EtcManifest = builtins.toJSON {
     version = 1;
-    entries = [ (switchLoopEtcEntry "switch-loop/hello.txt" "hello v2\n") ];
+    entries = [ (switchLoopEtcEntry "switch-loop/hello.txt" switchLoopEtcHelloV2Content) ];
   };
   # No etc change for scenario 2 (image swap) -- same declared content as
   # generation 2.
@@ -1144,8 +1154,8 @@ let
   switchLoopGen4EtcManifest = builtins.toJSON {
     version = 1;
     entries = [
-      (switchLoopEtcEntry "switch-loop/hello.txt" "hello v2\n")
-      (switchLoopEtcEntry "switch-loop/test-marker.txt" "test v4 -- scenario 3's deliberate change\n")
+      (switchLoopEtcEntry "switch-loop/hello.txt" switchLoopEtcHelloV2Content)
+      (switchLoopEtcEntry "switch-loop/test-marker.txt" switchLoopEtcTestMarkerContent)
     ];
   };
 
@@ -1278,8 +1288,10 @@ let
     ubxrun "$UBX_BASE/bin/mkdir" -p \
       "$out/usr/local/share/ubx-switch-loop/gen1" \
       "$out/usr/local/share/ubx-switch-loop/gen2/systemd-content" \
+      "$out/usr/local/share/ubx-switch-loop/gen2/etc-content/switch-loop" \
       "$out/usr/local/share/ubx-switch-loop/gen3/systemd-content" \
-      "$out/usr/local/share/ubx-switch-loop/gen4"
+      "$out/usr/local/share/ubx-switch-loop/gen3/etc-content/switch-loop" \
+      "$out/usr/local/share/ubx-switch-loop/gen4/etc-content/switch-loop"
 
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen1/etc-manifest.json" <<'UBX_M2_JSON_EOF'
     ${switchLoopGen1EtcManifest}
@@ -1303,6 +1315,12 @@ let
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/systemd-content/ubx-m2-canary-b.service" <<'UBX_M2_UNIT_EOF'
     ${switchLoopCanaryBGen2}
     UBX_M2_UNIT_EOF
+    # gen2's etc CONTENT bytes (referenced by the guest driver's
+    # `--etc-content-dir "$ASSETS/gen2/etc-content"`), matching
+    # switchLoopGen2EtcManifest's declared path/sha256 exactly.
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen2/etc-content/switch-loop/hello.txt" <<'UBX_M2_ETC_EOF'
+    ${switchLoopEtcHelloV2Content}
+    UBX_M2_ETC_EOF
 
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/etc-manifest.json" <<'UBX_M2_JSON_EOF'
     ${switchLoopGen3EtcManifest}
@@ -1313,6 +1331,13 @@ let
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/systemd-content/ubx-m2-canary-c.service" <<'UBX_M2_UNIT_EOF'
     ${switchLoopCanaryCGen3}
     UBX_M2_UNIT_EOF
+    # gen3's etc CONTENT bytes -- same declared content as gen2
+    # (switchLoopGen3EtcManifest = switchLoopGen2EtcManifest), staged here
+    # too since scenario 2 passes its own gen3-specific
+    # --etc-content-dir.
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen3/etc-content/switch-loop/hello.txt" <<'UBX_M2_ETC_EOF'
+    ${switchLoopEtcHelloV2Content}
+    UBX_M2_ETC_EOF
     # A plain marker string standing in for "a different rootfs image
     # store path" -- ubx_rebuild_classify_delta only ever compares this
     # value for (in)equality against generation 1/2's own GEN_ROOTFS_IMAGE
@@ -1324,6 +1349,15 @@ let
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen4/etc-manifest.json" <<'UBX_M2_JSON_EOF'
     ${switchLoopGen4EtcManifest}
     UBX_M2_JSON_EOF
+    # gen4's etc CONTENT bytes -- both entries declared in
+    # switchLoopGen4EtcManifest (unchanged hello.txt plus scenario 3's
+    # deliberate test-marker.txt change).
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen4/etc-content/switch-loop/hello.txt" <<'UBX_M2_ETC_EOF'
+    ${switchLoopEtcHelloV2Content}
+    UBX_M2_ETC_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/gen4/etc-content/switch-loop/test-marker.txt" <<'UBX_M2_ETC_EOF'
+    ${switchLoopEtcTestMarkerContent}
+    UBX_M2_ETC_EOF
 
     # -- (4) the soft-reboot stub (see this section's own header) --------
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-soft-reboot-stub" <<'UBX_M2_SCRIPT_EOF'
@@ -1530,6 +1564,7 @@ let
           --users-manifest "$ASSETS/gen2/users-manifest.json" \
           --apply --systemd-unit-dir /run/systemd/system \
           --systemd-content-dir "$ASSETS/gen2/systemd-content" \
+          --etc-content-dir "$ASSETS/gen2/etc-content" \
           --users-out "$STATE/gen2-users-activate.sh" \
           > "$STATE/s1.log" 2>&1
         rc=$?
@@ -1542,6 +1577,7 @@ let
         [ "$ts_a_after" = "$ts_a_before" ] || mark_fail S1 "canary-a (unchanged between gen1/gen2) was restarted anyway"
         [ -f /run/ubx-switch-loop/canary-b-gen2-ran ] || mark_fail S1 "canary-b's changed content did not activate"
         getent passwd ubxm2test > /dev/null 2>&1 || mark_fail S1 "declared user ubxm2test is not present"
+        [ "$(cat /etc/switch-loop/hello.txt 2>/dev/null)" = "hello v2" ] || mark_fail S1 "live /etc file switch-loop/hello.txt did not activate"
         echo "UBX-M2-S1-PASS"
 
         # ================= scenario 2: image swap / soft-reboot ========
@@ -1557,6 +1593,7 @@ let
           --users-manifest "$ASSETS/gen2/users-manifest.json" \
           --apply --systemd-unit-dir /run/systemd/system \
           --systemd-content-dir "$ASSETS/gen3/systemd-content" \
+          --etc-content-dir "$ASSETS/gen2/etc-content" \
           --users-out "$STATE/gen3-users-activate.sh" \
           > "$STATE/s2.log" 2>&1
         rc=$?
@@ -1603,12 +1640,18 @@ let
           --systemd-ref "$old_systemd_ref" \
           --users-manifest "$old_users_ref" \
           --apply --systemd-unit-dir /run/systemd/system \
+          --etc-content-dir "$ASSETS/gen4/etc-content" \
           > "$STATE/s3-register.log" 2>&1
         rc=$?
         [ "$rc" -eq 0 ] || mark_fail S3 "ubx rebuild test exited $rc -- see $STATE/s3-register.log"
         [ "$(readlink "$ROOT/current" 2>/dev/null)" = "4" ] || mark_fail S3 "current generation is not 4 after 'ubx rebuild test'"
         grub_default_after_test="$(cat "$ROOT/grub-default" 2>/dev/null)"
         [ "$grub_default_after_test" = "3" ] || mark_fail S3 "'ubx rebuild test' moved grub-default (was 3, now $grub_default_after_test) -- it must never touch it"
+        # 'ubx rebuild test' still applies domains for real (only grub-default
+        # is withheld) -- assert generation 4's deliberate etc change
+        # actually landed on live /etc before the reboot below resets this
+        # boot's writable /etc bind-mount back to the squashfs baseline.
+        [ "$(cat /etc/switch-loop/test-marker.txt 2>/dev/null)" = "test v4 -- scenario 3's deliberate change" ] || mark_fail S3 "live /etc file switch-loop/test-marker.txt did not activate"
 
         echo "UBX-M2-PHASE0-DONE"
         advance 1

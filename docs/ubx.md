@@ -121,10 +121,10 @@ domain's OWN issue left it — this orchestrator calls exactly as much of
 each as exists and prints a clear notice for the rest, never inventing
 execution machinery that belongs to another issue:
 
-- **etc** — plan only. `bin/ubx-etc-apply`, referenced in `bin/ubx-etc`'s
-  own header as future work, does not exist in this repository yet;
-  `ubx rebuild switch|test` prints a "plan only, nothing written" notice
-  for this domain instead of attempting anything.
+- **etc** — real, dry-run-by-default execution via `bin/ubx-etc-apply`
+  (see {doc}`etc`). `--apply` attempts the real thing (owner/group only
+  when run as root — see that script's own `--help`); `--dry-run`
+  (the default) prints every command it would run and touches nothing.
 - **systemd** — real, dry-run-by-default execution via
   `bin/ubx-systemd-apply` (see {doc}`systemd`). `--apply` attempts the
   real thing and requires `systemctl` on `PATH`, exactly as that script's

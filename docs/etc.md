@@ -1,20 +1,23 @@
 # The generated `/etc`
 
-```{admonition} Partially implemented (M2, issue #26): compile + plan only
+```{admonition} Implemented (M2, issues #26 and #54): compile + plan + apply
 :class: note
 
-`nix/etc.nix` and `bin/ubx-etc` exist in the repository as of milestone
-**M2** (`SPEC.md` §4.2 "generated `/etc`", §4.3 switching-table row 1;
-issue #26) and everything described below is real: declared entries
-compile to a content-addressed tree plus a JSON manifest, the machine-
-local mutable exceptions are enumerated and enforced, and `bin/ubx-etc
-plan` computes a deterministic create/update/remove/drift diff against
-observed system state. Nothing here yet **applies** that plan to a real
-`/etc` — no file is ever written, chowned, chmod'd, or deleted by
-anything on this page. That executor (`bin/ubx-etc-apply`), and the `ubx
-rebuild` verb that wires it into an actual switch, are separate, later
-work (`bin/ubx-generations`' own header: "Activation ... is `ubx` verb
-work for a later issue").
+`nix/etc.nix`, `bin/ubx-etc`, and `bin/ubx-etc-apply` all exist in the
+repository as of milestone **M2** (`SPEC.md` §4.2 "generated `/etc`", §4.3
+switching-table row 1; issues #26, #54) and everything described below is
+real: declared entries compile to a content-addressed tree plus a JSON
+manifest, the machine-local mutable exceptions are enumerated and
+enforced, `bin/ubx-etc plan` computes a deterministic create/update/
+remove/drift diff against observed system state, and `bin/ubx-etc-apply`
+applies that plan to a real `/etc` — writing, chowning (when run as root),
+chmod'ing, and removing files exactly as the plan describes — dry-run by
+default, gated behind `--apply`. `ubx rebuild switch|test` and
+`ubx rollback` wire it in automatically (see "Applying: `bin/ubx-etc-apply`"
+below); the real QEMU switch-loop end-to-end proof (`nix/boot.nix`'s
+switch-loop section, GitHub issue #57) now runs `ubx-etc-apply` for real
+against a live, writable `/etc` and asserts the landed file content
+directly, not just the touched-domains plan/report bookkeeping.
 ```
 
 ## The declaration surface
@@ -155,10 +158,38 @@ guarantee).
 An empty (fully converged) plan exits `0` and prints nothing — a no-op
 plan is success, not an error.
 
+## Applying: `bin/ubx-etc-apply`
+
+`bin/ubx-etc-apply` consumes exactly the TSV plan `bin/ubx-etc plan`
+produces and issues the corresponding filesystem calls, in the plan's own
+order:
+
+| Action | What `bin/ubx-etc-apply` does |
+|---|---|
+| `create` / `update-content` | atomically install `--content-dir/PATH` to `--etc-dir/PATH` at the plan's target mode (and owner/group, when run as root — see below), creating parent directories as needed |
+| `update-metadata` | re-apply owner/group/mode without touching the file's bytes |
+| `remove` | `rm -f` the target — idempotent: removing a path that is already gone is success, not a failure |
+| `drift` | informational only; printed to stderr in both modes, never a filesystem call |
+
+Like `bin/ubx-systemd-apply`, it defaults to `--dry-run` (print every
+command it would run, touch nothing) and only performs real writes under
+`--apply`. Owner/group are only ever applied when this process's effective
+uid is 0 — not attempted-then-swallowed when it isn't, simply never
+emitted — so the executor is fully exercisable by this project's
+unprivileged test harness (content and mode are still applied and checked
+either way); `mode` itself (`chmod`) never requires root and is always
+applied.
+
+`ubx rebuild switch|test` and `ubx rollback` call `bin/ubx-etc-apply`
+automatically once a generation declares an `/etc` manifest — see
+`ubx rebuild --help`'s `--etc-dir`/`--etc-content-dir` options (mirroring
+`--systemd-unit-dir`/`--systemd-content-dir`'s own shape).
+
 ## Where to track progress
 
-`nix/etc.nix` and `bin/ubx-etc plan`/`observe`/`exceptions` land at
-milestone **M2** (`SPEC.md` §11, issue #26). Applying a plan to a real
-`/etc` with real privileges (`bin/ubx-etc-apply`) and wiring the whole
-thing into `ubx rebuild switch|boot|test` are later work, tracked
-alongside {doc}`generations`' own activation/GC follow-ups.
+`nix/etc.nix`, `bin/ubx-etc plan`/`observe`/`exceptions`, and
+`bin/ubx-etc-apply` all land at milestone **M2** (`SPEC.md` §11, issues
+#26, #54). The real QEMU switch-loop end-to-end exercise of the whole
+chain (GitHub issue #57) now runs alongside `nix/boot.nix`'s other M2
+switch-loop scenarios, tracked alongside {doc}`generations`' own
+activation/GC follow-ups.

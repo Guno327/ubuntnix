@@ -1452,6 +1452,26 @@ let
     gen1_kernel="$(manifest_get "$ROOT/1/manifest" GEN_KERNEL_PATH)"
     gen1_initrd="$(manifest_get "$ROOT/1/manifest" GEN_INITRD_PATH)"
 
+    # Make /etc writable for this boot. The users domain's real activation
+    # runs useradd/usermod, which rewrite /etc/passwd (and group/shadow) via
+    # an atomic create-temp-then-rename -- that needs a writable /etc
+    # DIRECTORY, not just writable files, so bind-mounting the individual
+    # files would not suffice. The rootfs /etc is read-only squashfs, so
+    # copy it into tmpfs and bind-mount that back over /etc: the emitted
+    # user-activation script writes there, and `getent passwd`, reading the
+    # same /etc/passwd, then sees the live user. (A real ubuntnix system
+    # gets its writable generated /etc from the generation machinery; the
+    # switch-loop proof's own /etc executor is issue #54. This stands in so
+    # the users primitive -- SPEC.md §11 M2 -- is demonstrated for real.)
+    # Guarded by a /run marker so it runs once per boot (idempotent across
+    # the driver's phase-by-phase re-runs).
+    if [ ! -e /run/ubx-etc-bound ]; then
+      mkdir -p /run/ubx-etc-writable
+      cp -a /etc/. /run/ubx-etc-writable/
+      mount --bind /run/ubx-etc-writable /etc
+      : > /run/ubx-etc-bound
+    fi
+
     case "$phase" in
       0)
         # ================= scenario 1: config/service/user switch ======

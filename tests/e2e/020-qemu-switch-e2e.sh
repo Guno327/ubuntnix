@@ -202,7 +202,7 @@ main() {
 
   [ -z "$built_dir" ] || rm -rf "$built_dir"
 
-  # shellcheck disable=SC2329  # invoked indirectly via the `trap ... EXIT` below
+  # shellcheck disable=SC2317,SC2329  # invoked indirectly via the `trap ... EXIT` below (SC2317 on <0.10, SC2329 on >=0.10)
   cleanup() {
     [ -z "$keep_log" ] || cp "$master_log" "$keep_log" 2> /dev/null || true
     rm -rf "$workdir"

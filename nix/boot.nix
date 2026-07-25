@@ -404,14 +404,31 @@ let
 
       writeUnitLines = builtins.concatStringsSep "\n" (map
         (path:
-          let slug = builtins.replaceStrings [ "/" ] [ "-" ] path; in
+          # systemd REQUIRES a .mount unit's filename to equal the escaped
+          # form of its `Where=` path (systemd.mount(5) / systemd-escape -p
+          # --suffix=mount): "/tmp" -> "tmp.mount", "/home" -> "home.mount",
+          # "/ubx/var" -> "ubx-var.mount". A mount unit whose name does NOT
+          # match its Where= is silently REJECTED by systemd -- which is
+          # exactly why these tmpfs writable-state mounts (formerly named
+          # "ubx-tmp.mount" &c.) never actually took effect, leaving /tmp,
+          # /var and /home on the read-only squashfs. The M1 boot e2e never
+          # wrote to them so it passed regardless; the M2 switch-loop e2e's
+          # `ubx rebuild switch` is the first thing to `mktemp -d` in /tmp,
+          # which surfaced the bug (issue #32). The escaped name for these
+          # single- and multi-segment absolute paths is the path with its
+          # leading slash dropped and remaining slashes turned into dashes
+          # (none of /var,/tmp,/home contain a literal dash to \x2d-escape).
+          let
+            rel = builtins.substring 1 (builtins.stringLength path) path;
+            unitName = (builtins.replaceStrings [ "/" ] [ "-" ] rel) + ".mount";
+          in
           ''
-            ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx${slug}.mount" <<'UBX_UNIT_EOF'
+            ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/${unitName}" <<'UBX_UNIT_EOF'
             ${mountUnit path}
             UBX_UNIT_EOF
             ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/local-fs.target.wants"
-            ubxrun "$UBX_BASE/bin/ln" -sf "../ubx${slug}.mount" \
-              "$out/etc/systemd/system/local-fs.target.wants/ubx${slug}.mount"
+            ubxrun "$UBX_BASE/bin/ln" -sf "../${unitName}" \
+              "$out/etc/systemd/system/local-fs.target.wants/${unitName}"
           '')
         [ "/var" "/tmp" "/home" ]);
 

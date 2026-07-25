@@ -198,6 +198,11 @@ main() {
   disk="$workdir/switch-loop-disk.img"
   master_log="$workdir/serial-all.log"
   cp "$image" "$disk"
+  # The source image typically comes from a `nix build` result (read-only,
+  # mode 0444 in the Nix store); the copy inherits that mode, so QEMU cannot
+  # open it read-write (if=virtio, no readonly=on) and each boot dies with
+  # "Could not open ...: Permission denied". Restore write permission.
+  chmod u+w "$disk"
   : > "$master_log"
 
   [ -z "$built_dir" ] || rm -rf "$built_dir"

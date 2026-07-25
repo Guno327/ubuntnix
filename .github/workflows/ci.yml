@@ -462,6 +462,61 @@ jobs:
         with:
           name: boot-e2e-serial-log
           path: serial.log
+
+  switch-loop:
+    name: Switch-loop QEMU e2e (SPEC.md §11 M2 exit criterion; issue #32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # Same requirement as the "boot"/"compose" jobs above -- nix/boot.nix's
+      # switch-loop-proof composes TWO rootfs trees (its own, plus reusing
+      # M1's boot-proof kernel) through the same hardened
+      # `unshare --user --map-root-user` chroot.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: see the "boot" job's identical step for
+      # the full rationale (nix/stdenv.nix's `__noChroot = true` derivation).
+      - name: Build switch-loop-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#switch-loop-proof -L -o result-switch-loop-image
+          sudo chown -R "$USER" result-switch-loop-image
+      - name: Assert switch-loop-proof artifact
+        run: |
+          img="result-switch-loop-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e switch loop below will fall back to TCG (slower, still correct; see tests/e2e/020-qemu-switch-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end switch-loop test (SPEC.md §11's M2 exit
+      # criterion): boots the just-built disk image across multiple
+      # guest-initiated reboots over the SAME persistent disk file, and
+      # asserts all five UBX-M2-Sn-PASS markers the image's own baked-in
+      # driver (nix/boot.nix's switchLoopDriverScript) emits -- see that
+      # script's own header, and tests/e2e/020-qemu-switch-e2e.sh's, for
+      # the exact scenario-by-scenario design.
+      - name: QEMU e2e switch-loop test
+        run: ./tests/e2e/020-qemu-switch-e2e.sh --image result-switch-loop-image --timeout 240 --max-boots 4 --keep-log switch-loop-serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-loop-e2e-serial-log
+          path: switch-loop-serial.log
           if-no-files-found: ignore
 
   resolve:

@@ -38,10 +38,25 @@
 #     manual reboot (never auto-triggered) per SPEC.md §4.3/§12 R3 — full
 #     reboot is the always-correct fallback this project never overrides.
 #     `test` never reboots (a plain reboot already returns to the last-
-#     good generation). What is still explicitly OUT OF SCOPE: the real
-#     QEMU switch-loop end-to-end exercise of `systemctl soft-reboot`
-#     itself actually re-executing userspace (issue #32) — this issue is
-#     the mechanism + unit tests only.
+#     good generation). Issue #55 closed the gap issue #30 left open: the
+#     new generation's rootfs squashfs image (GEN_ROOTFS_IMAGE) is now
+#     mounted read-only at /run/nextroot (an injectable
+#     UBX_NEXTROOT_STAGE_CMD, mirroring UBX_SOFT_REBOOT_CMD) immediately
+#     before the reboot call, so `systemctl soft-reboot` — which requires
+#     systemd >= 254 and only re-execs into /run/nextroot when it is
+#     already populated — actually lands on the new image instead of just
+#     restarting the same userspace in place.
+#     tests/e2e/020-qemu-switch-e2e.sh's scenario 2 now drives this real
+#     staging step too: the guest builds a real squashfs image at runtime
+#     and lets `ubx rebuild switch` really `mount` it at /run/nextroot
+#     (UBX_NEXTROOT_STAGE_CMD left unset -- its real default runs), then
+#     asserts that landed, before tearing it down again. What remains a
+#     documented stub: the actual `systemctl soft-reboot` re-exec call
+#     itself, which still goes through a marker-dropping stub, because
+#     really re-execing into /run/nextroot needs a full second bootable
+#     userspace staged there (systemd, every binary the driver depends on
+#     to keep running post-re-exec) -- see nix/boot.nix's switch-loop-proof
+#     section header for exactly why that is out of scope here.
 # Live activation of the three domains this orchestrator DOES run
 # end-to-end is itself gated by how far each domain's own executor got in
 # its own issue: bin/ubx-etc-apply and bin/ubx-systemd-apply are both real
@@ -67,7 +82,53 @@ export UBX_REBUILD_LIB_PROG
 # `soft-reboot` (which this test harness's containers/CI runners have
 # neither the privilege nor the systemd version for). Never consulted for
 # a kernel or live-only delta, `ubx rebuild test`, or any --dry-run.
+#
+# systemd's soft-reboot mechanism (`systemctl soft-reboot`) requires
+# systemd >= 254: that is the first release able to re-exec userspace into
+# a populated /run/nextroot at all (older systemd's `soft-reboot` verb
+# either does not exist or always just restarts the SAME userspace in
+# place, silently never picking up the new generation's image). This
+# project targets Ubuntu 24.04 "noble" (systemd 255), so the minimum is
+# already met on every image this repo builds; a caller running this on an
+# older base must not expect the reboot below to actually land on the new
+# image even though it exits 0.
 UBX_SOFT_REBOOT_CMD="${UBX_SOFT_REBOOT_CMD:-systemctl}"
+
+# Where the new generation's rootfs squashfs image is staged before the
+# soft-reboot call above (issue #55) — systemd's soft-reboot mechanism
+# re-execs userspace into /run/nextroot IFF that path is already populated
+# (a mounted tree) at the moment `systemctl soft-reboot` runs; otherwise it
+# just restarts the same userspace in place and the new image is never
+# actually activated. Not itself overridable (this is systemd's own fixed
+# contract, not a project choice) — UBX_NEXTROOT_STAGE_CMD below is the
+# injectable seam.
+UBX_NEXTROOT_DIR="${UBX_NEXTROOT_DIR:-/run/nextroot}"
+
+# The staging command invoked to populate $UBX_NEXTROOT_DIR — mirrors
+# UBX_SOFT_REBOOT_CMD immediately above: overridable so unit tests can
+# substitute a stub script that records "IMAGE TARGET" instead of actually
+# mounting anything (this test harness's containers/CI runners have
+# neither the privilege nor, in general, a mounted squashfs image to mount
+# for real). Invoked as `"$UBX_NEXTROOT_STAGE_CMD" IMAGE TARGET`, exactly
+# once, immediately BEFORE UBX_SOFT_REBOOT_CMD, and gated identically to
+# it: only `rebuild switch` with an `image`-class delta, never `test`, a
+# `kernel`/`live-only` delta, or any --dry-run. Defaults to the internal
+# _ubx_stage_nextroot function (below) rather than a bare external command
+# name, since staging needs two positional args in a fixed order — a
+# real override still just names a command/script taking the same two
+# args, exactly like a UBX_SOFT_REBOOT_CMD stub does today.
+UBX_NEXTROOT_STAGE_CMD="${UBX_NEXTROOT_STAGE_CMD:-_ubx_stage_nextroot}"
+
+# _ubx_stage_nextroot IMAGE TARGET — the real default UBX_NEXTROOT_STAGE_CMD:
+# mounts IMAGE (a squashfs rootfs image, from the new generation's own
+# GEN_ROOTFS_IMAGE manifest field) read-only at TARGET, creating TARGET
+# first if it does not already exist. All-Canonical: mount(8) and squashfs
+# kernel/tooling support are both base Ubuntu — no nixpkgs binary involved.
+_ubx_stage_nextroot() {
+  local image="$1" target="$2"
+  mkdir -p "$target"
+  mount -t squashfs -o ro "$image" "$target"
+}
 
 die() {
   echo "ubx: $*" >&2
@@ -617,6 +678,10 @@ do_rebuild() {
       case "$delta_class" in
         image)
           if [ "$verb" = switch ]; then
+            local nextroot_image
+            nextroot_image="$(ubx_rebuild_manifest_get "$root/$new_idx/manifest" GEN_ROOTFS_IMAGE)"
+            echo "soft-reboot: staging generation $new_idx's rootfs image ($nextroot_image) at $UBX_NEXTROOT_DIR ..."
+            "$UBX_NEXTROOT_STAGE_CMD" "$nextroot_image" "$UBX_NEXTROOT_DIR"
             echo "soft-reboot: rootfs image changed, kernel unchanged -- soft-rebooting live into generation $new_idx (a few seconds of downtime, no kernel reboot)"
             "$UBX_SOFT_REBOOT_CMD" soft-reboot
           else

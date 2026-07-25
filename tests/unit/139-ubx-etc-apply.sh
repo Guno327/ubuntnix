@@ -133,6 +133,7 @@ e2e_etc_dir="$work/e2e-etcdir"
 mkdir -p "$e2e_etc_dir"
 
 export UBX_SOFT_REBOOT_CMD=true # no image delta expected; guard anyway, mirrors tests/unit/137
+export UBX_NEXTROOT_STAGE_CMD=true # ditto, since issue #55 (nextroot staging)
 
 root="$work/gens"
 out="$("$ubx" rebuild switch --root "$root" \

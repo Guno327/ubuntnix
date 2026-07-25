@@ -30,6 +30,11 @@ trap cleanup EXIT
 # otherwise try to invoke a real `systemctl soft-reboot` (issue #30).
 # Stub it out.
 export UBX_SOFT_REBOOT_CMD=true
+# ...and, since issue #55, that image-delta path also stages
+# /run/nextroot before the (stubbed) reboot call -- stub that seam
+# too, or the real default (mount(8)) would fail for lack of
+# privilege in this harness.
+export UBX_NEXTROOT_STAGE_CMD=true
 
 root="$work/gens"
 

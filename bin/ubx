@@ -28,10 +28,20 @@
 #     here invokes `nix` itself. See bin/ubx-rebuild-lib's header for how
 #     a domain ref is resolved once supplied.
 #   - Soft-reboot into a changed rootfs image (SPEC.md §4.3's "Deb set...
-#     build new image -> systemctl soft-reboot into it") is explicitly OUT
-#     OF SCOPE for this issue (deferred to issue #30) — `switch`/`test`
-#     print a clear "pending #30" notice for the image-swap step and never
-#     attempt it.
+#     build new image -> systemctl soft-reboot into it") IS implemented as
+#     of issue #30: `switch` classifies the delta between the old and new
+#     generation's rootfs image/kernel store paths
+#     (ubx_rebuild_classify_delta in bin/ubx-rebuild-lib) and, when only
+#     the image changed, invokes an injectable reboot command (default
+#     `systemctl soft-reboot`, overridable via UBX_SOFT_REBOOT_CMD for
+#     testing). A kernel change always falls back to demanding a full,
+#     manual reboot (never auto-triggered) per SPEC.md §4.3/§12 R3 — full
+#     reboot is the always-correct fallback this project never overrides.
+#     `test` never reboots (a plain reboot already returns to the last-
+#     good generation). What is still explicitly OUT OF SCOPE: the real
+#     QEMU switch-loop end-to-end exercise of `systemctl soft-reboot`
+#     itself actually re-executing userspace (issue #32) — this issue is
+#     the mechanism + unit tests only.
 # Live activation of the three domains this orchestrator DOES run
 # end-to-end is itself gated by how far each domain's own executor got in
 # its own issue: bin/ubx-systemd-apply is a real (dry-run-by-default,
@@ -50,6 +60,14 @@ UBX_REBUILD_LIB_PROG="$prog_name"
 export UBX_REBUILD_LIB_PROG
 # shellcheck source=bin/ubx-rebuild-lib
 . "$bindir/ubx-rebuild-lib"
+
+# The soft-reboot command `do_rebuild` invokes for an image-only delta
+# (issue #30) — overridable so unit tests can substitute a stub script
+# that records its invocation instead of actually calling systemd's real
+# `soft-reboot` (which this test harness's containers/CI runners have
+# neither the privilege nor the systemd version for). Never consulted for
+# a kernel or live-only delta, `ubx rebuild test`, or any --dry-run.
+UBX_SOFT_REBOOT_CMD="${UBX_SOFT_REBOOT_CMD:-systemctl}"
 
 die() {
   echo "ubx: $*" >&2
@@ -557,13 +575,56 @@ do_rebuild() {
   report_domains 0 | sed 's/^/  /'
 
   if [ "$verb" = switch ] || [ "$verb" = test ]; then
-    echo "note: soft-reboot into a changed rootfs image is pending (issue #30) — the image is registered but never hot-swapped by this command"
     if [ "$dry_run" = 0 ]; then
       local exec_users_out="$users_out"
       [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
       execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out"
       ubx_rebuild_write_booted "$root" "$new_idx"
+
+      # -- Soft-reboot activation (issue #30) -----------------------------
+      #
+      # Classified AFTER ubx_rebuild_write_booted so the booted marker is
+      # never left stale under a changed image/kernel, but against
+      # old_current -- captured at the TOP of this function, before that
+      # write -- so the comparison is genuinely old-vs-new, never new-vs-
+      # new. `test` classifies purely for an informational line: a plain
+      # reboot already returns to the last-good generation (the GRUB-
+      # default matrix below never moves for `test`), so it must never
+      # itself trigger any reboot, soft or full.
+      local delta_class
+      delta_class="$(ubx_rebuild_classify_delta "$root" "$old_current" "$new_idx")"
+      case "$delta_class" in
+        image)
+          if [ "$verb" = switch ]; then
+            echo "soft-reboot: rootfs image changed, kernel unchanged -- soft-rebooting live into generation $new_idx (a few seconds of downtime, no kernel reboot)"
+            "$UBX_SOFT_REBOOT_CMD" soft-reboot
+          else
+            echo "soft-reboot: rootfs image changed, kernel unchanged -- 'ubx rebuild test' never reboots (a plain reboot already returns to the last-good generation)"
+          fi
+          ;;
+        kernel)
+          echo "reboot: the kernel changed (generation $new_idx) -- a FULL REBOOT is required to activate it; ubx will NOT auto-reboot (full reboot is the always-correct fallback, SPEC.md §4.3/§12 R3)"
+          ;;
+        live-only)
+          echo "reboot: not needed -- neither the rootfs image nor the kernel changed"
+          ;;
+      esac
     else
+      local dry_delta_class old_kernel_dr old_image_dr
+      old_kernel_dr="$(ubx_rebuild_manifest_get "$root/${old_current}/manifest" GEN_KERNEL_PATH)"
+      old_image_dr="$(ubx_rebuild_manifest_get "$root/${old_current}/manifest" GEN_ROOTFS_IMAGE)"
+      dry_delta_class="$(_ubx_rebuild_classify_delta_values "$old_kernel_dr" "$old_image_dr" "$kernel" "$rootfs_image")"
+      case "$dry_delta_class" in
+        image)
+          echo "soft-reboot: would soft-reboot into the new rootfs image (kernel unchanged) (dry-run: nothing executed, no reboot attempted)"
+          ;;
+        kernel)
+          echo "reboot: the kernel would change -- a full reboot would be required, ubx would NOT auto-reboot (dry-run: nothing executed)"
+          ;;
+        live-only)
+          echo "reboot: would not be needed -- neither the rootfs image nor the kernel would change (dry-run: nothing executed)"
+          ;;
+      esac
       echo "(dry-run: no execution attempted)"
     fi
   fi

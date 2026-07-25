@@ -158,7 +158,11 @@ PYEOF
   # executed as a command).
   local script
   script="$(mktemp)"
-  trap 'rm -f "$script"' EXIT
+  # shellcheck disable=SC2064  # intentional: expand $script NOW (it is
+  # `local` to this function and would be unbound -- fatal under `set -u`
+  # -- by the time an EXIT trap set with single quotes fired after this
+  # function returned; mirrors bin/ubx's do_rebuild's own workdir trap)
+  trap "rm -f '$script'" EXIT
   {
     printf '#!/bin/sh\nset -e\n'
     printf '%s\n' "$commands"

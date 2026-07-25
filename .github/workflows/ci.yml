@@ -192,6 +192,46 @@ jobs:
             cat snap-mismatch.log
             exit 1
           }
+      # Live snap-declaration assertion drift check (SPEC.md §4.3, §4.4;
+      # issue #60, M3). nix/snap.nix's `fetchAssert` no longer touches the
+      # network at all -- it reads the COMMITTED, VENDORED
+      # snaps/assertions/<name>_<revision>.snap-declaration file (see that
+      # file's header, "Vendoring"), because api.snapcraft.io's
+      # snap-declaration assertion endpoint content-negotiates on the
+      # `Accept` request header (real signed assertion bytes WITH
+      # `Accept: application/x.ubuntu.assertion`; a small, useless JSON
+      # wrapper with no/any other Accept -- which is ALL a plain GET, and
+      # therefore ALL a `<nix/fetchurl.nix>` fixed-output derivation, can
+      # ever send). That means snap-fetch-proof above no longer catches
+      # Canonical re-signing a snap-declaration out from under the vendored
+      # file/lockfile pin -- this step, plain bash + curl (NOT a Nix
+      # build), closes that gap by fetching the LIVE assertion with the
+      # correct header and diffing its sha256 against both the committed
+      # vendored file and the lockfile's own `assert.sha256` pin. Fails the
+      # job loudly (`set -euo pipefail`, explicit mismatch checks) on any
+      # disagreement, since a silent pass here would be worse than no
+      # check at all.
+      - name: Verify vendored snap-declaration assertion matches the live Snap Store
+        run: |
+          set -euo pipefail
+          vendored="snaps/assertions/hello-world_29.snap-declaration"
+          [ -f "$vendored" ] || { echo "missing vendored assertion file: $vendored" >&2; exit 1; }
+          pinned_sha256="$(python3 -c "import json; print(json.load(open('snaps.lock.json'))['snaps'][0]['assert']['sha256'])")"
+          vendored_sha256="$(sha256sum "$vendored" | cut -d' ' -f1)"
+          [ "$vendored_sha256" = "$pinned_sha256" ] || {
+            echo "committed vendored file $vendored (sha256 $vendored_sha256) does not match snaps.lock.json's assert.sha256 ($pinned_sha256) -- the two are supposed to be kept in lockstep by bin/ubx-snap-resolve" >&2
+            exit 1
+          }
+          assert_url="https://api.snapcraft.io/api/v1/snaps/assertions/snap-declaration/16/buPKUD3TKqCOgLEjjHx5kSiCpIs5cMuQ"
+          live="$(mktemp)"
+          curl -fsSL -H 'Accept: application/x.ubuntu.assertion' -o "$live" "$assert_url"
+          live_sha256="$(sha256sum "$live" | cut -d' ' -f1)"
+          rm -f "$live"
+          [ "$live_sha256" = "$pinned_sha256" ] || {
+            echo "the LIVE snap-declaration assertion at $assert_url now hashes to $live_sha256, but the committed vendored file/lockfile pin $pinned_sha256 -- Canonical appears to have re-signed the assertion; re-run bin/ubx-snap-resolve and commit the regenerated snaps/assertions/hello-world_29.snap-declaration + snaps.lock.json" >&2
+            exit 1
+          }
+          echo "live snap-declaration assertion matches the committed vendored file and lockfile pin ($pinned_sha256)"
       # Generated /etc proof (SPEC.md §4.2/§4.3; issue #26, M2):
       # nix/etc.nix's `render` evaluated end to end against a small fixture
       # declaration (two entries: a `text` file and a `text` file with

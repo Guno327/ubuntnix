@@ -27,6 +27,13 @@ trap 'rm -rf "$work"' EXIT
 
 sha_snap="$(python3 -c "import hashlib;print(hashlib.sha256(b'snap-payload').hexdigest())")"
 sha_assert="$(python3 -c "import hashlib;print(hashlib.sha256(b'assert-chain').hexdigest())")"
+# base64 of the exact bytes sha_assert was computed from -- the stub's
+# "assertBase64" field (see bin/ubx-snap-resolve's header, "The injectable
+# Store-access seam") always carries the real assertion bytes so
+# emit_lockfile can vendor them to snaps/assertions/ and verify their
+# sha256 against assertSha256 above (see this file's "vendored assertion
+# file" check below).
+b64_assert="$(python3 -c "import base64;print(base64.b64encode(b'assert-chain').decode())")"
 
 # A recording stub: logs every "NAME CHANNEL REVISION_PIN" invocation to
 # $work/calls.log (one line per call), then prints a canned resolved JSON
@@ -40,7 +47,7 @@ verified="\${STUB_VERIFIED:-true}"
 publisher="\${STUB_PUBLISHER:-canonical}"
 revision="\${STUB_REVISION:-29}"
 cat <<JSON
-{"revision": \$revision, "publisher": "\$publisher", "publisherVerified": \$verified, "snapUrl": "https://x/\$1.snap", "snapSha256": "$sha_snap", "snapSize": 1024, "assertUrl": "https://x/\$1.assert", "assertSha256": "$sha_assert"}
+{"revision": \$revision, "publisher": "\$publisher", "publisherVerified": \$verified, "snapUrl": "https://x/\$1.snap", "snapSha256": "$sha_snap", "snapSize": 1024, "assertUrl": "https://x/\$1.assert", "assertSha256": "$sha_assert", "assertBase64": "$b64_assert"}
 JSON
 EOF
 chmod +x "$stub"
@@ -94,6 +101,23 @@ PYEOF
   then
     fail "resolved lockfile entry does not carry the expected declared+resolved fields through end to end"
   fi
+fi
+
+# -- the assertion bytes the stub reported are vendored next to the
+# lockfile, byte-for-byte, and neither transient field leaks into the
+# persisted lockfile (SPEC.md §4.3, §4.4; nix/snap.nix's `fetchAssert` reads
+# exactly this file -- see bin/ubx-snap-resolve's header, "Emission") ------
+vendored="$work/snaps/assertions/hello-world_29.snap-declaration"
+if [ -f "$out" ]; then
+  [ -f "$vendored" ] || fail "resolve did not write the vendored assertion file at $vendored"
+  if [ -f "$vendored" ]; then
+    vendored_sha="$(python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$vendored")"
+    [ "$vendored_sha" = "$sha_assert" ] || fail "vendored assertion file's sha256 ($vendored_sha) does not match the lockfile's assert.sha256 ($sha_assert)"
+  fi
+  case "$(cat "$out")" in
+    *"_assertBase64"* | *"assertBase64"*) fail "the internal _assertBase64/assertBase64 field leaked into the persisted lockfile" ;;
+    *) ;;
+  esac
 fi
 
 # -- UBX_SNAP_RESOLVE_CMD (env var) is honored the same as --resolve-cmd --

@@ -27,10 +27,14 @@ for f in "$declfile" "$lockfile" "$validator"; do
   }
 done
 
-# -- schema conformance -------------------------------------------------
-schema_out="$(python3 "$validator" "$lockfile" 2>&1)"
+# -- schema conformance, PLUS the vendored-assertion invariant (passing
+# $UBX_REPO_ROOT as validate-snap-lockfile.py's optional REPO_ROOT arg turns
+# on its "every entry has a matching snaps/assertions/<name>_<revision>.
+# snap-declaration file whose sha256 equals assert.sha256" check -- see
+# that script's own docstring) -----------------------------------------
+schema_out="$(python3 "$validator" "$lockfile" "$UBX_REPO_ROOT" 2>&1)"
 schema_rc=$?
-[ "$schema_rc" -eq 0 ] || fail "$lockfile failed schema validation: $schema_out"
+[ "$schema_rc" -eq 0 ] || fail "$lockfile failed schema/vendored-assertion validation: $schema_out"
 
 # -- both files must be valid, parseable JSON with the expected top-level
 # shape, and both must be plain JSON with no `nix` binary required to read

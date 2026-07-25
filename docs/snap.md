@@ -121,16 +121,65 @@ snap-declaration, snap-revision) before a sideloaded payload can be
 installed fully offline. That chain has no single stable HTTP URL a
 `<nix/fetchurl.nix>` fixed-output derivation could deterministically re-GET.
 `assert.url`/`assert.sha256` above therefore pin specifically the
-**snap-declaration** assertion, fetched from its own stable,
-independently-re-fetchable endpoint
-(`api.snapcraft.io/v1/snaps/assertions/snap-declaration/16/<snap-id>`) —
-enough to bind a snap name to its `snap-id` and publisher identity (what
-`nix/snap.nix`'s policy re-enforcement needs), but **not** enough for a
-fully offline `snap ack` of the sideloaded payload by itself. This is a
-deliberate, tracked scope reduction, not an oversight — see
-`bin/ubx-snap-resolve`'s `_ubx_snap_resolve_real` header for the full
-reasoning, and the real on-device converge step (not yet implemented) is
-where a full assertion chain will need to be sourced properly.
+**snap-declaration** assertion — enough to bind a snap name to its
+`snap-id` and publisher identity (what `nix/snap.nix`'s policy
+re-enforcement needs), but **not** enough for a fully offline `snap ack` of
+the sideloaded payload by itself. This is a deliberate, tracked scope
+reduction, not an oversight — see `bin/ubx-snap-resolve`'s
+`_ubx_snap_resolve_real` header for the full reasoning, and the real
+on-device converge step (not yet implemented) is where a full assertion
+chain will need to be sourced properly.
+
+### Why the assertion is vendored, not fetched live at build time
+
+`assert.url` records `api.snapcraft.io`'s snap-declaration assertion
+endpoint (`/v1/snaps/assertions/snap-declaration/16/<snap-id>`) purely as
+**provenance** — where the pinned bytes came from, and what CI's live
+drift check (below) re-fetches to confirm they still agree — but
+`nix/snap.nix`'s `fetchAssert` does **not** GET that URL at build time.
+
+The endpoint **content-negotiates on the `Accept` request header**: with
+`Accept: application/x.ubuntu.assertion` it returns the real, signed
+assertion bytes (what `bin/ubx-snap-resolve` requests, and what
+`assert.sha256` pins); without that header — which is *all* a plain GET
+can ever be, and Nix's builtin `<nix/fetchurl.nix>` has no way to set
+request headers — it instead returns a small JSON wrapper describing the
+request, a completely different (and much smaller) set of bytes with a
+different hash. No header-less URL variant of this endpoint returns the
+raw assertion either (`?max-format=0`, `assertions.ubuntu.com`, and the
+`/v2/assertions/...` shape were all tried by hand against the live Store
+and all still content-negotiate the same way). A plain
+`<nix/fetchurl.nix>` fixed-output derivation pointed at this URL can
+therefore never reproduce the pinned hash — not a bug in the pin, a
+structural mismatch between what the endpoint needs (a header) and what
+this flake's only permitted fetcher can send (none).
+
+The fix: the raw assertion bytes are **vendored** into the repository at
+`snaps/assertions/<name>_<revision>.snap-declaration` (e.g.
+`snaps/assertions/hello-world_29.snap-declaration`) — assertions are
+small, signed, and immutable, so committing them is exactly what an
+offline `snap ack` consumes anyway. `nix/snap.nix`'s `fetchAssert` reads
+that committed file back via a `file://` URL (interpolating the Nix path
+copies it into the store; the `<nix/fetchurl.nix>` FOD then re-verifies
+its flat `sha256` against `assert.sha256`, exactly as it would for any
+other URL scheme) — pure, offline, and reproducible with no network access
+at all. `bin/ubx-snap-resolve` regenerates the vendored file itself
+whenever it resolves for real: `_ubx_snap_resolve_real` base64-encodes the
+fetched assertion bytes into the seam's `assertBase64` field,
+`build_resolved` carries it through as the transient `_assertBase64` tuple
+field (the same pattern already used for `_unverifiedPublisherAllowed`),
+and `emit_lockfile` decodes it, verifies its sha256 against the tuple's own
+`assert.sha256` (a hard failure on mismatch), writes it atomically to
+`snaps/assertions/`, and strips the transient field before serializing the
+lockfile — the persisted `snaps.lock.json` schema is completely unchanged
+by any of this.
+
+Because `nix/snap.nix` no longer touches the network for this half, CI's
+"flake" job runs one extra, plain-bash step (no Nix build) that fetches the
+LIVE assertion with the correct `Accept` header via `curl` and diffs its
+sha256 against both the committed vendored file and the lockfile pin —
+this is what still catches Canonical re-signing a snap-declaration out
+from under the vendored/pinned bytes.
 
 ## Resolving: `bin/ubx-snap-resolve`
 
@@ -145,7 +194,11 @@ convention `bin/ubx`'s `UBX_SOFT_REBOOT_CMD`/`UBX_NEXTROOT_STAGE_CMD` and
 `bin/ubx-etc-apply` already establish. It is invoked once per declared snap
 as `CMD NAME CHANNEL REVISION_PIN` and must print one JSON object
 (`revision`, `publisher`, `publisherVerified`, `snapUrl`, `snapSha256`,
-`snapSize`, `assertUrl`, `assertSha256`) to stdout. The default
+`snapSize`, `assertUrl`, `assertSha256`, `assertBase64`) to stdout —
+`assertBase64` (base64 of the raw assertion bytes) is what lets
+`emit_lockfile` vendor those bytes to `snaps/assertions/` (see "Why the
+assertion is vendored" above); it never reaches the persisted lockfile
+itself. The default
 implementation shells out to the host's own `snap` client (present on every
 supported host, the same "reuse Canonical's own tooling" posture
 `bin/ubx-resolve` takes for `apt-get`); unit tests instead point the seam at
@@ -169,15 +222,22 @@ own `--emit-lockfile`.
 derivations via Nix's own `<nix/fetchurl.nix>` (never a nixpkgs fetcher —
 `SPEC.md` §1.3), verified against the pinned `sha256` by Nix itself at
 build time — the identical mechanism `nix/archive.nix` uses for debs.
-`packages.snap-fetch-proof` forces every pinned payload/assertion to
-actually fetch and re-hashes each one inside the sandbox as an independent
-check; `packages.snap-hash-mismatch-proof` is the deliberate negative case
-(a real URL, a deliberately wrong pinned hash) that must fail to build with
-Nix's own "hash mismatch" error — mirroring `nix/archive.nix`'s
-`archive-fetch-proof`/`archive-hash-mismatch-proof` pair exactly. Per
-`SPEC.md` §4.3, the fetched `.snap`/`.assert` bytes belong in the
-generation's retained-artifact set (`/ubx/store`) once real on-device
-composition exists.
+`fetchSnap` fetches the real `.snap` payload live, over plain HTTPS
+(that endpoint needs no special header); `fetchAssert` instead reads the
+committed, vendored `snaps/assertions/<name>_<revision>.snap-declaration`
+file via a `file://` URL — see "Why the assertion is vendored, not fetched
+live at build time" above for the full reasoning (the endpoint's
+`Accept`-header content negotiation that a header-less
+`<nix/fetchurl.nix>` GET can't satisfy). Both are still real, hash-verified
+fixed-output derivations. `packages.snap-fetch-proof` forces every pinned
+payload/assertion to actually build and re-hashes each one inside the
+sandbox as an independent check; `packages.snap-hash-mismatch-proof` is the
+deliberate negative case (a real URL, a deliberately wrong pinned hash)
+that must fail to build with Nix's own "hash mismatch" error — mirroring
+`nix/archive.nix`'s `archive-fetch-proof`/`archive-hash-mismatch-proof`
+pair exactly. Per `SPEC.md` §4.3, the fetched `.snap`/vendored `.assert`
+bytes belong in the generation's retained-artifact set (`/ubx/store`) once
+real on-device composition exists.
 
 ## The per-generation snap manifest
 

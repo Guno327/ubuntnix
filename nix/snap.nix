@@ -128,14 +128,40 @@
 #
 # -- Vendoring: fixed-output derivations by hash (`fetchSnap`/`fetchAssert`) -
 #
-# Mirrors nix/archive.nix's `fetchDeb`/`debs` exactly: one
-# `snaps.lock.json` entry -> one (or two — payload AND assertion chain)
-# fixed-output derivation(s) via `<nix/fetchurl.nix>`, verified against the
-# pinned sha256 by Nix itself at build time. `snaps` (below) is the
-# name -> `{ snap; assert; }` attrset for every LOCKFILE entry (not merely
-# every declared one — mirrors `debs`' own "every pinned entry gets a
-# fetcher" posture). Nothing here FORCES these to build merely by
-# evaluating this file (like nix/archive.nix's own `debs`, they are
+# Mirrors nix/archive.nix's `fetchDeb`/`debs`, with ONE deliberate
+# divergence for the assertion half — `fetchSnap` fetches the real `.snap`
+# payload straight from the live Store, over plain HTTPS, exactly like
+# `fetchDeb` (that endpoint needs no special request header and verifies
+# fine as an ordinary `<nix/fetchurl.nix>` FOD); `fetchAssert` does NOT
+# re-fetch over the network at all — it reads a COMMITTED, VENDORED copy of
+# the snap-declaration assertion bytes out of `../snaps/assertions/` (still
+# verified against the pinned `entry."assert".sha256` by Nix itself, still
+# a real fixed-output derivation, just fed a `file://` URL instead of an
+# `https://` one). Why: api.snapcraft.io's snap-declaration assertion
+# endpoint (`/v1/snaps/assertions/snap-declaration/16/<snap-id>`)
+# *content-negotiates on the `Accept` request header* — WITH
+# `Accept: application/x.ubuntu.assertion` it returns the real signed
+# assertion bytes (what `bin/ubx-snap-resolve`'s `_ubx_snap_resolve_real`
+# requests, and what `snaps.lock.json`'s `assert.sha256` pins); WITHOUT that
+# header — which is ALL a plain GET can be, and Nix's builtin
+# `<nix/fetchurl.nix>` has no way to set request headers — it instead
+# returns a small JSON wrapper describing the request, a completely
+# different set of bytes with a different hash. No header-less URL variant
+# of this endpoint returns the raw assertion (confirmed by hand:
+# `?max-format=0`, `assertions.ubuntu.com`, and the `/v2/assertions/...`
+# endpoint were all tried and all still content-negotiate the same way).
+# So a plain `<nix/fetchurl.nix>` FOD pointed at that URL can NEVER
+# reproduce the pinned hash — not a bug in the pin, a structural mismatch
+# between what the endpoint needs (a header) and what this flake's only
+# permitted fetcher can send (none). Vendoring the bytes instead sidesteps
+# the problem entirely: assertions are small, signed, and immutable, so
+# committing them to the repo (as `bin/ubx-snap-resolve` now does whenever
+# it resolves for real — see that script's header) and reading them back
+# locally is exactly what an offline `snap ack` consumes anyway. `snaps`
+# (below) is the name -> `{ snap; assert; }` attrset for every LOCKFILE
+# entry (not merely every declared one — mirrors `debs`' own "every pinned
+# entry gets a fetcher" posture). Nothing here FORCES these to build merely
+# by evaluating this file (like nix/archive.nix's own `debs`, they are
 # realized only when something actually depends on their output — see that
 # file's header, "so merely evaluating... forcing every pinned .deb to be
 # fetched... would be both slow and needless network I/O"), but
@@ -147,6 +173,12 @@
 # that file's own header), so — unlike an earlier draft of this file, when
 # the lockfile only carried schema-shaped placeholder data — a real,
 # CI-verified forcing proof is possible today, not just a future follow-up.
+# CI's "flake" job separately re-fetches the LIVE assertion (with the
+# correct `Accept` header, via plain `curl`, NOT a Nix build) and diffs its
+# hash against the vendored file, so a live re-signing by Canonical is
+# still caught even though nix/snap.nix itself no longer touches the
+# network for this half (see .github/workflows/ci.yml's "Verify vendored
+# snap-declaration assertion..." step).
 #
 # -- Interface with a future bin/ubx-snap ------------------------------------
 #
@@ -352,9 +384,25 @@ let
       name = sanitizeStoreName "${entry.name}_${toString entry.revision}.snap";
     };
 
+  # `entry."assert".url` is retained in the lockfile schema purely as
+  # PROVENANCE (which live endpoint these bytes came from, and what CI's
+  # separate live-assertion-drift check re-fetches — see the "Vendoring"
+  # header comment above) — it is deliberately NOT what this function
+  # fetches from. The vendored file path convention
+  # (`../snaps/assertions/<name>_<revision>.snap-declaration`, relative to
+  # this file) is shared verbatim with bin/ubx-snap-resolve's
+  # `emit_lockfile` (the one place that WRITES these files) and
+  # tests/lib/validate-snap-lockfile.py (which checks every lockfile entry
+  # has a matching vendored file). Interpolating a Nix PATH value (rather
+  # than a plain string) into the `file://` URL is what makes Nix copy the
+  # referenced file into the store as a source input first; the
+  # `<nix/fetchurl.nix>` FOD then reads it back out via a `file://
+  # <store-path>` fetch and verifies its flat sha256 against
+  # `entry."assert".sha256` exactly as it would for any other URL scheme —
+  # pure, offline, and reproducible without any network access at all.
   fetchAssert = entry:
     import <nix/fetchurl.nix> {
-      url = entry."assert".url;
+      url = "file://" + toString (../snaps/assertions + "/${entry.name}_${toString entry.revision}.snap-declaration");
       sha256 = entry."assert".sha256;
       name = sanitizeStoreName "${entry.name}_${toString entry.revision}.assert";
     };

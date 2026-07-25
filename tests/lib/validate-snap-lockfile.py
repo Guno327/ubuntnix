@@ -32,15 +32,35 @@ alone -- see bin/ubx-snap-resolve's header, "_unverifiedPublisherAllowed"
 is intentionally NOT part of this persisted schema). This validator
 therefore does not re-enforce the policy itself; it only enforces shape.
 
-Usage: validate-snap-lockfile.py PATH
+Usage: validate-snap-lockfile.py PATH [REPO_ROOT]
 Exits 0 and prints "OK: ..." on success; exits 1 and prints "FAIL: ..." (one
 line per violation) on failure.
+
+When REPO_ROOT is given, an additional check runs: every entry's vendored
+assertion file (`REPO_ROOT/snaps/assertions/<name>_<revision>.snap-
+declaration` -- the exact path/naming convention nix/snap.nix's
+`fetchAssert` and bin/ubx-snap-resolve's `emit_lockfile` both use, see
+their own headers) must exist and its flat sha256 must equal that entry's
+own `assert.sha256`. This guards the vendored-file/lockfile invariant the
+snap-declaration Accept-header content-negotiation fix depends on (a
+lockfile entry whose vendored file is missing or stale would make
+nix/snap.nix's fetch either fail outright or silently verify the WRONG
+bytes against the right hash, which can't happen if the hash matches, but
+COULD happen if someone hand-edits the lockfile's assert.sha256 without
+regenerating the vendored file -- this check exists to catch exactly that
+drift). REPO_ROOT is omitted by callers exercising `--emit-lockfile`
+fixtures that don't supply assertion bytes (bin/ubx-snap-resolve's header,
+"Emission": `_assertBase64` is optional) -- there is no vendored file to
+check in that case, so the check is skipped rather than failing spuriously.
 """
+import hashlib
 import json
+import os
 import re
 import sys
 
 path = sys.argv[1]
+repo_root = sys.argv[2] if len(sys.argv) > 2 else None
 errors = []
 
 
@@ -154,6 +174,33 @@ for i, s in enumerate(snaps):
 
 if errors:
     print(f"FAIL: {path} failed schema validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+# -- vendored-file/lockfile invariant (see this module's docstring) --------
+if repo_root is not None:
+    for s in snaps:
+        vendored_path = os.path.join(
+            repo_root, "snaps", "assertions",
+            f"{s['name']}_{s['revision']}.snap-declaration",
+        )
+        if not os.path.isfile(vendored_path):
+            fail(f"{vendored_path} does not exist (every lockfile entry needs a vendored assertion file -- see nix/snap.nix's/bin/ubx-snap-resolve's headers, 'Vendoring'/'Emission')")
+            continue
+        with open(vendored_path, "rb") as f:
+            actual_sha256 = hashlib.sha256(f.read()).hexdigest()
+        expected_sha256 = s["assert"]["sha256"]
+        if actual_sha256 != expected_sha256:
+            fail(
+                f"{vendored_path} has sha256 {actual_sha256}, but "
+                f"snaps[?] ({s['name']!r})'s assert.sha256 is "
+                f"{expected_sha256!r} -- vendored file is stale or the "
+                "lockfile was hand-edited; re-run bin/ubx-snap-resolve"
+            )
+
+if errors:
+    print(f"FAIL: {path} failed vendored-assertion validation:", file=sys.stderr)
     for e in errors:
         print(f"  - {e}", file=sys.stderr)
     sys.exit(1)

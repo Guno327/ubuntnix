@@ -142,6 +142,38 @@ if [ -n "$unpack_line" ] && [ -n "$configure_a_line" ]; then
     fail "unpackLines (line $unpack_line) does not come BEFORE dpkg --configure -a (line $configure_a_line)"
 fi
 
+# -- the LD_PRELOAD must actually LOAD: LD_LIBRARY_PATH + concrete symlink ---
+#
+# CI run 30199370520-era symptom: every build printed `ld.so: object
+# '.../libfakeroot-sysv.so' from LD_PRELOAD cannot be preloaded (cannot open
+# shared object file): ignored`, i.e. fakeroot was NEVER faking chown, and
+# boot-proof's pam packages died with `error setting ownership of
+# ./usr/sbin/pam_extrausers_chkpwd: Invalid argument` (a non-root gid EINVAL
+# under the single-id-mapped userns). Root cause was an asymmetry: pack.sh
+# exported LD_LIBRARY_PATH for the staged fakeroot lib tree but configure.sh
+# did not, and both preloaded the `libfakeroot-sysv.so` SYMLINK rather than a
+# concrete ELF object. Guard both halves of the fix so it cannot regress:
+#
+#   (1) configure.sh exports LD_LIBRARY_PATH covering the staged
+#       /.ubx-compose/fakeroot-tools lib dir, and does so BEFORE the fakeroot
+#       re-exec (otherwise the exec'd fakeroot/faked and their libfakeroot
+#       payload cannot resolve their own deps);
+ldpath_line=$(grep -n 'export LD_LIBRARY_PATH=.*fakeroot-tools' "$configure_sh" | head -1 | cut -d: -f1)
+[ -n "$ldpath_line" ] ||
+  fail "configure.sh does not export LD_LIBRARY_PATH covering the /.ubx-compose/fakeroot-tools lib dir before its fakeroot exec (asymmetry with pack.sh that left LD_PRELOAD ignored -- pam_extrausers_chkpwd EINVAL)"
+if [ -n "$ldpath_line" ] && [ -n "$reexec_line" ]; then
+  [ "$ldpath_line" -lt "$reexec_line" ] ||
+    fail "configure.sh exports LD_LIBRARY_PATH (line $ldpath_line) only AFTER the fakeroot re-exec (line $reexec_line) -- the exec'd fakeroot session would not inherit it"
+fi
+
+#   (2) BOTH configure.sh and pack.sh resolve the discovered
+#       `libfakeroot-sysv.so` symlink to a concrete regular file with
+#       `readlink -f` before putting it in LD_PRELOAD (a dangling/relative
+#       symlink in LD_PRELOAD is exactly what ld.so refused to load).
+readlink_n=$(grep -cE 'readlink -f "\$ubx_libfakeroot"' "$compose_nix")
+[ "$readlink_n" -ge 2 ] ||
+  fail "$compose_nix does not resolve the libfakeroot symlink to a concrete path with 'readlink -f' in BOTH the compose and pack fakeroot blocks (found $readlink_n of 2)"
+
 # -- squashfsImage packs with no -pf/pseudo-file mechanism, and loads a
 # fakeroot database back via -i --------------------------------------------
 #

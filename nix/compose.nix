@@ -585,6 +585,63 @@ let
             echo "configure.sh: could not locate fakeroot/faked/libfakeroot under /.ubx-compose/fakeroot-tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
             exit 1
           fi
+
+          # GitHub issue #48 -- the LD_PRELOAD actually has to LOAD, or none
+          # of the chown/chmod faking happens and dpkg hits EINVAL on the
+          # first non-root-owned/setgid file (boot-proof's pam packages:
+          # `error setting ownership of pam_extrausers_chkpwd: Invalid
+          # argument`). Ubuntu ships `libfakeroot-sysv.so` as a SYMLINK
+          # (-> libfakeroot-0.so) in .../libfakeroot/, and `find -L` returns
+          # the SYMLINK path; ld.so was reporting `object '<that path>' from
+          # LD_PRELOAD cannot be preloaded (cannot open shared object file):
+          # ignored` -- i.e. running WITHOUT fakeroot -- in every run so far
+          # (the small compose-proof only looked healthy because htop/hello/
+          # libnl are all root:root, so nothing needed a faked owner). Two
+          # robustness fixes: (1) resolve to the CONCRETE real ELF file with
+          # readlink -f and preload THAT absolute regular-file path, so no
+          # symlink sits in LD_PRELOAD; (2) put its own directory plus the
+          # staged fakeroot lib dirs on LD_LIBRARY_PATH so libfakeroot's own
+          # NEEDED deps resolve in every faked child (dpkg-deb's extraction
+          # subprocess, which is where the failing chown runs, included).
+          ubx_libfakeroot_real="$(readlink -f "$ubx_libfakeroot")"
+          [ -n "$ubx_libfakeroot_real" ] && ubx_libfakeroot="$ubx_libfakeroot_real"
+          ubx_ft_libdir="$(dirname "$ubx_libfakeroot")"
+          export LD_LIBRARY_PATH="$ubx_ft_libdir:/.ubx-compose/fakeroot-tools/usr/lib/x86_64-linux-gnu:/.ubx-compose/fakeroot-tools/lib/x86_64-linux-gnu''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
+          # Neither dev harness can run fakeroot/dpkg offline, so make the
+          # next CI run self-diagnosing: dump the three discovered paths,
+          # whether the libfakeroot file is a symlink and whether its target
+          # exists (ls -laL, deref), the lib's own declared dynamic deps
+          # (readelf -d NEEDED/RUNPATH -- the smoking gun for a preload that
+          # fails on a missing dependency; guarded with `command -v` because
+          # readelf may not exist in the chroot -- if absent we skip, never
+          # fail, since this whole block runs under `set -eu`), the exact
+          # LD_LIBRARY_PATH we just exported, and whether a bare preload of
+          # the resolved lib is accepted or still ignored. All to stderr so
+          # it lands in the build log regardless of exit status, and every
+          # external command is `|| true`-guarded so a missing tool can never
+          # abort the build.
+          echo "UBX-DIAG(compose): fakeroot_bin    = $ubx_fakeroot_bin" >&2
+          echo "UBX-DIAG(compose): faked_bin       = $ubx_faked_bin" >&2
+          echo "UBX-DIAG(compose): raw find        = $(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-sysv.so' | head -n1)" >&2
+          echo "UBX-DIAG(compose): lib(real)       = $ubx_libfakeroot" >&2
+          echo "UBX-DIAG(compose): LD_LIBRARY_PATH = $LD_LIBRARY_PATH" >&2
+          echo "UBX-DIAG(compose): ls -laL of lib file + its dir:" >&2
+          ls -laL "$ubx_libfakeroot" "$ubx_ft_libdir" >&2 || true
+          echo "UBX-DIAG(compose): readelf -d of preload lib (if readelf present):" >&2
+          if command -v readelf >/dev/null 2>&1; then
+            readelf -d "$ubx_libfakeroot" >&2 || true
+          else
+            echo "UBX-DIAG(compose): readelf not present in chroot, skipping" >&2
+          fi
+          echo "UBX-DIAG(compose): ldd of preload lib:" >&2
+          ldd "$ubx_libfakeroot" >&2 || true
+          echo "UBX-DIAG(compose): preload probe (any ld.so warning below => still IGNORED):" >&2
+          LD_PRELOAD="$ubx_libfakeroot" /bin/true || true
+          echo "UBX-DIAG(compose): preload probe done" >&2
+          # --- end DIAGNOSTIC ---------------------------------------------
+
           # `-s`: save the final faked ownership/mode database to
           # /.ubx-fakeroot-state -- deliberately OUTSIDE /.ubx-compose (a
           # later step in this same script `rm -rf`s that directory) and
@@ -1134,6 +1191,41 @@ let
           echo "pack.sh: could not locate fakeroot/faked/libfakeroot under /mnt/tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
           exit 1
         fi
+
+        # GitHub issue #48 -- same LD_PRELOAD-must-actually-load fix as
+        # composeRootfs's fakeroot re-exec block (see its comment): resolve
+        # the sysv .so SYMLINK to the concrete real ELF file and preload
+        # THAT, and add its own directory to LD_LIBRARY_PATH (the base
+        # /mnt/tools lib dirs are already there, from the export above, for
+        # mksquashfs's liblzo2 -- but libfakeroot lives in a `libfakeroot/`
+        # SUBDIR of those, which is not otherwise searched). If mksquashfs
+        # runs without fakeroot faking stat(2), every path is captured with
+        # its Nix-canonicalized owner/mode instead of the composed one.
+        ubx_libfakeroot_real="$(readlink -f "$ubx_libfakeroot")"
+        [ -n "$ubx_libfakeroot_real" ] && ubx_libfakeroot="$ubx_libfakeroot_real"
+        export LD_LIBRARY_PATH="$(dirname "$ubx_libfakeroot")''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+        # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
+        # Mirrors composeRootfs's own fakeroot-diag block (see it for the
+        # rationale + the `command -v readelf` / `|| true` robustness notes).
+        echo "UBX-DIAG(pack): fakeroot_bin    = $ubx_fakeroot_bin" >&2
+        echo "UBX-DIAG(pack): faked_bin       = $ubx_faked_bin" >&2
+        echo "UBX-DIAG(pack): lib(real)       = $ubx_libfakeroot" >&2
+        echo "UBX-DIAG(pack): LD_LIBRARY_PATH = $LD_LIBRARY_PATH" >&2
+        echo "UBX-DIAG(pack): ls -laL of lib file + its dir:" >&2
+        ls -laL "$ubx_libfakeroot" "$(dirname "$ubx_libfakeroot")" >&2 || true
+        echo "UBX-DIAG(pack): readelf -d of preload lib (if readelf present):" >&2
+        if command -v readelf >/dev/null 2>&1; then
+          readelf -d "$ubx_libfakeroot" >&2 || true
+        else
+          echo "UBX-DIAG(pack): readelf not present in chroot, skipping" >&2
+        fi
+        echo "UBX-DIAG(pack): ldd of preload lib:" >&2
+        ldd "$ubx_libfakeroot" >&2 || true
+        echo "UBX-DIAG(pack): preload probe (any ld.so warning below => IGNORED):" >&2
+        LD_PRELOAD="$ubx_libfakeroot" /bin/true || true
+        echo "UBX-DIAG(pack): preload probe done" >&2
+        # --- end DIAGNOSTIC ---------------------------------------------
 
         # GitHub issue #48 / issue #22 R1 determinism -- cross-derivation
         # (dev,inode) reconstruction. `/mnt/rootfs/.ubx-fakeroot-state` is

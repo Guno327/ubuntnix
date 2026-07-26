@@ -883,10 +883,24 @@ let
         # targets. Nothing after this point may redirect to /dev/null --
         # its bind mount is gone.
         for d in null zero full random urandom tty; do
-          umount "/dev/$d" || true
+          umount "/dev/$d" || umount -l "/dev/$d" || true
         done
-        umount /proc
-        find / -exec touch -h -d @0 {} +
+        umount /proc || umount -l /proc || true
+        # `|| true` on EVERY umount (issue #48): under this `unshare --user`
+        # namespace a mount bind-mounted from the more-privileged outer
+        # sandbox (the /dev nodes) -- and a /proc grouped with them -- is
+        # LOCKED, so umount is refused with EPERM. That is expected and must
+        # never abort the build (set -eu); the mounts vanish anyway when this
+        # namespace is torn down at process exit, before the rootfs is packed.
+        # Whether or not the detach succeeded, PRUNE the /proc and /dev bind
+        # mountpoints from the normalization find: a still-live procfs/devfs
+        # node cannot be touched, and find's resulting non-zero exit would
+        # abort under set -eu. Their mountpoint entries' own mtimes are
+        # already deterministic from unpack, so skipping them is
+        # reproducibility-safe; the best-effort touch afterwards still drives
+        # them to @0 on the runs where the detach did succeed.
+        find / \( -path /proc -o -path /dev/null -o -path /dev/zero -o -path /dev/full -o -path /dev/random -o -path /dev/urandom -o -path /dev/tty \) -prune -o -exec touch -h -d @0 {} +
+        touch -h -d @0 /proc /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty || true
         UBX_INNER_EOF
         ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/configure.sh"
 

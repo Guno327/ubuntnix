@@ -959,6 +959,19 @@ let
         ubxrun "$UBX_BASE/bin/cp" -r --preserve=mode,timestamps,links --no-preserve=ownership \
           "$UBX_BASE/." "$out/.ubx-pack/"
         ubxrun "$UBX_BASE/bin/chmod" u+w "$out/.ubx-pack"
+
+        # Unlike composeRootfs's fresh `.ubx-compose` (a name not present in
+        # ubuntu-base), `.ubx-pack` is populated by literally copying
+        # $UBX_BASE's own tree above -- and ubuntu-base ships a real `/mnt`
+        # directory, so the `--preserve=mode` copy stamps its canonical 0555
+        # onto `$out/.ubx-pack/mnt` too. The `chmod u+w` just above only
+        # reaches `.ubx-pack` itself, not that nested `mnt`, so the mount
+        # points created next still land inside a read-only directory.
+        # Proven by CI run 30199686173: `mkdir: cannot create directory
+        # '.../.ubx-pack/mnt/rootfs': Permission denied` (and same for
+        # `tools`/`out`). Same 0555-preserved-copy failure mode composeRootfs
+        # documents above for `$out` itself -- restore owner-write here too.
+        ubxrun "$UBX_BASE/bin/chmod" u+w "$out/.ubx-pack/mnt"
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-pack/mnt/rootfs" "$out/.ubx-pack/mnt/tools" "$out/.ubx-pack/mnt/out"
 
         # pack.sh -- runs INSIDE the chroot, same "write to a file, not a

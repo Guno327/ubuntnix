@@ -290,7 +290,7 @@ is the only one of the two that ever actually touches snapd.
 manifest (`renderManifest`'s output, above) against what snapd actually
 reports right now, and emits a deterministic, ordered action plan:
 
-```json
+```text
 { "version": 1, "actions": [ { "op": "...", "...": "..." }, ... ] }
 ```
 

@@ -169,12 +169,24 @@ not_implemented() {
 # =====================================================================
 # shared plan/report/execute helpers
 #
-# Domain order is FIXED throughout this file: etc, systemd, users, snap —
-# mirrors SPEC.md §4.3's switching table (row 1 combines /etc + systemd
-# units, row 2 is users, row 3 is snaps) and matches the position
-# bin/ubx-snap-purge's own sweep already established at the end of
-# execute_domains (issue #66). Every report this script prints lists
-# domains in exactly this order, regardless of which verb produced it.
+# REPORTED domain order is FIXED throughout this file: etc, systemd, users,
+# snap, secrets — mirrors SPEC.md §4.3's switching table (row 1 combines
+# /etc + systemd units, row 2 is users, row 3 is snaps) and matches the
+# position bin/ubx-snap-purge's own sweep already established at the end of
+# execute_domains (issue #66). Every report this script prints (report_domains
+# below) lists domains in exactly this order, regardless of which verb
+# produced it.
+#
+# COMPUTED order (plan_domains/execute_domains below) is a SEPARATE thing,
+# and is NOT the same as reported order: secrets is computed, and applied,
+# BEFORE users (GitHub issue #80, milestone M4) — a declared
+# `hashedPasswordSecret` needs the secrets domain's own NEW manifest in
+# hand to cross-check against at users-plan time, and a real password-hash
+# convergence needs the secret's own bytes already materialized under
+# `--run-secrets-dir` before `ubx-users apply-passwords` can read them back
+# out — see plan_domains'/execute_domains' own "-- secrets" comments for
+# the full reasoning. The reported SUMMARY line order is untouched by this;
+# only the internal compute/apply sequencing moved.
 # =====================================================================
 
 peek_next_index() { # ROOT
@@ -400,6 +412,7 @@ n = (
     len(p["users"]["create"]) + len(p["users"]["modify"])
     + len(p["groups"]["create"]) + len(p["membership"]["add"])
     + len(p["membership"]["remove"]) + len(p["authorized_keys"])
+    + len(p.get("password_set", []))
 )
 print(f"{n}\t{len(p['drift'])}\t{len(p['errors'])}")
 PYEOF
@@ -428,6 +441,8 @@ for m in p["membership"]["add"]:
     lines.append(f"add membership: {m['user']} to {m['group']}")
 for a in p["authorized_keys"]:
     lines.append(f"authorized_keys: {a['user']}")
+for pw in p.get("password_set", []):
+    lines.append(f"password_set: {pw['user']} (from secret '{pw['secret']}')")
 
 if not lines and not p["drift"] and not p["errors"]:
     print("users: nothing to do (fully converged)")
@@ -565,6 +580,61 @@ plan_domains() {
     DOM_NEW_SYSTEMD_JSON=""
   fi
 
+  # -- secrets (GitHub issue #78, milestone M4) ---------------------------
+  #
+  # Computed BEFORE users (GitHub issue #80, milestone M4: password login
+  # from a secret-sourced hash) -- deliberately reordered ahead of its
+  # original position (which used to sit after snap, below): the users
+  # block right after this one needs THIS domain's own NEW declared
+  # manifest to cross-check every declared `hashedPasswordSecret` against
+  # a REAL declared secret name (`ubx-users plan --secrets-manifest`, see
+  # that script's header, "Password hashes"), and, further down in
+  # execute_domains, secret delivery must land in `--run-secrets-dir`
+  # BEFORE `ubx-users apply-passwords` reads a hash back out of it — see
+  # that function's own comment for the executor half of this same
+  # ordering requirement. SPEC.md §4.3's own switching-table row for THIS
+  # domain is "none" downtime -- exactly etc/systemd/users' own posture, so
+  # this block otherwise mirrors their plan_domains shape unchanged (old/
+  # new declared manifest + an observed-state default synthesized from the
+  # OLD declared manifest, overridable via --secrets-observed) rather than
+  # snap's own plan+separate-purge-sweep shape (there is no secrets-purge
+  # sweep: an undeclared canonical copy is already `materialize.remove`,
+  # computed by bin/ubx-secrets' own planner -- see that script's header,
+  # "What counts as managed").
+  DOM_SECRETS_SKIP=0
+  if [ -z "$DOM_OLD_SECRETS_REF" ] && [ -z "$DOM_NEW_SECRETS_REF" ]; then
+    DOM_SECRETS_SKIP=1
+  fi
+  # DOM_NEW_SECRETS_JSON is resolved UNCONDITIONALLY (even when this domain
+  # is otherwise fully undeclared, on either side): ubx_rebuild_resolve_ref's
+  # own empty-ref branch already writes the "nothing declared" fixture
+  # content and echoes that path, so this is always a real, valid manifest
+  # file the users block below can pass to `ubx-users plan
+  # --secrets-manifest` unconditionally too -- a manifest declaring zero
+  # secrets correctly makes ANY `hashedPasswordSecret` reference a plan-time
+  # error there, exactly as it should.
+  DOM_NEW_SECRETS_JSON="$(ubx_rebuild_resolve_ref "$DOM_NEW_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" new-secrets)" \
+    || die "could not resolve the new generation's secrets manifest"
+  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
+    local secrets_old_json secrets_obs_json
+    secrets_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" old-secrets)" \
+      || die "could not resolve the old generation's secrets manifest"
+    if [ -n "${OPT_SECRETS_OBSERVED:-}" ]; then
+      secrets_obs_json="$OPT_SECRETS_OBSERVED"
+    else
+      secrets_obs_json="$workdir/secrets-obs-synth.json"
+      secrets_synthesize_observed "$secrets_old_json" "$secrets_obs_json"
+    fi
+
+    DOM_SECRETS_PLAN="$workdir/secrets-plan.json"
+    "$bindir/ubx-secrets" plan --manifest "$DOM_NEW_SECRETS_JSON" --observed "$secrets_obs_json" --out "$DOM_SECRETS_PLAN" \
+      || die "ubx-secrets plan refused (see its stderr above)"
+    DOM_SECRETS_TOUCH="$(summarize_secrets_plan "$DOM_SECRETS_PLAN")"
+  else
+    DOM_SECRETS_PLAN=""
+    DOM_SECRETS_TOUCH=0
+  fi
+
   DOM_USERS_SKIP=0
   if [ -z "$DOM_OLD_USERS_REF" ] && [ -z "$DOM_NEW_USERS_REF" ]; then
     DOM_USERS_SKIP=1
@@ -578,8 +648,14 @@ plan_domains() {
     users_shadow="${OPT_SHADOW:-/etc/shadow}"
 
     DOM_USERS_PLAN="$workdir/users-plan.json"
+    # --secrets-manifest is passed UNCONDITIONALLY (DOM_NEW_SECRETS_JSON is
+    # always resolved above, regardless of DOM_SECRETS_SKIP) -- see this
+    # function's own "-- secrets" block comment above for why that makes
+    # every declared hashedPasswordSecret cross-checked against the real
+    # secrets domain on every single 'ubx-users plan' call, GitHub issue
+    # #80.
     local users_args=("$bindir/ubx-users" plan --manifest "$users_new_json" --passwd "$users_passwd" \
-      --group "$users_group" --shadow "$users_shadow" --out "$DOM_USERS_PLAN")
+      --group "$users_group" --shadow "$users_shadow" --secrets-manifest "$DOM_NEW_SECRETS_JSON" --out "$DOM_USERS_PLAN")
     if [ -n "${OPT_USERS_EXCEPTIONS:-}" ]; then
       users_args+=(--exceptions "$OPT_USERS_EXCEPTIONS")
     fi
@@ -589,7 +665,7 @@ plan_domains() {
     users_rc=0
     "${users_args[@]}" || users_rc=$?
     if [ "$users_rc" -ne 0 ]; then
-      die "ubx-users plan reported hard errors (uid/gid conflicts) — see $DOM_USERS_PLAN"
+      die "ubx-users plan reported hard errors (uid/gid conflicts, or a hashedPasswordSecret referencing an undeclared secret) — see $DOM_USERS_PLAN"
     fi
     IFS=$'\t' read -r DOM_USERS_TOUCH DOM_USERS_DRIFT DOM_USERS_ERRORS < <(summarize_users_plan "$DOM_USERS_PLAN")
     # Defense in depth: users_rc==0 above should already guarantee
@@ -653,43 +729,6 @@ plan_domains() {
     DOM_NEW_SNAP_JSON=""
   fi
 
-  # -- secrets (GitHub issue #78, milestone M4) ---------------------------
-  #
-  # SPEC.md §4.3's own switching-table row for this domain is "none"
-  # downtime -- exactly etc/systemd/users' own posture, so this block
-  # mirrors their plan_domains shape (old/new declared manifest + an
-  # observed-state default synthesized from the OLD declared manifest,
-  # overridable via --secrets-observed) rather than snap's own
-  # plan+separate-purge-sweep shape (there is no secrets-purge sweep: an
-  # undeclared canonical copy is already `materialize.remove`, computed by
-  # bin/ubx-secrets' own planner -- see that script's header, "What counts
-  # as managed").
-  DOM_SECRETS_SKIP=0
-  if [ -z "$DOM_OLD_SECRETS_REF" ] && [ -z "$DOM_NEW_SECRETS_REF" ]; then
-    DOM_SECRETS_SKIP=1
-  fi
-  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
-    local secrets_old_json secrets_obs_json
-    secrets_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" old-secrets)" \
-      || die "could not resolve the old generation's secrets manifest"
-    DOM_NEW_SECRETS_JSON="$(ubx_rebuild_resolve_ref "$DOM_NEW_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" new-secrets)" \
-      || die "could not resolve the new generation's secrets manifest"
-    if [ -n "${OPT_SECRETS_OBSERVED:-}" ]; then
-      secrets_obs_json="$OPT_SECRETS_OBSERVED"
-    else
-      secrets_obs_json="$workdir/secrets-obs-synth.json"
-      secrets_synthesize_observed "$secrets_old_json" "$secrets_obs_json"
-    fi
-
-    DOM_SECRETS_PLAN="$workdir/secrets-plan.json"
-    "$bindir/ubx-secrets" plan --manifest "$DOM_NEW_SECRETS_JSON" --observed "$secrets_obs_json" --out "$DOM_SECRETS_PLAN" \
-      || die "ubx-secrets plan refused (see its stderr above)"
-    DOM_SECRETS_TOUCH="$(summarize_secrets_plan "$DOM_SECRETS_PLAN")"
-  else
-    DOM_SECRETS_PLAN=""
-    DOM_SECRETS_TOUCH=0
-    DOM_NEW_SECRETS_JSON=""
-  fi
 }
 
 # report_domains VERBOSE — prints the deterministic touched-domains report
@@ -804,10 +843,81 @@ execute_domains() {
     "${apply_args[@]}"
   fi
 
+  # -- secrets (GitHub issue #78) ------------------------------------------
+  #
+  # Runs BEFORE the users block right below (GitHub issue #80, milestone
+  # M4): a declared `hashedPasswordSecret` is converged by
+  # `ubx-users apply-passwords` reading a secret's REAL materialized bytes
+  # back out of `--run-secrets-dir/<secret>` -- that read only ever
+  # succeeds if this block has already run (real `--apply`) and actually
+  # written that file first. "none" downtime, real executor exists (unlike
+  # bin/ubx-users' own `execute`, which only ever emits a script) -- gated
+  # exactly like bin/ubx-etc-apply/bin/ubx-systemd-apply above: --apply
+  # runs it for real under EITHER switch or test (materializing a secret to
+  # tmpfs is safe to retry/roll back from, unlike a snapd mutation or a
+  # purge -- there is no snap-purge-style "test never really applies"
+  # carve-out here), --dry-run (the default) only prints.
+  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
+    local secrets_apply_args=("$bindir/ubx-secrets-apply" --plan "$DOM_SECRETS_PLAN" --run-secrets-dir "$run_secrets_dir")
+    local real_secrets_dir="$secrets_dir"
+    [ -n "$real_secrets_dir" ] || real_secrets_dir="$(dirname "$DOM_NEW_SECRETS_JSON")"
+    secrets_apply_args+=(--secrets-dir "$real_secrets_dir")
+    [ -z "$secrets_mounts_file" ] || secrets_apply_args+=(--mounts-file "$secrets_mounts_file")
+    if [ "$apply" = 1 ]; then
+      secrets_apply_args+=(--apply)
+    else
+      secrets_apply_args+=(--dry-run)
+    fi
+    "${secrets_apply_args[@]}"
+  fi
+
   if [ "$DOM_USERS_SKIP" = 0 ]; then
     local script="$users_out"
     "$bindir/ubx-users" execute --plan "$DOM_USERS_PLAN" --format shell --out "$script"
     echo "users: activation script written to $script (not executed — ubx-users execute only ever emits it; run it as root to converge, or see docs/users.md)"
+
+    # -- password hashes (GitHub issue #80) --------------------------------
+    #
+    # Unlike the account-creation half just above (script emission only,
+    # ALWAYS just written regardless of --apply), this DOES run for real
+    # when --apply is given: a declared hashedPasswordSecret's own
+    # convergence action (bin/ubx-users' own `password_set`, computed by
+    # `plan` above) is applied here -- see 'ubx-users apply-passwords
+    # --help' / that subcommand's own header ("apply-passwords") for why
+    # this must run AFTER the secrets block above (the read side of that
+    # ordering requirement: it reads a secret's REAL materialized bytes
+    # back out of --run-secrets-dir). Users this references are expected
+    # to already exist in --shadow -- true on a real machine only once the
+    # emitted activation script above has itself actually been run as
+    # root; a caller invoking this from 'ubx rebuild switch --apply'
+    # against a machine that has never run that script gets a clear
+    # apply-passwords error naming the missing account, never a silent
+    # no-op.
+    #
+    # UNLIKE etc/systemd/secrets above, this is only ever INVOKED when
+    # apply=1 (mirroring the snap block's own "dry-run means simply never
+    # invoking it at all" posture just below, not etc/systemd/secrets-
+    # apply's own "always invoke, --dry-run only prints" posture): unlike
+    # those tools, `apply-passwords --dry-run` still has to actually READ
+    # each referenced secret's real materialized bytes to compute whether
+    # a change would occur at all -- there is no content-free preview to
+    # give here (bin/ubx-users' own "Password hashes" header: `plan`
+    # itself never reads secret bytes, so this is the very first point
+    # that can). Invoking it unconditionally would mean the very first
+    # `ubx rebuild switch` (no --apply at all, nothing ever materialized
+    # anywhere yet) fails outright merely because nothing exists yet to
+    # preview a diff against -- exactly the kind of surprise a dry-run
+    # must never produce. report_domains, called earlier in bin/ubx's own
+    # do_rebuild/cmd_rollback, has already printed this plan's
+    # password_set action count, so nothing is lost by skipping the call
+    # when --apply was not given.
+    if [ "$apply" = 1 ]; then
+      local pw_shadow_file="${OPT_SHADOW:-/etc/shadow}"
+      "$bindir/ubx-users" apply-passwords --plan "$DOM_USERS_PLAN" \
+        --run-secrets-dir "$run_secrets_dir" --shadow "$pw_shadow_file" --apply
+    else
+      echo "users: password_set actions (if any) dry-run only -- ubx-users apply-passwords not invoked (pass --apply to converge real password hashes)"
+    fi
   fi
 
   if [ "$DOM_SNAP_SKIP" = 0 ] && { [ "$verb" = switch ] || [ "$verb" = test ]; }; then
@@ -869,29 +979,6 @@ execute_domains() {
       snap_purge_args+=(--dry-run)
     fi
     "${snap_purge_args[@]}"
-  fi
-
-  # -- secrets (GitHub issue #78) ------------------------------------------
-  #
-  # "none" downtime, real executor exists (unlike bin/ubx-users' own
-  # execute, which only ever emits a script) -- gated exactly like
-  # bin/ubx-etc-apply/bin/ubx-systemd-apply above: --apply runs it for
-  # real under EITHER switch or test (materializing a secret to tmpfs is
-  # safe to retry/roll back from, unlike a snapd mutation or a purge --
-  # there is no snap-purge-style "test never really applies" carve-out
-  # here), --dry-run (the default) only prints.
-  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
-    local secrets_apply_args=("$bindir/ubx-secrets-apply" --plan "$DOM_SECRETS_PLAN" --run-secrets-dir "$run_secrets_dir")
-    local real_secrets_dir="$secrets_dir"
-    [ -n "$real_secrets_dir" ] || real_secrets_dir="$(dirname "$DOM_NEW_SECRETS_JSON")"
-    secrets_apply_args+=(--secrets-dir "$real_secrets_dir")
-    [ -z "$secrets_mounts_file" ] || secrets_apply_args+=(--mounts-file "$secrets_mounts_file")
-    if [ "$apply" = 1 ]; then
-      secrets_apply_args+=(--apply)
-    else
-      secrets_apply_args+=(--dry-run)
-    fi
-    "${secrets_apply_args[@]}"
   fi
 }
 

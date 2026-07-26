@@ -190,24 +190,17 @@ readlink_n=$(grep -cE 'readlink -f "\$ubx_libfakeroot"' "$compose_nix")
 [ "$readlink_n" -ge 2 ] ||
   fail "$compose_nix does not resolve the libfakeroot symlink to a concrete path with 'readlink -f' in BOTH the compose and pack fakeroot blocks (found $readlink_n of 2)"
 
-#   (3) configure.sh runs a post-re-exec self-test (INSIDE the faked
-#       session, BEFORE dpkg) that fakes a root:shadow-style chown and reads
-#       it back, so CI can PROVE the tcp daemon actually intercepts chown
-#       rather than us guessing again after each run. Assert both the
-#       self-test tag and that it sits AFTER the re-exec and BEFORE dpkg.
-# shellcheck disable=SC2016 # literal text matched in source, not an expansion here
-selftest_line=$(grep -n 'fakeroot self-test' "$configure_sh" | head -1 | cut -d: -f1)
-[ -n "$selftest_line" ] ||
-  fail "configure.sh has no post-re-exec 'fakeroot self-test' chown probe (issue #48: proves whether the tcp backend actually fakes chown)"
-if [ -n "$selftest_line" ] && [ -n "$reexec_line" ]; then
-  [ "$selftest_line" -gt "$reexec_line" ] ||
-    fail "the fakeroot self-test (line $selftest_line) is not AFTER the re-exec (line $reexec_line) -- it must run INSIDE the faked session"
-fi
-if [ -n "$selftest_line" ] && [ -n "$unpack_line" ]; then
-  [ "$selftest_line" -lt "$unpack_line" ] ||
-    fail "the fakeroot self-test (line $selftest_line) is not BEFORE unpackLines (line $unpack_line) -- it must probe faking before dpkg relies on it"
-fi
-
+#   (3) [retired] configure.sh used to run a post-re-exec self-test (a
+#       throwaway chown probe logged to stderr, guarded entirely by
+#       `|| true`) proving to a human reading CI logs that the tcp backend
+#       actually intercepts chown. That diagnostic/self-test scaffolding
+#       was explicitly marked "REMOVE once CI is green" in nix/compose.nix
+#       and has now been removed (GitHub issue #77) now that fakeroot
+#       integration is stable on main -- the REAL guarantee (dpkg's own
+#       chown/chmod calls succeeding under the faked session) is still
+#       exercised by every other assertion in this file plus CI's real
+#       build, so no replacement assertion is needed here.
+#
 #   (4) BOTH blocks export FAKEROOTDONTTRYCHOWN=1 (fakeroot >= 1.29). Under
 #       `unshare --user`'s single-id map the faked chown target gid (42 =
 #       shadow) is unmapped, so the REAL chown/fchownat libfakeroot performs

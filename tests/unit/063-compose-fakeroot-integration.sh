@@ -208,6 +208,18 @@ if [ -n "$selftest_line" ] && [ -n "$unpack_line" ]; then
     fail "the fakeroot self-test (line $selftest_line) is not BEFORE unpackLines (line $unpack_line) -- it must probe faking before dpkg relies on it"
 fi
 
+#   (4) BOTH blocks export FAKEROOTDONTTRYCHOWN=1 (fakeroot >= 1.29). Under
+#       `unshare --user`'s single-id map the faked chown target gid (42 =
+#       shadow) is unmapped, so the REAL chown/fchownat libfakeroot performs
+#       after recording the fake returns EINVAL (kernel make_kgid rejects the
+#       id before any cap check; libfakeroot swallows only EPERM, not EINVAL
+#       -- Debian #802612), and dpkg dies. Setting this var makes every
+#       libfakeroot chown wrapper skip the real syscall and return 0 while
+#       still recording the faked owner. Guard it in both the compose and
+#       pack fakeroot blocks so the fix cannot regress.
+[ "$(grep -cE '^ *export FAKEROOTDONTTRYCHOWN=1' "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not 'export FAKEROOTDONTTRYCHOWN=1' in BOTH the compose and pack fakeroot blocks (issue #48: the real chown to an unmapped gid EINVALs under unshare --user, which libfakeroot does not swallow)"
+
 # -- squashfsImage packs with no -pf/pseudo-file mechanism, and loads a
 # fakeroot database back via -i --------------------------------------------
 #

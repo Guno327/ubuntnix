@@ -637,6 +637,20 @@ let
           [ -n "$ubx_libfakeroot_real" ] && ubx_libfakeroot="$ubx_libfakeroot_real"
           ubx_ft_libdir="$(dirname "$ubx_libfakeroot")"
           export LD_LIBRARY_PATH="$ubx_ft_libdir:/.ubx-compose/fakeroot-tools/usr/lib/x86_64-linux-gnu:/.ubx-compose/fakeroot-tools/lib/x86_64-linux-gnu''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # THE fix for issue #48 under `unshare --user`: libfakeroot RECORDS
+          # the faked ownership to faked-tcp (self-test stat reads back 0:42),
+          # but by default it then ALSO performs the real chown/fchownat --
+          # and inside this single-id user namespace the target gid (e.g. 42
+          # = shadow, for pam_extrausers_chkpwd) is UNMAPPED, so the kernel
+          # rejects it at make_kgid with EINVAL (id-validity is checked before
+          # any CAP_CHOWN permission check, so dropping caps would not help;
+          # and libfakeroot only swallows EPERM, not EINVAL -- Debian bug
+          # #802612). FAKEROOTDONTTRYCHOWN=1 (fakeroot >= 1.29; we pin 1.33)
+          # tells every libfakeroot chown/lchown/fchown/fchownat wrapper to
+          # send_stat the faked owner and then SKIP the real syscall entirely
+          # (return 0), so dpkg's fchownat succeeds and the faked db still
+          # carries the correct ownership for mksquashfs's -s/-i to apply.
+          export FAKEROOTDONTTRYCHOWN=1
 
           # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
           # Neither dev harness can run fakeroot/dpkg offline, so make the
@@ -1265,6 +1279,11 @@ let
         ubx_libfakeroot_real="$(readlink -f "$ubx_libfakeroot")"
         [ -n "$ubx_libfakeroot_real" ] && ubx_libfakeroot="$ubx_libfakeroot_real"
         export LD_LIBRARY_PATH="$(dirname "$ubx_libfakeroot")''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        # Same issue #48 fix as composeRootfs's block (see its FAKEROOTDONTTRYCHOWN
+        # comment): skip the real chown/fchownat under the single-id userns so
+        # mksquashfs's faked session never EINVALs on an unmapped gid while the
+        # faked ownership db it reads via -i stays correct.
+        export FAKEROOTDONTTRYCHOWN=1
 
         # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
         # Mirrors composeRootfs's own fakeroot-diag block (see it for the

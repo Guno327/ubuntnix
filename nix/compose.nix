@@ -602,8 +602,8 @@ let
           ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-tcp.so' | head -n1)"
           # Fall back to the sysv backend if the tcp trio is not all present,
           # so we never regress to a hard "not found" (sysv still loads; it
-          # just may not fake chown under unshare --user -- the diag below
-          # and the post-re-exec self-test will make that visible).
+          # just may not fake chown under unshare --user -- see the "WHY TCP,
+          # NOT SYSV" comment below for how that was actually diagnosed).
           if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
             ubx_fakeroot_backend=sysv
             ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
@@ -638,8 +638,8 @@ let
           ubx_ft_libdir="$(dirname "$ubx_libfakeroot")"
           export LD_LIBRARY_PATH="$ubx_ft_libdir:/.ubx-compose/fakeroot-tools/usr/lib/x86_64-linux-gnu:/.ubx-compose/fakeroot-tools/lib/x86_64-linux-gnu''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # THE fix for issue #48 under `unshare --user`: libfakeroot RECORDS
-          # the faked ownership to faked-tcp (self-test stat reads back 0:42),
-          # but by default it then ALSO performs the real chown/fchownat --
+          # the faked ownership to faked-tcp, but by default it then ALSO
+          # performs the real chown/fchownat --
           # and inside this single-id user namespace the target gid (e.g. 42
           # = shadow, for pam_extrausers_chkpwd) is UNMAPPED, so the kernel
           # rejects it at make_kgid with EINVAL (id-validity is checked before
@@ -652,40 +652,6 @@ let
           # carries the correct ownership for mksquashfs's -s/-i to apply.
           export FAKEROOTDONTTRYCHOWN=1
 
-          # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
-          # Neither dev harness can run fakeroot/dpkg offline, so make the
-          # next CI run self-diagnosing: dump the three discovered paths,
-          # whether the libfakeroot file is a symlink and whether its target
-          # exists (ls -laL, deref), the lib's own declared dynamic deps
-          # (readelf -d NEEDED/RUNPATH -- the smoking gun for a preload that
-          # fails on a missing dependency; guarded with `command -v` because
-          # readelf may not exist in the chroot -- if absent we skip, never
-          # fail, since this whole block runs under `set -eu`), the exact
-          # LD_LIBRARY_PATH we just exported, and whether a bare preload of
-          # the resolved lib is accepted or still ignored. All to stderr so
-          # it lands in the build log regardless of exit status, and every
-          # external command is `|| true`-guarded so a missing tool can never
-          # abort the build.
-          echo "UBX-DIAG(compose): backend        = $ubx_fakeroot_backend" >&2
-          echo "UBX-DIAG(compose): fakeroot_bin    = $ubx_fakeroot_bin" >&2
-          echo "UBX-DIAG(compose): faked_bin       = $ubx_faked_bin" >&2
-          echo "UBX-DIAG(compose): lib(real)       = $ubx_libfakeroot" >&2
-          echo "UBX-DIAG(compose): LD_LIBRARY_PATH = $LD_LIBRARY_PATH" >&2
-          echo "UBX-DIAG(compose): ls -laL of lib file + its dir:" >&2
-          ls -laL "$ubx_libfakeroot" "$ubx_ft_libdir" >&2 || true
-          echo "UBX-DIAG(compose): readelf -d of preload lib (if readelf present):" >&2
-          if command -v readelf >/dev/null 2>&1; then
-            readelf -d "$ubx_libfakeroot" >&2 || true
-          else
-            echo "UBX-DIAG(compose): readelf not present in chroot, skipping" >&2
-          fi
-          echo "UBX-DIAG(compose): ldd of preload lib:" >&2
-          ldd "$ubx_libfakeroot" >&2 || true
-          echo "UBX-DIAG(compose): preload probe (any ld.so warning below => still IGNORED):" >&2
-          LD_PRELOAD="$ubx_libfakeroot" /bin/true || true
-          echo "UBX-DIAG(compose): preload probe done" >&2
-          # --- end DIAGNOSTIC ---------------------------------------------
-
           # `-s`: save the final faked ownership/mode database to
           # /.ubx-fakeroot-state -- deliberately OUTSIDE /.ubx-compose (a
           # later step in this same script `rm -rf`s that directory) and
@@ -696,25 +662,6 @@ let
           exec "$ubx_fakeroot_bin" --lib "$ubx_libfakeroot" --faked "$ubx_faked_bin" \
             -s /.ubx-fakeroot-state -- /bin/sh /.ubx-compose/configure.sh
         fi
-
-        # --- SELF-TEST (issue #48; REMOVE once CI is green) -------------
-        # Execution only reaches here on the SECOND entry -- i.e. we are now
-        # INSIDE the faked session the FAKEROOTKEY guard above re-exec'd us
-        # into. PROVE whether chown faking actually works before dpkg relies
-        # on it: fake a root:shadow (gid 42) chown -- the exact ownership
-        # pam_extrausers_chkpwd needs, and the first non-zero GID that made
-        # dpkg EINVAL on the sysv backend -- on a throwaway probe and read it
-        # back. `0:42` => faking works (the tcp daemon is alive and
-        # intercepting); a chown error or a stat showing the real gid => the
-        # daemon is not intercepting and dpkg will EINVAL again. Everything is
-        # `|| true`-guarded so this can never abort the build under `set -eu`.
-        echo "UBX-DIAG(compose): fakeroot self-test -- FAKEROOTKEY=''${FAKEROOTKEY:-<unset>}" >&2
-        ubx_probe=/.ubx-compose/.ubx-fakeroot-selftest
-        : > "$ubx_probe" 2>/dev/null || true
-        chown 0:42 "$ubx_probe" 2>&1 | sed 's/^/UBX-DIAG(compose): self-test chown: /' >&2 || true
-        echo "UBX-DIAG(compose): self-test stat = $(stat -c '%u:%g' "$ubx_probe" 2>/dev/null || echo '<stat failed>') (expect 0:42 if faking works)" >&2
-        rm -f "$ubx_probe" 2>/dev/null || true
-        # --- end SELF-TEST ----------------------------------------------
 
         # A fresh /proc for THIS pid namespace -- several maintainer
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
@@ -1329,29 +1276,6 @@ let
         # mksquashfs's faked session never EINVALs on an unmapped gid while the
         # faked ownership db it reads via -i stays correct.
         export FAKEROOTDONTTRYCHOWN=1
-
-        # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
-        # Mirrors composeRootfs's own fakeroot-diag block (see it for the
-        # rationale + the `command -v readelf` / `|| true` robustness notes).
-        echo "UBX-DIAG(pack): backend        = $ubx_fakeroot_backend" >&2
-        echo "UBX-DIAG(pack): fakeroot_bin    = $ubx_fakeroot_bin" >&2
-        echo "UBX-DIAG(pack): faked_bin       = $ubx_faked_bin" >&2
-        echo "UBX-DIAG(pack): lib(real)       = $ubx_libfakeroot" >&2
-        echo "UBX-DIAG(pack): LD_LIBRARY_PATH = $LD_LIBRARY_PATH" >&2
-        echo "UBX-DIAG(pack): ls -laL of lib file + its dir:" >&2
-        ls -laL "$ubx_libfakeroot" "$(dirname "$ubx_libfakeroot")" >&2 || true
-        echo "UBX-DIAG(pack): readelf -d of preload lib (if readelf present):" >&2
-        if command -v readelf >/dev/null 2>&1; then
-          readelf -d "$ubx_libfakeroot" >&2 || true
-        else
-          echo "UBX-DIAG(pack): readelf not present in chroot, skipping" >&2
-        fi
-        echo "UBX-DIAG(pack): ldd of preload lib:" >&2
-        ldd "$ubx_libfakeroot" >&2 || true
-        echo "UBX-DIAG(pack): preload probe (any ld.so warning below => IGNORED):" >&2
-        LD_PRELOAD="$ubx_libfakeroot" /bin/true || true
-        echo "UBX-DIAG(pack): preload probe done" >&2
-        # --- end DIAGNOSTIC ---------------------------------------------
 
         # GitHub issue #48 / issue #22 R1 determinism -- cross-derivation
         # (dev,inode) reconstruction. `/mnt/rootfs/.ubx-fakeroot-state` is

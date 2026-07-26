@@ -61,6 +61,10 @@ plan.
   per-machine and per-user GPG identity onboarding, and the revocation path
   (mechanism implemented and unit-tested in M4; real installer-flow wiring
   is M7).
+- {doc}`pro` — declarative Ubuntu Pro: attach, esm-apps, and Livepatch,
+  converged against a fixture/real `pro status` (planner + executor
+  implemented and unit-tested behind a mock `pro` client in M4; a real
+  attach needs a real owned subscription token, tracked separately).
 - {doc}`boot` — kernel selection, GRUB generation machinery, and the
   bootable disk image (implemented in M1).
 - {doc}`systemd` — systemd units/services: declaration, the refuse-restart
@@ -90,6 +94,7 @@ generations
 users
 etc
 secrets
+pro
 boot
 systemd
 ubx

@@ -29,6 +29,7 @@
         ./nix/boot.nix
         ./nix/systemd.nix
         ./nix/secrets.nix
+        ./nix/pro.nix
       ];
     };
 }

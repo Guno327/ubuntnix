@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""bin/ubx-pro -- the Ubuntu Pro primitive's convergence PLANNER, plus a
+thin `observe` subcommand (SPEC.md §8.2 "Ubuntu Pro", §5, §11 M4; GitHub
+issue #82, milestone M4). The Pro-domain sibling of bin/ubx-secrets/
+bin/ubx-users: consumes nix/pro.nix's rendered manifest plus a real (or
+fixture, in tests) copy of `pro status` and decides what needs to change.
+
+-- Why this lives outside Nix, as a script under bin/ ----------------------
+
+Exactly bin/ubx-secrets' own reasoning (see that script's header):
+convergence is a function of REAL, observed system state (whether this
+machine is currently attached, and which services are currently enabled),
+which Nix's build graph has no business seeing. nix/pro.nix owns the
+declaration surface and renders it to a flat JSON manifest; this script
+CONSUMES that manifest plus an observed-state JSON and decides what needs
+to change. Kept pure Python specifically so the planner half is
+unit-testable with zero root, network, or `pro`/`nix` binary involved -- see
+tests/unit/172-ubx-pro-plan.sh.
+
+-- THE ABSOLUTE INVARIANT: the token VALUE never enters a plan -------------
+
+Exactly nix/pro.nix's own header, and SPEC.md §8.1's "no secret material
+ever enters a store object": this planner NEVER reads the real token's
+bytes. The manifest carries only `tokenSecretPath` (a plain path STRING,
+never dereferenced by this script); the plan's own `attach` action carries
+only `tokenSecretName` (the secret's declared NAME, re-derived from that
+path's basename) -- never a value, never even an attempt to open the file.
+bin/ubx-pro-apply (the executor) is the ONLY place real token bytes are
+ever read, and only at real `--apply` time, off the materialized
+`/run/secrets/<name>` file -- mirroring bin/ubx-secrets-apply's own
+`ubx_secrets_render_env` seam (see that script's header, "Env-file
+rendering: value never appears in the printed command list").
+
+-- The two subcommands ------------------------------------------------------
+
+  ubx-pro plan --manifest FILE --observed FILE [--out FILE]
+    Pure function of its inputs: declared manifest + observed Pro status ->
+    a deterministic JSON PLAN on stdout (or --out). Never touches a real
+    system.
+
+  ubx-pro observe [--status-file FILE] [--pro-bin CMD] [--out FILE]
+    Emits the observed-state JSON `plan` consumes. With --status-file, reads
+    a (real or fixture) `pro status --format json` document straight off
+    disk -- this is what every unit test uses, so `observe` is exercisable
+    with zero root/network/`pro` binary. Without --status-file, shells out
+    to `<pro-bin> status --format json` (default pro-bin: the literal
+    command "pro", the real host client) and parses ITS stdout instead --
+    the one codepath tests never exercise (mirrors bin/ubx-snap-apply's own
+    "the literal default is never exercised by tests/unit/" precedent for
+    UBX_SNAP_CMD).
+
+-- The manifest schema (produced by nix/pro.nix's `renderManifestJSON`) ----
+
+  { "version": 1, "enable": <bool>, "tokenSecretPath": "/run/secrets/<name>",
+    "esmApps": <bool>, "livepatch": <bool> }
+`esmApps`/`livepatch` are already gated by `enable` at render time (false
+whenever `enable` is false) -- see nix/pro.nix's own header.
+
+-- The observed schema ------------------------------------------------------
+
+  { "version": 1, "attached": <bool>,
+    "services": { "esm-apps": "enabled"|"disabled", "livepatch": "enabled"|"disabled", ... } }
+`services` mirrors the subset of a real `pro status --format json`
+document's own `services` list this planner cares about (every entry has a
+`name` and a `status` field in the real CLI's own output; entries this
+planner does not recognize -- e.g. `esm-infra`, `fips` -- are simply
+ignored, both by `observe`'s own extraction and by `plan`'s own diffing:
+this project declares only esm-apps/livepatch today, SPEC.md §8.2/§5, so
+there is nothing to converge for any other Pro service).
+
+-- The plan schema ----------------------------------------------------------
+
+  { "version": 1, "empty": <bool>,
+    "actions": [
+      { "op": "attach", "tokenSecretName": <str> },
+      { "op": "detach" },
+      { "op": "enable", "service": "esm-apps"|"livepatch" },
+      { "op": "disable", "service": "esm-apps"|"livepatch" },
+      ...
+    ] }
+`actions` is always emitted in this FIXED order -- attach before enable
+before disable, mirroring bin/ubx-snap's own "ack before install... before
+hold" fixed-order posture (see that script's header, "Ordering") -- and
+`enable`/`disable` are themselves emitted in declaration order (esm-apps,
+then livepatch) for full determinism across repeated runs against identical
+inputs. `detach` (declared `enable: false` but observed `attached: true`)
+is mutually exclusive with `attach`/`enable`/`disable`: detaching already
+implies every Pro service goes with it, so no separate per-service disable
+actions are ever emitted alongside a `detach`.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+PROG = "ubx-pro"
+
+# The two services this project declares convergence for today (SPEC.md
+# §5/§8.2) -- emission order for `enable`/`disable` actions, see this
+# file's header.
+KNOWN_SERVICES = ("esm-apps", "livepatch")
+
+
+def die(msg):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_json(path, default=None):
+    if path is None:
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(obj, out_path):
+    text = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+    if out_path is None:
+        sys.stdout.write(text)
+        return
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, out_path)
+
+
+# -- manifest/observed validation --------------------------------------------
+
+
+def validate_manifest(manifest):
+    errors = []
+    if not isinstance(manifest, dict):
+        return ["manifest top level is not a JSON object"]
+    if manifest.get("version") != 1:
+        errors.append(f"manifest 'version' must be 1, got {manifest.get('version')!r}")
+    if not isinstance(manifest.get("enable"), bool):
+        errors.append(f"manifest 'enable' must be a boolean, got {manifest.get('enable')!r}")
+    tsp = manifest.get("tokenSecretPath")
+    if not isinstance(tsp, str) or not tsp.startswith("/"):
+        errors.append(f"manifest 'tokenSecretPath' must be an absolute path string, got {tsp!r}")
+    if not isinstance(manifest.get("esmApps"), bool):
+        errors.append(f"manifest 'esmApps' must be a boolean, got {manifest.get('esmApps')!r}")
+    if not isinstance(manifest.get("livepatch"), bool):
+        errors.append(f"manifest 'livepatch' must be a boolean, got {manifest.get('livepatch')!r}")
+    return errors
+
+
+def validate_observed(observed):
+    errors = []
+    if not isinstance(observed, dict):
+        return ["observed state top level is not a JSON object"]
+    if observed.get("version") != 1:
+        errors.append(f"observed 'version' must be 1, got {observed.get('version')!r}")
+    if not isinstance(observed.get("attached"), bool):
+        errors.append(f"observed 'attached' must be a boolean, got {observed.get('attached')!r}")
+    services = observed.get("services")
+    if not isinstance(services, dict):
+        errors.append("observed 'services' must be an object")
+    return errors
+
+
+# -- the planner --------------------------------------------------------------
+
+
+def build_plan(manifest, observed):
+    actions = []
+
+    token_secret_name = manifest["tokenSecretPath"].rsplit("/", 1)[-1]
+    attached = observed["attached"]
+    services = observed.get("services", {})
+
+    if manifest["enable"]:
+        if not attached:
+            actions.append({"op": "attach", "tokenSecretName": token_secret_name})
+
+        declared_services = {"esm-apps": manifest["esmApps"], "livepatch": manifest["livepatch"]}
+        for service in KNOWN_SERVICES:
+            declared = declared_services[service]
+            current = services.get(service)
+            if declared and current != "enabled":
+                actions.append({"op": "enable", "service": service})
+            elif not declared and current == "enabled":
+                actions.append({"op": "disable", "service": service})
+    else:
+        # Detaching already tears down every Pro service with it -- no
+        # separate per-service disable actions alongside it (this file's
+        # header, "The plan schema").
+        if attached:
+            actions.append({"op": "detach"})
+
+    return {
+        "version": 1,
+        "empty": not actions,
+        "actions": actions,
+    }
+
+
+def cmd_plan(args):
+    manifest = load_json(args.manifest)
+    if manifest is None:
+        die("--manifest is required")
+    m_errors = validate_manifest(manifest)
+    if m_errors:
+        die("manifest failed validation:\n" + "\n".join(f"  - {e}" for e in m_errors))
+
+    observed = load_json(args.observed, {"version": 1, "attached": False, "services": {}})
+    o_errors = validate_observed(observed)
+    if o_errors:
+        die("observed state failed validation:\n" + "\n".join(f"  - {e}" for e in o_errors))
+
+    plan = build_plan(manifest, observed)
+    write_json(plan, args.out)
+    sys.exit(0)
+
+
+# -- observe: real (or fixture) `pro status --format json` -> observed JSON -
+
+
+def extract_observed(status):
+    """A real (or fixture) `pro status --format json` document -> this
+    script's own observed schema. Unrecognized top-level shapes degrade to
+    "not attached, nothing known" rather than raising -- a genuinely
+    malformed --status-file is still caught by `validate_observed` right
+    after, on the `plan` side; `observe` itself stays permissive so a
+    slightly-different real `pro` CLI version (extra fields, a missing
+    optional one) never crashes this step outright."""
+    attached = bool(status.get("attached", False)) if isinstance(status, dict) else False
+    services = {}
+    raw_services = status.get("services") if isinstance(status, dict) else None
+    if isinstance(raw_services, list):
+        for entry in raw_services:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            svc_status = entry.get("status")
+            if isinstance(name, str) and isinstance(svc_status, str):
+                services[name] = svc_status
+    return {"version": 1, "attached": attached, "services": services}
+
+
+def cmd_observe(args):
+    if args.status_file is not None:
+        status = load_json(args.status_file, {})
+    else:
+        # The one codepath tests never exercise -- see this file's header.
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [args.pro_bin, "status", "--format", "json"],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError as e:
+            die(f"could not run '{args.pro_bin} status --format json': {e}")
+        try:
+            status = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError as e:
+            die(f"'{args.pro_bin} status --format json' did not produce valid JSON: {e}")
+
+    write_json(extract_observed(status), args.out)
+    sys.exit(0)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description=(
+            "Ubuntu Pro convergence planner and observed-state reader "
+            "(SPEC.md §8.2, §5, §11 M4; issue #82, milestone M4)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_plan = sub.add_parser("plan", help="compute a convergence plan from a manifest + observed state")
+    p_plan.add_argument("--manifest", required=True, help="declared pro manifest (nix/pro.nix's renderManifestJSON output)")
+    p_plan.add_argument("--observed", default=None, help="observed pro-status state JSON (default: assume not attached, nothing enabled)")
+    p_plan.add_argument("--out", default=None, help="write the plan here instead of stdout")
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_obs = sub.add_parser("observe", help="read a real (or fixture) 'pro status --format json' document and emit its observed-state JSON")
+    p_obs.add_argument("--status-file", default=None, dest="status_file", help="a (real or fixture) 'pro status --format json' document to read instead of invoking --pro-bin")
+    p_obs.add_argument("--pro-bin", default="pro", dest="pro_bin", help="the real 'pro' client to invoke when --status-file is omitted (default: pro)")
+    p_obs.add_argument("--out", default=None, help="write the observed state here instead of stdout")
+    p_obs.set_defaults(func=cmd_observe)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except (OSError, json.JSONDecodeError) as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()

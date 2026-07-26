@@ -620,6 +620,61 @@ jobs:
           path: switch-loop-serial.log
           if-no-files-found: ignore
 
+  soft-reboot:
+    name: Soft-reboot re-exec QEMU e2e (GitHub issue #59, follow-up to #55/#58)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # Same requirement as the "boot"/"switch-loop"/"snap-convergence" jobs
+      # above -- nix/boot.nix's soft-reboot-proof composes a rootfs tree
+      # through the same hardened `unshare --user --map-root-user` chroot.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: see the "boot" job's identical step for
+      # the full rationale (nix/stdenv.nix's `__noChroot = true` derivation).
+      - name: Build soft-reboot-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#soft-reboot-proof -L -o result-soft-reboot-image
+          sudo chown -R "$USER" result-soft-reboot-image
+      - name: Assert soft-reboot-proof artifact
+        run: |
+          img="result-soft-reboot-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the real soft-reboot re-exec below is expected to be declined via a clean UBX-SR-NOTE instead (see tests/e2e/040-qemu-soft-reboot-e2e.sh's/nix/boot.nix's soft-reboot-proof's own uptime heuristic)"
+          fi
+      # The actual QEMU end-to-end soft-reboot test (GitHub issue #59):
+      # boots the just-built disk image once and asserts EITHER a real
+      # `systemctl soft-reboot` re-exec succeeded (UBX-SR-BOOTID-PASS +
+      # UBX-SR-POST-PASS) or the guest cleanly declined one (a single
+      # UBX-SR-NOTE, no UBX-SR-FAIL) -- see nix/boot.nix's
+      # softRebootDriverScript and this harness's own header for the exact
+      # design and every clean-fallback condition.
+      - name: QEMU e2e soft-reboot test
+        run: ./tests/e2e/040-qemu-soft-reboot-e2e.sh --image result-soft-reboot-image --timeout 240 --keep-log soft-reboot-serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soft-reboot-e2e-serial-log
+          path: soft-reboot-serial.log
+          if-no-files-found: ignore
+
   snap-convergence:
     name: M3 snap-convergence QEMU e2e (SPEC.md §11 M3 exit criterion; issue #64)
     runs-on: ubuntu-24.04

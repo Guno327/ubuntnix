@@ -1062,6 +1062,18 @@ let
           "$out/.ubx-pack/enter.sh"
 
         ubxrun "$UBX_BASE/bin/cp" "$out/.ubx-pack/mnt/out/rootfs.squashfs" "$out/rootfs.squashfs"
+        # The `.ubx-pack` scratch tree is a copy of ubuntu-base, so it carries
+        # ubuntu's own restrictive directory modes (e.g. dpkg info/, var/cache,
+        # var/log entries whose containing dirs lack owner-write). `rm -rf` then
+        # fails `Permission denied` removing their contents (CI run
+        # 30199980867). The earlier `chmod u+w .../mnt` fix only covered the
+        # nested mount points; generalize it to the whole tree right before the
+        # delete. This is safe: the /mnt/rootfs and /mnt/tools bind mounts lived
+        # only inside enter.sh's `unshare --mount` namespace and have already
+        # vanished with it, so this chmod (and the rm) touch only the local
+        # writable copy, never the read-only Nix store rootfs/tools. Capital `X`
+        # restores search/traverse on directories so the recursion can descend.
+        ubxrun "$UBX_BASE/bin/chmod" -R u+rwX "$out/.ubx-pack"
         ubxrun "$UBX_BASE/bin/rm" -rf "$out/.ubx-pack"
       '';
     };

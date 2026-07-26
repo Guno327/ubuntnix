@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# bin/ubx-snap-apply — snap-domain convergence EXECUTOR (SPEC.md §4.3
+# switching-table row "Snaps (add/remove/pin/connect/config) | converge
+# snapd via its API; vendored payloads signed-sideloaded; auto-refresh held
+# permanently", §4.4; GitHub issue #62, milestone M3). The snap-domain
+# sibling of bin/ubx-systemd-apply/bin/ubx-etc-apply, analogous by design:
+# consumes the plan JSON `bin/ubx-snap plan` emits (see that script's
+# header for the manifest/plan schemas and the full plan algorithm; its
+# `cmd_plan_usage` for the exact per-op action-object schema) and issues
+# the corresponding `snap` calls, IN THE PLAN'S OWN ORDER. All the
+# intelligence (what should change, install vs refresh vs revert, which
+# connections/config keys differ, whether the system needs a fresh
+# refresh-hold) lives in the planner (bin/ubx-snap); this script is
+# deliberately dumb — it never recomputes, re-derives, or second-guesses a
+# single decision the plan already made, exactly bin/ubx-systemd-apply's
+# own "THIN...EXECUTOR" scope line.
+#
+# -- The injectable snapd-mutation command seam: UBX_SNAP_CMD ---------------
+#
+# Every call that actually mutates live snapd state is gated behind ONE
+# seam, `UBX_SNAP_CMD` (or `--snap-cmd`) — the same "UBX_*_CMD" convention
+# bin/ubx's `UBX_SOFT_REBOOT_CMD`/`UBX_NEXTROOT_STAGE_CMD` and bin/ubx-snap's
+# own `UBX_SNAP_QUERY_CMD` already establish. Unlike `UBX_SNAP_QUERY_CMD`
+# (which combines SEVERAL separate `snap` subcommands into one observed-
+# state query, so its seam takes no arguments at all — see that script's
+# header), every action this executor performs already maps 1:1 onto a
+# single real `snap` subcommand invocation, so this seam mirrors
+# `UBX_SOFT_REBOOT_CMD` instead: an environment variable/option naming a
+# COMMAND (not a fixed-argv function), invoked once per plan action as
+# `"$UBX_SNAP_CMD" <subcommand> <args...>` — exactly the argv a human
+# would type at the real `snap` CLI — and defaulted to the literal string
+# `snap` (the real, unwrapped host binary), never a wrapper function. Unit
+# tests point this seam at a small recording-stub script instead of the
+# real `snap` client (tests/README.md's "no root, no network, no KVM" unit
+# rule — there is no live snapd in this harness's containers), so the
+# whole plan -> ordered-snapd-calls pipeline is exercisable fully offline;
+# the literal `snap` default is NEVER exercised by tests/unit/, exactly
+# `_ubx_snap_query_real`'s own "exercised only by a human/CI with a real
+# snapd instance" precedent.
+#
+# -- Payload/assertion resolution: a documented assumption -------------------
+#
+# The plan's `ack`/`install`/`refresh` action objects (bin/ubx-snap's own
+# `cmd_plan_usage`) carry `name`/`revision` (`refresh`: `toRevision`) plus
+# `channel`/`classic` for `install` only — no file paths. This is
+# deliberate on bin/ubx-snap's side (see nix/snap.nix's header, "The
+# per-generation snap manifest": embedding raw store paths there would
+# force a network fetch merely by evaluating the manifest). Real vendored
+# artifacts are therefore resolved HERE, by the same `<name>_<revision>`
+# naming convention bin/ubx-snap-resolve's `emit_lockfile` and
+# nix/snap.nix's `fetchAssert` already use for the committed
+# `snaps/assertions/<name>_<revision>.snap-declaration` files (see both of
+# those for the precedent):
+#   --payload-dir DIR/<name>_<revision>.snap               (the .snap payload)
+#   --assert-dir  DIR/<name>_<revision>.snap-declaration   (the assertion)
+# `--payload-dir` defaults to "." (mirrors bin/ubx-etc-apply's own
+# `--content-dir` default); `--assert-dir` defaults to "snaps/assertions"
+# (the exact repo-root-relative path bin/ubx-snap-resolve already vendors
+# into and nix/snap.nix's `fetchAssert` already reads from). A real
+# `ubx rebuild switch --apply` is expected to point both at wherever the
+# new generation's snap-domain manifest build actually placed these files
+# (bin/ubx-generations' reserved `GEN_SNAP_MANIFEST` field, once wired) —
+# tracked as a gap, not silently glossed over, same as bin/ubx-snap-resolve
+# and nix/snap.nix's own headers track theirs.
+#
+# `refresh`'s action object carries `toRevision`, never `revision`, and —
+# per bin/ubx-snap's own schema — no `classic` field at all (only
+# `install`'s does). This executor therefore NEVER passes `--classic` for
+# a `refresh` op; a classic snap that later needs a revision bump would
+# need bin/ubx-snap's own schema extended first — a tracked gap, not an
+# oversight.
+#
+# -- Why sideload passes --dangerous despite the preceding `ack` ------------
+#
+# docs/snap.md's own "A scoped simplification: which assertion is pinned"
+# section is explicit: only the snap-declaration assertion is vendored,
+# never the full chain (account, account-key, snap-declaration,
+# snap-revision) a real, fully-offline `snap ack` + sideload needs to
+# verify a payload's signature end to end. `ack` (below) still acks
+# whatever IS vendored — binding the snap name to its snap-id/publisher
+# identity, the one thing this project's own policy re-enforcement needs —
+# but snapd itself cannot verify the SIDELOADED PAYLOAD's signature against
+# that alone, so `install`/`refresh` pass `--dangerous` (snapd's own escape
+# hatch for "install this unasserted-for-this-purpose local file anyway").
+# This is a direct, honest consequence of the already-documented scope
+# reduction, not a new one introduced here.
+#
+# -- connect: system-slot assumption -----------------------------------------
+#
+# The plan's `connect`/`disconnect` action objects carry a single
+# `interface` name (SPEC.md's `connections` list is just plug/slot
+# interface names — see bin/ubx-snap's own header). Every interface this
+# project declares today (network, camera, etc. — nix/snap.nix's
+# `identRe`-validated strings) is a CORE-provided (system) interface, whose
+# slot is always addressed as `:<interface>` with no snap name (a real
+# `snap connect foo:network` alone already resolves unambiguously to the
+# one core `:network` slot; explicitly naming it, `snap connect
+# foo:network :network`, is the exact call `snap connect --help` documents
+# and is unambiguous even if snapd's own resolution differs in an edge
+# case, so this executor always passes it explicitly). This mirrors the
+# "document the assumption" posture set for the payload/assertion paths
+# above; a connection to a NON-core slot (another snap's slot) is out of
+# this issue's declared interface shape entirely.
+#
+# -- set/unset value formatting ----------------------------------------------
+#
+# `snap set NAME KEY=VALUE` reads VALUE as a plain string unless it is one
+# of snapd's own recognized literals (`true`/`false`, a bare integer/float,
+# or valid JSON when the value looks like a JSON structure) — this
+# executor formats a `true`/`false` Python bool as bare `true`/`false`
+# (lowercase, unquoted) and any other value via `json.dumps` (so a string
+# stays a string, a number stays a number, and a list/object round-trips
+# as JSON) -- see snapd's own `snap set` documentation for this exact
+# literal-vs-JSON reading rule.
+#
+# -- Ordering ------------------------------------------------------------
+#
+# Actions are executed in EXACTLY the order the plan JSON lists them --
+# this script never sorts, groups, or reorders; bin/ubx-snap's own header
+# documents why its emitted order is already the correct one (ack before
+# install/refresh before revert before remove before connect/disconnect
+# before set/unset before hold).
+set -euo pipefail
+
+prog_name="ubx-snap-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-snap-apply --plan FILE [--payload-dir DIR] [--assert-dir DIR] [--snap-cmd CMD]
+
+Consumes a plan produced by `bin/ubx-snap plan` and issues the
+corresponding `snap` calls, in the plan's own order, through the
+injectable UBX_SNAP_CMD seam (see this script's header).
+
+  --plan FILE        the plan JSON to apply (required)
+  --payload-dir DIR  where an install/refresh action's vendored .snap
+                     payload is read from, as DIR/<name>_<revision>.snap
+                     (default: ".")
+  --assert-dir DIR   where an ack action's vendored assertion is read
+                     from, as DIR/<name>_<revision>.snap-declaration
+                     (default: "snaps/assertions")
+  --snap-cmd CMD     the snapd-mutation seam to invoke as
+                     "CMD <subcommand> <args...>" for each action
+                     (default: $UBX_SNAP_CMD, else the literal command
+                     "snap" — the real host snapd client)
+  -h, --help         show this message
+
+Unit tests point --snap-cmd/UBX_SNAP_CMD at a small recording-stub script
+instead of the real 'snap' client, so the whole plan -> ordered-snapd-calls
+pipeline is exercisable fully offline (tests/README.md's "no root, no
+network, no KVM" unit rule).
+USAGE
+}
+
+main() {
+  local plan="" payload_dir="." assert_dir="snaps/assertions"
+  local snap_cmd="${UBX_SNAP_CMD:-snap}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --payload-dir) [ $# -ge 2 ] || die "--payload-dir requires an argument"; payload_dir="$2"; shift 2 ;;
+      --assert-dir) [ $# -ge 2 ] || die "--assert-dir requires an argument"; assert_dir="$2"; shift 2 ;;
+      --snap-cmd) [ $# -ge 2 ] || die "--snap-cmd requires an argument"; snap_cmd="$2"; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+
+  local commands
+  commands="$(python3 - "$plan" "$payload_dir" "$assert_dir" "$snap_cmd" <<'PYEOF'
+import json
+import shlex
+import sys
+
+plan_path, payload_dir, assert_dir, snap_cmd = sys.argv[1:5]
+
+with open(plan_path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+lines = []
+
+
+def emit(argv):
+    lines.append(" ".join(shlex.quote(a) for a in [snap_cmd] + argv))
+
+
+def payload_path(name, revision):
+    return f"{payload_dir}/{name}_{revision}.snap"
+
+
+def assert_path(name, revision):
+    return f"{assert_dir}/{name}_{revision}.snap-declaration"
+
+
+def fmt_value(value):
+    # See this script's header, "set/unset value formatting".
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+for a in plan.get("actions", []):
+    op = a["op"]
+    if op == "ack":
+        emit(["ack", assert_path(a["name"], a["revision"])])
+    elif op == "install":
+        argv = ["install", "--dangerous"]
+        if a.get("classic"):
+            argv.append("--classic")
+        argv.append(payload_path(a["name"], a["revision"]))
+        emit(argv)
+    elif op == "refresh":
+        # No 'classic' field on a refresh action -- see this script's
+        # header, "Payload/assertion resolution".
+        emit(["refresh", "--dangerous", payload_path(a["name"], a["toRevision"])])
+    elif op == "revert":
+        emit(["revert", a["name"], f"--revision={a['toRevision']}"])
+    elif op == "remove":
+        emit(["remove", a["name"]])
+    elif op == "connect":
+        emit(["connect", f"{a['name']}:{a['interface']}", f":{a['interface']}"])
+    elif op == "disconnect":
+        emit(["disconnect", f"{a['name']}:{a['interface']}"])
+    elif op == "set":
+        emit(["set", a["name"], f"{a['key']}={fmt_value(a['value'])}"])
+    elif op == "unset":
+        emit(["unset", a["name"], a["key"]])
+    elif op == "hold":
+        emit(["refresh", "--hold=forever"])
+    else:  # pragma: no cover -- defensive; bin/ubx-snap never emits this
+        print(f"ubx-snap-apply: unknown plan action op: {op!r}", file=sys.stderr)
+        sys.exit(1)
+
+print("\n".join(lines))
+PYEOF
+  )"
+
+  if [ -z "$commands" ]; then
+    exit 0
+  fi
+
+  # Run each command line via a temp script, exactly bin/ubx-systemd-apply's
+  # / bin/ubx-etc-apply's own `--apply` branch (see tests/unit/137's header
+  # for exactly why `$script` is expanded NOW, double-quoted, rather than
+  # lazily at EXIT-trap-fire time).
+  local script
+  script="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $script now
+  trap "rm -f '$script'" EXIT
+  {
+    printf '#!/bin/sh\nset -e\n'
+    printf '%s\n' "$commands"
+  } > "$script"
+  chmod +x "$script"
+  "$script"
+}
+
+main "$@"

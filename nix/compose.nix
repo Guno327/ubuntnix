@@ -980,6 +980,13 @@ let
         # test expression, here).
         ubxrun "$UBX_BASE/bin/cat" > "$out/.ubx-pack/pack.sh" <<'UBX_PACK_EOF'
         set -eu
+        # Mirrors configure.sh's own PATH export above: a chroot inherits
+        # whatever PATH the outer builder happened to have (no nix-store
+        # paths exist inside this chroot at all), so bare-name lookups
+        # below (find, head, ...) resolve against an effectively empty
+        # PATH unless one is set explicitly here. Fix for CI run
+        # 30199884603: "/pack.sh: 26: find: not found" / "head: not found".
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         # squashfs-tools' own runtime deps (liblz4-1, liblzma5, libzstd1,
         # zlib1g) are already inside ubuntu-base; only liblzo2-2 (and
         # fakeroot's own small dep set) live under /mnt/tools instead --

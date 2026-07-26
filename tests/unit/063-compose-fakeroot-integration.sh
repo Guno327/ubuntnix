@@ -91,14 +91,27 @@ grep -qE 'packages = \[ "fakeroot" "libfakeroot" \]' "$compose_nix" ||
 grep -qE 'FAKEROOTKEY' "$compose_nix" ||
   fail "$compose_nix does not guard its fakeroot re-exec with a FAKEROOTKEY check"
 
-# -- tool discovery targets the CONCRETE -sysv binaries, not the bare
-# alternatives-symlink names (regression guard for CI run 30199370520,
-# where `-name fakeroot`/`-name 'faked-*'` found a dangling symlink and a
-# manpage). Both discovery blocks (configure.sh + pack.sh) must use them.
+# -- tool discovery selects the TCP backend (with a -sysv fallback), and
+# targets CONCRETE binaries, not the bare alternatives-symlink names.
+#
+# The tcp backend is what actually FAKES chown under this file's `unshare
+# --user` sandbox: the CI run on bf1f13a proved libfakeroot loaded fine yet
+# the sysv frontend/daemon could not talk over SysV IPC message queues in
+# the nested userns, so dpkg still EINVAL'd on the first non-root-GID chown
+# (pam_extrausers_chkpwd, root:shadow). faked-tcp talks over a localhost
+# socket instead. Both discovery blocks (configure.sh + pack.sh) must try
+# tcp FIRST, and keep a sysv fallback so we never regress to "not found".
+[ "$(grep -cE "\-name 'fakeroot-tcp'" "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not discover the concrete 'fakeroot-tcp' binary in both the compose and pack blocks (tcp is the backend that actually fakes chown under unshare --user)"
+[ "$(grep -cE "\-name 'faked-tcp'" "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not discover the concrete 'faked-tcp' binary in both the compose and pack blocks"
+[ "$(grep -cE "\-name 'libfakeroot-tcp.so'" "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not discover the concrete 'libfakeroot-tcp.so' preload in both the compose and pack blocks"
+# The -sysv fallback must remain in both blocks (never a hard 'not found').
 [ "$(grep -cE "\-name 'fakeroot-sysv'" "$compose_nix")" -ge 2 ] ||
-  fail "$compose_nix does not discover the concrete 'fakeroot-sysv' binary in both the compose and pack blocks"
+  fail "$compose_nix dropped the concrete 'fakeroot-sysv' fallback in the compose and pack blocks"
 [ "$(grep -cE "\-name 'faked-sysv'" "$compose_nix")" -ge 2 ] ||
-  fail "$compose_nix does not discover the concrete 'faked-sysv' binary in both the compose and pack blocks"
+  fail "$compose_nix dropped the concrete 'faked-sysv' fallback in the compose and pack blocks"
 if grep -qE -- "-type f -name fakeroot( |$)" "$compose_nix"; then
   fail "$compose_nix still discovers fakeroot by the bare 'fakeroot' name -- that is the update-alternatives symlink, dangling in a data-only extraction (CI run 30199370520)"
 fi
@@ -167,12 +180,33 @@ if [ -n "$ldpath_line" ] && [ -n "$reexec_line" ]; then
 fi
 
 #   (2) BOTH configure.sh and pack.sh resolve the discovered
-#       `libfakeroot-sysv.so` symlink to a concrete regular file with
-#       `readlink -f` before putting it in LD_PRELOAD (a dangling/relative
-#       symlink in LD_PRELOAD is exactly what ld.so refused to load).
+#       libfakeroot .so to a concrete regular file with `readlink -f` before
+#       putting it in LD_PRELOAD (a dangling/relative symlink in LD_PRELOAD
+#       is exactly what ld.so refused to load). CI on bf1f13a showed the
+#       staged .so was a real ELF, not a symlink, so this is a harmless
+#       no-op there -- but it is cheap insurance kept for both blocks.
+# shellcheck disable=SC2016 # literal $ is intentional -- matching source text, not an expansion here
 readlink_n=$(grep -cE 'readlink -f "\$ubx_libfakeroot"' "$compose_nix")
 [ "$readlink_n" -ge 2 ] ||
   fail "$compose_nix does not resolve the libfakeroot symlink to a concrete path with 'readlink -f' in BOTH the compose and pack fakeroot blocks (found $readlink_n of 2)"
+
+#   (3) configure.sh runs a post-re-exec self-test (INSIDE the faked
+#       session, BEFORE dpkg) that fakes a root:shadow-style chown and reads
+#       it back, so CI can PROVE the tcp daemon actually intercepts chown
+#       rather than us guessing again after each run. Assert both the
+#       self-test tag and that it sits AFTER the re-exec and BEFORE dpkg.
+# shellcheck disable=SC2016 # literal text matched in source, not an expansion here
+selftest_line=$(grep -n 'fakeroot self-test' "$configure_sh" | head -1 | cut -d: -f1)
+[ -n "$selftest_line" ] ||
+  fail "configure.sh has no post-re-exec 'fakeroot self-test' chown probe (issue #48: proves whether the tcp backend actually fakes chown)"
+if [ -n "$selftest_line" ] && [ -n "$reexec_line" ]; then
+  [ "$selftest_line" -gt "$reexec_line" ] ||
+    fail "the fakeroot self-test (line $selftest_line) is not AFTER the re-exec (line $reexec_line) -- it must run INSIDE the faked session"
+fi
+if [ -n "$selftest_line" ] && [ -n "$unpack_line" ]; then
+  [ "$selftest_line" -lt "$unpack_line" ] ||
+    fail "the fakeroot self-test (line $selftest_line) is not BEFORE unpackLines (line $unpack_line) -- it must probe faking before dpkg relies on it"
+fi
 
 # -- squashfsImage packs with no -pf/pseudo-file mechanism, and loads a
 # fakeroot database back via -i --------------------------------------------

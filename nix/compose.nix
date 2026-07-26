@@ -561,28 +561,58 @@ let
         # VERIFICATION NOTE" for why: this dev harness has no `fakeroot`
         # binary to inspect directly).
         #
-        # We target the CONCRETE `fakeroot-sysv`/`faked-sysv` binaries, not
-        # the bare `fakeroot`/`faked` names: on Ubuntu those bare names are
-        # update-alternatives symlinks (`/usr/bin/fakeroot ->
-        # /etc/alternatives/fakeroot`) wired up by the package's postinst --
-        # which toolsFHS never runs -- so in a raw data-only extraction they
-        # are DANGLING symlinks `-type f` skips, and `faked-*` also matches
-        # manpages under share/man. Restricting to a `*/bin/*` path excludes
-        # the manpages, `-sysv` picks the always-shipped default frontend,
-        # and `-L` on the library lets `-type f` follow the
-        # `libfakeroot-sysv.so -> libfakeroot-0.so` symlink to a real file.
-        # (Fix for CI run 30199370520, where the old bare-name find returned
-        # an empty fakeroot path, a manpage for faked, and an empty library
-        # path. NB: no adjacent single-quote pair may appear in this comment
-        # -- it lives inside a Nix indented-string, where that pair would
-        # terminate the string.)
+        # We target the CONCRETE `fakeroot-tcp`/`faked-tcp` binaries (with a
+        # `-sysv` fallback), not the bare `fakeroot`/`faked` names: on Ubuntu
+        # those bare names are update-alternatives symlinks
+        # (`/usr/bin/fakeroot -> /etc/alternatives/fakeroot`) wired up by the
+        # package's postinst -- which toolsFHS never runs -- so in a raw
+        # data-only extraction they are DANGLING symlinks `-type f` skips, and
+        # `faked-*` also matches manpages under share/man. Restricting to a
+        # `*/bin/*` path excludes the manpages, `-tcp`/`-sysv` pick a concrete
+        # frontend, and `-L` on the library lets `-type f` follow any
+        # `libfakeroot-*.so -> libfakeroot-0.so` symlink to a real file.
+        # (Original fix for CI run 30199370520, where the old bare-name find
+        # returned an empty fakeroot path, a manpage for faked, and an empty
+        # library path.)
+        #
+        # WHY TCP, NOT SYSV (CI run on bf1f13a): with the LD_PRELOAD load
+        # fixed (readlink + LD_LIBRARY_PATH below), libfakeroot now LOADS
+        # everywhere (zero `cannot be preloaded` warnings), yet dpkg STILL
+        # EINVAL'd on the first non-root-GID chown -- boot-proof's
+        # `error setting ownership of ./usr/sbin/pam_extrausers_chkpwd:
+        # Invalid argument` (that file is root:shadow, gid 42). root:root
+        # chowns only "succeed" because uid 0 maps to the build uid in the
+        # userns; the first non-zero gid reaches the REAL kernel and EINVALs.
+        # i.e. libfakeroot was loaded but NOT intercepting chown at all: the
+        # `-sysv` frontend/daemon reach each other over SysV IPC message
+        # queues, which do not work inside this file's `unshare --user`
+        # sandbox, so libfakeroot silently fell through to the real chown.
+        # The `-tcp` backend (`faked-tcp` + `libfakeroot-tcp.so`, both already
+        # staged by toolsFHS -- no packaging change) talks to the daemon over
+        # a localhost socket instead, which the sandbox permits. compose's
+        # `-s` save-file and pack's `-i` load-file share one backend-agnostic
+        # record format, so a tcp compose still interoperates with a tcp pack.
+        # (NB: no adjacent single-quote pair may appear in this comment -- it
+        # lives inside a Nix indented-string, where that pair would terminate
+        # the string.)
         if [ -z "''${FAKEROOTKEY:-}" ]; then
-          ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
-          ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
-          ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+          ubx_fakeroot_backend=tcp
+          ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-tcp' | head -n1)"
+          ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'faked-tcp' | head -n1)"
+          ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-tcp.so' | head -n1)"
+          # Fall back to the sysv backend if the tcp trio is not all present,
+          # so we never regress to a hard "not found" (sysv still loads; it
+          # just may not fake chown under unshare --user -- the diag below
+          # and the post-re-exec self-test will make that visible).
+          if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
+            ubx_fakeroot_backend=sysv
+            ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
+            ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
+            ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+          fi
           [ -n "$ubx_libfakeroot" ] || ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-*.so' | head -n1)"
           if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
-            echo "configure.sh: could not locate fakeroot/faked/libfakeroot under /.ubx-compose/fakeroot-tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
+            echo "configure.sh: could not locate fakeroot-tcp/faked-tcp/libfakeroot-tcp.so (nor the -sysv fallback) under /.ubx-compose/fakeroot-tools (backend='$ubx_fakeroot_backend' fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
             exit 1
           fi
 
@@ -622,9 +652,9 @@ let
           # it lands in the build log regardless of exit status, and every
           # external command is `|| true`-guarded so a missing tool can never
           # abort the build.
+          echo "UBX-DIAG(compose): backend        = $ubx_fakeroot_backend" >&2
           echo "UBX-DIAG(compose): fakeroot_bin    = $ubx_fakeroot_bin" >&2
           echo "UBX-DIAG(compose): faked_bin       = $ubx_faked_bin" >&2
-          echo "UBX-DIAG(compose): raw find        = $(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-sysv.so' | head -n1)" >&2
           echo "UBX-DIAG(compose): lib(real)       = $ubx_libfakeroot" >&2
           echo "UBX-DIAG(compose): LD_LIBRARY_PATH = $LD_LIBRARY_PATH" >&2
           echo "UBX-DIAG(compose): ls -laL of lib file + its dir:" >&2
@@ -652,6 +682,25 @@ let
           exec "$ubx_fakeroot_bin" --lib "$ubx_libfakeroot" --faked "$ubx_faked_bin" \
             -s /.ubx-fakeroot-state -- /bin/sh /.ubx-compose/configure.sh
         fi
+
+        # --- SELF-TEST (issue #48; REMOVE once CI is green) -------------
+        # Execution only reaches here on the SECOND entry -- i.e. we are now
+        # INSIDE the faked session the FAKEROOTKEY guard above re-exec'd us
+        # into. PROVE whether chown faking actually works before dpkg relies
+        # on it: fake a root:shadow (gid 42) chown -- the exact ownership
+        # pam_extrausers_chkpwd needs, and the first non-zero GID that made
+        # dpkg EINVAL on the sysv backend -- on a throwaway probe and read it
+        # back. `0:42` => faking works (the tcp daemon is alive and
+        # intercepting); a chown error or a stat showing the real gid => the
+        # daemon is not intercepting and dpkg will EINVAL again. Everything is
+        # `|| true`-guarded so this can never abort the build under `set -eu`.
+        echo "UBX-DIAG(compose): fakeroot self-test -- FAKEROOTKEY=''${FAKEROOTKEY:-<unset>}" >&2
+        ubx_probe=/.ubx-compose/.ubx-fakeroot-selftest
+        : > "$ubx_probe" 2>/dev/null || true
+        chown 0:42 "$ubx_probe" 2>&1 | sed 's/^/UBX-DIAG(compose): self-test chown: /' >&2 || true
+        echo "UBX-DIAG(compose): self-test stat = $(stat -c '%u:%g' "$ubx_probe" 2>/dev/null || echo '<stat failed>') (expect 0:42 if faking works)" >&2
+        rm -f "$ubx_probe" 2>/dev/null || true
+        # --- end SELF-TEST ----------------------------------------------
 
         # A fresh /proc for THIS pid namespace -- several maintainer
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
@@ -1179,16 +1228,28 @@ let
           exit 1
         }
 
-        # Same "discover, don't hardcode" reasoning -- and the same
-        # `-sysv`/`*/bin/*`/`-L` handling of the alternatives symlinks,
-        # manpages, and library symlink -- as composeRootfs's own fakeroot
-        # re-exec block above; see its comment for the full rationale.
-        ubx_fakeroot_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
-        ubx_faked_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
-        ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+        # Same "discover, don't hardcode" reasoning -- and the same tcp-first
+        # / sysv-fallback backend choice, `*/bin/*`/`-L` handling of the
+        # alternatives symlinks, manpages, and library symlink -- as
+        # composeRootfs's own fakeroot re-exec block above; see its comment
+        # (WHY TCP, NOT SYSV) for the full rationale. mksquashfs runs here as
+        # a CLIENT of a faked session too, so it must reach a working daemon;
+        # under this file's userns sandbox that means the tcp backend, and
+        # pack must use the SAME backend compose's `-s` save-file was written
+        # by (both tcp).
+        ubx_fakeroot_backend=tcp
+        ubx_fakeroot_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'fakeroot-tcp' | head -n1)"
+        ubx_faked_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'faked-tcp' | head -n1)"
+        ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-tcp.so' | head -n1)"
+        if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
+          ubx_fakeroot_backend=sysv
+          ubx_fakeroot_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
+          ubx_faked_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
+          ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+        fi
         [ -n "$ubx_libfakeroot" ] || ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-*.so' | head -n1)"
         if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
-          echo "pack.sh: could not locate fakeroot/faked/libfakeroot under /mnt/tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
+          echo "pack.sh: could not locate fakeroot-tcp/faked-tcp/libfakeroot-tcp.so (nor the -sysv fallback) under /mnt/tools (backend='$ubx_fakeroot_backend' fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
           exit 1
         fi
 
@@ -1208,6 +1269,7 @@ let
         # --- DIAGNOSTIC (issue #48; REMOVE once CI is green) ------------
         # Mirrors composeRootfs's own fakeroot-diag block (see it for the
         # rationale + the `command -v readelf` / `|| true` robustness notes).
+        echo "UBX-DIAG(pack): backend        = $ubx_fakeroot_backend" >&2
         echo "UBX-DIAG(pack): fakeroot_bin    = $ubx_fakeroot_bin" >&2
         echo "UBX-DIAG(pack): faked_bin       = $ubx_faked_bin" >&2
         echo "UBX-DIAG(pack): lib(real)       = $ubx_libfakeroot" >&2

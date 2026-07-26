@@ -32,20 +32,25 @@ diffing, drift detection) is testable in complete isolation, with fixture
 `passwd`/`group`/`shadow` files, no root, no live system, and no `nix`
 binary required.
 
-## Scope: what's in M2, what's deferred to M4
+## Scope: M2 (SSH keys) and M4 (secret-sourced password hashes)
 
-`SPEC.md` §11 M2 is explicit: *"users primitive (interim auth via SSH
-keys — secret-backed passwords complete in M4)"*. Concretely:
+`SPEC.md` §11 M2 was explicit: *"users primitive (interim auth via SSH
+keys — secret-backed passwords complete in M4)"*. As of GitHub issue #80,
+both halves are real:
 
-- **In scope now**: group membership, login shell, home-directory
+- **M2 (issue #28)**: group membership, login shell, home-directory
   creation (`createHome` + `home` path), uid strategy (explicit uid
   optional; a `system` flag selects the allocation range), and
   `authorizedKeys` — a plain list of SSH public key strings materialized to
   `~<user>/.ssh/authorized_keys`.
-- **Out of scope until M4**: `hashedPasswordSecret` (`SPEC.md` §6's own
-  example shows it) — sourcing a password hash from the secrets index
-  needs `secrets/index.nix` (§8.1) to exist first. Declaring it here early
-  would just be a field with nothing behind it.
+- **M4 (issue #80)**: `hashedPasswordSecret` (`SPEC.md` §6's own example
+  shows it) — the NAME of a secret declared in `secrets/index.nix`
+  (`nix/secrets.nix`, §8.1, issue #78) whose materialized content is a
+  user's crypt(3) password hash. A reference only: the manifest/plan this
+  page describes never carries the hash itself, only the secret's own
+  name — see "Password hashes (`hashedPasswordSecret`)" below for the full
+  design and why that is a structural guarantee, not a promise kept by
+  discipline alone.
 
 ## The declaration surface
 

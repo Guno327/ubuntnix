@@ -1,6 +1,7 @@
 # nix/users.nix — the users primitive: declaration surface + eval-time
-# validation + JSON manifest rendering (SPEC.md §4.3 "Users" row, §6, §7;
-# GitHub issue #28, milestone M2).
+# validation + JSON manifest rendering (SPEC.md §4.3 "Users" row, §6, §7,
+# §8.1, §11 M4; GitHub issues #28 (M2) and #80 (M4, password login from a
+# secret-sourced hash)).
 #
 # -- What this file is, and isn't ------------------------------------------
 #
@@ -10,12 +11,16 @@
 #     groups = [ "sudo" ]; shell = "/usr/bin/bash";
 #     hashedPasswordSecret = "gunnarPassword";       # -> secrets index
 #   };
-# `hashedPasswordSecret` is explicitly OUT OF SCOPE here — SPEC.md §11 M2
-# spells out "users primitive (interim auth via SSH keys — secret-backed
-# passwords complete in M4)" — so this file adds `authorizedKeys` (a plain
+# `hashedPasswordSecret` was OUT OF SCOPE for M2 (issue #28) — SPEC.md §11
+# M2 spelled out "users primitive (interim auth via SSH keys — secret-backed
+# passwords complete in M4)" — that issue added `authorizedKeys` (a plain
 # list of SSH public key strings) as the M2 interim auth surface instead,
-# and leaves the password-hash field for M4 to add once the secrets index
-# (§8.1) exists to source it from.
+# and left the password-hash field for M4. This file's M4 addition (issue
+# #80) is exactly `hashedPasswordSecret` below: a REFERENCE (the declared
+# secret's own NAME, e.g. "gunnarPassword") into `secrets/index.nix`
+# (nix/secrets.nix's own declaration surface), never the hash itself — see
+# "hashedPasswordSecret: a reference, never a value" further down for the
+# structural reason this manifest can carry that name completely safely.
 #
 # This file does exactly two things, deliberately kept thin (the PM's own
 # design guidance for this issue: "keep the nix layer thin and push logic
@@ -50,7 +55,8 @@
 #       { "name": ..., "uid": <int|null>, "system": <bool>,
 #         "shell": "/usr/bin/bash", "home": <str|null>,
 #         "createHome": <bool>, "groups": [ ... ],
-#         "authorizedKeys": [ "ssh-ed25519 AAAA... comment", ... ] },
+#         "authorizedKeys": [ "ssh-ed25519 AAAA... comment", ... ],
+#         "hashedPasswordSecret": <str|null> },
 #       ... sorted by name (Nix attrset key enumeration -- builtins.attrNames
 #       -- is already alphabetical; see "Determinism" below)
 #     ],
@@ -59,6 +65,15 @@
 #       ... sorted by name
 #     ]
 #   }
+# `hashedPasswordSecret`, when non-null, is the declared secret's own NAME
+# (SPEC.md §6's own example: `"gunnarPassword"`) -- see
+# "hashedPasswordSecret: a reference, never a value" below for why this
+# manifest field is completely safe to render even though a real hash sits
+# behind that name at activation time. bin/ubx-users' own `plan` is where
+# that reference actually gets resolved to a real filesystem path
+# (`secrets.<name>.path`, SPEC.md §8.1) and turned into a real convergence
+# action -- see that script's header, "Password hashes (hashedPasswordSecret,
+# issue #80)".
 # `home: null` means "let the planner default it to /home/<name>" (kept
 # here rather than baked in, so the planner's own default is the single
 # source of truth bin/ubx-users' own header documents — see that file).
@@ -66,6 +81,54 @@
 # per-user/per-group; `system` (mirrors `useradd -r` / `groupadd -r`)
 # decides which range the planner allocates from (bin/ubx-users' own
 # SYS_UID_MIN/MAX vs UID_MIN/MAX constants — see that file).
+#
+# -- hashedPasswordSecret: a reference, never a value -----------------------
+#
+# Exactly nix/secrets.nix's own "THE ABSOLUTE INVARIANT" (see that file's
+# header): SPEC.md §8.1's "no secret material ever enters a store object —
+# enforced by the API shape (references, not values)" applies here
+# identically. `hashedPasswordSecret` is declared with
+# `lib.types.nullOr (lib.types.strMatching secretNameRe)` -- a plain Nix
+# STRING (the secret's own declared attribute name in `secrets/index.nix`,
+# e.g. `"gunnarPassword"`), never `lib.types.path` and never anything that
+# could coerce to the secret's real file contents. There is no field here
+# shaped like nix/secrets.nix's own `src` (the one field that file's own
+# manifest deliberately never renders) -- because there is nothing OF that
+# shape to declare in the first place: a user only ever names a secret,
+# never a path into `secrets/` directly. Rendering this field into the
+# manifest (`renderManifestJSON`, `builtins.toJSON`) therefore only ever
+# forces a short, harmless attribute-name string -- structurally
+# indistinguishable, invariant-wise, from `groups` or `shell` above.
+#
+# -- Cross-referencing a REAL declared secret --------------------------------
+#
+# SPEC.md's own example table (§6) writes `hashedPasswordSecret =
+# "gunnarPassword"; # -> secrets index` -- implying the name must actually
+# resolve to something `secrets/index.nix` (nix/secrets.nix) declares.
+# This file has no access to that index by default (nix/users.nix and
+# nix/secrets.nix are two independent dendritic files -- see either
+# file's own header -- and neither is wired to a real
+# `options.ubuntnix.*` yet, so there is no single real machine
+# configuration this file could import a secrets index FROM even if it
+# wanted to). `mkManifest` therefore accepts an OPTIONAL third argument,
+# `declaredSecretNames` (a list of strings -- typically
+# `builtins.attrNames declaredSecretsIndex`, or
+# `builtins.attrNames (import ./secrets/index.nix)`, or
+# `builtins.attrNames (flake.lib.secrets.mkManifest declaredSecretsIndex).secrets`'s
+# own `name`s): when a real caller (a future machine flake's own module
+# glue) has BOTH indices in scope, passing this list makes every declared
+# `hashedPasswordSecret` cross-checked HERE, at eval time, with a clear
+# `throw` naming the offending user and secret name on a miss (mirrors
+# this file's own `checkManifest`, one throw enumerating every violation).
+# Left at its default `null` (this file's own `exampleManifest` below, and
+# any caller with no secrets index in scope), the check is skipped here
+# entirely and deferred to `bin/ubx-users plan`'s own `--secrets-manifest`
+# cross-check against the REAL secrets manifest at rebuild-planning time
+# (SPEC.md's own two-layer "declare at eval, converge for real at plan"
+# split every other primitive in this project already follows) -- see that
+# script's header for the plan-time half of this same validation, which is
+# NOT optional there (a `hashedPasswordSecret` with no `--secrets-manifest`
+# passed at all, or one not found in it, is always a hard `plan` error).
 #
 # -- Determinism --------------------------------------------------------
 #
@@ -99,6 +162,17 @@ let
   # deep semantic validation, e.g. "is this base64 blob actually a valid
   # Ed25519 key", to sshd itself at use time).
   keyLineRe = "^[^ \t\n]+ [^ \t\n]+.*$";
+
+  # secretNameRe -- a declared secret's own name grammar, mirroring
+  # nix/secrets.nix's own `nameRe` EXACTLY (a plain Nix attribute
+  # identifier -- SPEC.md §8.1's own `proToken`/`gunnarPassword` example --
+  # deliberately NOT this file's own lowercase-only username `nameRe`
+  # above). Duplicated rather than imported: nix/secrets.nix exposes its
+  # `secretType` under `flake.lib.secrets`, not this bare regex string, and
+  # this file's own header already documents why it otherwise has no
+  # access to that file's declarations at all (see "Cross-referencing a
+  # REAL declared secret").
+  secretNameRe = "^[A-Za-z_][A-Za-z0-9_-]{0,63}$";
 
   # -- userType / groupType -------------------------------------------------
   #
@@ -154,10 +228,41 @@ let
         description = ''
           SSH public key lines materialized to
           ~<user>/.ssh/authorized_keys (0700 dir / 0600 file) by the
-          planner/executor. Interim M2 auth surface -- SPEC.md §11 M2:
-          hashed passwords sourced from the secrets index are M4 scope
-          (`hashedPasswordSecret` in SPEC.md §6's own example is
-          deliberately not declared here yet).
+          planner/executor. M2 auth surface (issue #28) -- kept alongside
+          `hashedPasswordSecret` below (M4, issue #80), not replaced by
+          it: a user may declare either, both, or neither.
+        '';
+      };
+      hashedPasswordSecret = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching secretNameRe);
+        default = null;
+        description = ''
+          The NAME of a secret declared in `secrets/index.nix`
+          (nix/secrets.nix's own declaration surface, SPEC.md §8.1) whose
+          materialized content is this user's crypt(3) password hash
+          (SPEC.md §6's own example: `hashedPasswordSecret =
+          "gunnarPassword";`). A REFERENCE only -- see this file's header,
+          "hashedPasswordSecret: a reference, never a value" -- the actual
+          hash is sourced by bin/ubx-users' `plan`/`apply-passwords` from
+          the referenced secret's real runtime delivery path
+          (`secrets.<name>.path`, i.e. `/run/secrets/<name>`, materialized
+          by bin/ubx-secrets-apply, GitHub issue #78) at APPLY time only --
+          it is never read, embedded, or forced by this file, and
+          therefore never enters this manifest or any Nix store object.
+
+          This file cannot cross-check the referenced name against a real
+          declared secrets index at eval time (no `ubuntnix.secrets`
+          input is threaded into `mkManifest` here -- see this file's own
+          two-job header: it only validates `users`/`groups`, standalone).
+          The syntactic check above (a legal secret name, per
+          nix/secrets.nix's own `nameRe`) is everything this file can do;
+          the semantic check -- "does a secret by this name actually exist
+          in the declared secrets manifest" -- is deferred to bin/ubx-users'
+          `plan --secrets-manifest FILE`, a real plan-time validation
+          against the actual secrets manifest (see that script's own
+          header, "Password hashes"), which is where the missing/
+          unreferenced-secret error this option's own acceptance criteria
+          demands is actually raised.
         '';
       };
     };
@@ -205,7 +310,7 @@ let
   # whether a declared uid/gid collides with a FOREIGN, non-declared
   # account already on a real machine. See bin/ubx-users' own header for
   # that half of "uid conflict detection".
-  checkManifest = users: groups:
+  checkManifest = users: groups: declaredSecretNames:
     let
       userNames = builtins.attrNames users;
       groupNames = builtins.attrNames groups;
@@ -221,6 +326,21 @@ let
       explicitGids = lib.filterAttrs (_: g: g.gid != null) groups;
       gidGroups = lib.groupBy (n: toString explicitGids.${n}.gid) (builtins.attrNames explicitGids);
       duplicateGidGroups = lib.filterAttrs (_: names: builtins.length names > 1) gidGroups;
+
+      # -- hashedPasswordSecret cross-check (M4, issue #80) -- only ever
+      # run when a caller actually passed `declaredSecretNames` (see this
+      # file's header, "Cross-referencing a REAL declared secret"): a
+      # user declaring `hashedPasswordSecret = "foo";` where "foo" is not
+      # among the caller-supplied declared secret names is a clear,
+      # eval-time error naming both the offending user and secret.
+      usersWithSecret = lib.filterAttrs (_: u: u.hashedPasswordSecret != null) users;
+      missingSecretRefs =
+        if declaredSecretNames == null
+        then { }
+        else
+          lib.filterAttrs
+            (_: u: !(builtins.elem u.hashedPasswordSecret declaredSecretNames))
+            usersWithSecret;
     in
     (map (n: ''ubuntnix.users."${n}": not a valid username (must match ${nameRe})'') badUserNames)
     ++ (map (n: ''ubuntnix.groups."${n}": not a valid group name (must match ${nameRe})'') badGroupNames)
@@ -229,17 +349,23 @@ let
       duplicateUidGroups)
     ++ (lib.mapAttrsToList
       (gid: names: "duplicate explicit gid ${gid} declared by: ${builtins.concatStringsSep ", " (builtins.sort (a: b: a < b) names)}")
-      duplicateGidGroups);
+      duplicateGidGroups)
+    ++ (lib.mapAttrsToList
+      (n: u: ''ubuntnix.users."${n}".hashedPasswordSecret = "${u.hashedPasswordSecret}": no such secret declared in the secrets index'')
+      missingSecretRefs);
 
   # mkManifest -- the file's main entry point: `{ users, groups }` (SPEC.md
   # §6 shape) -> the validated, JSON-ready manifest attrset. `throw`s with
   # every violation found (checkManifest above) on a bad declaration,
   # exactly like nix/archive.nix's `validate`/nix/compose.nix's
-  # `renderPreseed`.
-  mkManifest = declared:
+  # `renderPreseed`. `declaredSecretNames`, left at its default `null`,
+  # skips the hashedPasswordSecret eval-time cross-check entirely -- see
+  # this file's header, "Cross-referencing a REAL declared secret", and
+  # checkManifest above.
+  mkManifest = { users ? { }, groups ? { }, declaredSecretNames ? null }:
     let
-      evaled = evalDeclared declared;
-      errors = checkManifest evaled.users evaled.groups;
+      evaled = evalDeclared { inherit users groups; };
+      errors = checkManifest evaled.users evaled.groups declaredSecretNames;
     in
     if errors != [ ] then
       throw ''
@@ -277,6 +403,13 @@ let
         authorizedKeys = [
           "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICLoremIpsumExampleKeyOnly gunnar@laptop"
         ];
+        # SPEC.md §6's own example field -- exercised here (declaredSecretNames
+        # left at its default `null`, so this reference is NOT cross-checked at
+        # eval time; see this file's header, "Cross-referencing a REAL declared
+        # secret") purely to force hashedPasswordSecret through
+        # renderManifestJSON's own toJSON call under CI's "flake" job, exactly
+        # like every other field here.
+        hashedPasswordSecret = "gunnarPassword";
       };
     };
     groups = {

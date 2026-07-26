@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""bin/ubx-users -- the users primitive's convergence PLANNER and a thin
-EXECUTOR (SPEC.md §4.3 "Users" row, §6, §7; GitHub issue #28, milestone
-M2).
+"""bin/ubx-users -- the users primitive's convergence PLANNER, a thin
+EXECUTOR, and a real password-hash APPLIER (SPEC.md §4.3 "Users" row, §6,
+§7, §8.1, §11 M4; GitHub issue #28, milestone M2; GitHub issue #80,
+milestone M4, "password login from a secret-sourced hash").
 
 -- Why this lives outside Nix, as a script under bin/ -----------------------
 
@@ -16,34 +17,55 @@ fixture (in tests) or real (at activation) copies of passwd/group/shadow and
 decides what needs to change. Kept in one deterministic, pure-Python
 file specifically so the planner half can be unit-tested with zero root,
 network, or `nix` binary (tests/README.md's own rule) -- see
-tests/unit/100-ubx-users-parsing.sh through 103-ubx-users-executor.sh.
+tests/unit/100-ubx-users-parsing.sh through 105-ubx-users-cli.sh.
 
--- The two subcommands, and why they're separate ---------------------------
+-- The three subcommands, and why they're separate -------------------------
 
   ubx-users plan --manifest FILE --passwd FILE --group FILE --shadow FILE
-                  [--exceptions FILE] [--home-state FILE] [--out FILE]
+                  [--exceptions FILE] [--home-state FILE]
+                  [--secrets-manifest FILE] [--out FILE]
     Pure function of its inputs: declared manifest + observed passwd/group/
-    shadow (+ optional exceptions/home-state fixtures) -> a deterministic
-    JSON PLAN on stdout (or --out). Never touches a real system. This is
-    the half tests/unit/ exercises heavily -- see "The plan schema" below.
+    shadow (+ optional exceptions/home-state/secrets-manifest fixtures) ->
+    a deterministic JSON PLAN on stdout (or --out). Never touches a real
+    system, and never reads real secret material -- see "Password hashes
+    (hashedPasswordSecret, issue #80)" below. This is the half tests/unit/
+    exercises heavily -- see "The plan schema" below.
 
   ubx-users execute --plan FILE [--format shell|json] [--out FILE]
     Translates an already-computed plan into the EXACT command sequence
     that converges a real system to it (useradd/usermod/groupadd/gpasswd,
     plus the authorized_keys file-materialization steps) -- emission only.
-    Deliberately does NOT run anything itself: SPEC.md §11 M2 scopes this
-    issue to "converge passwd/groups state" being *testable*, the same way
+    Deliberately does NOT run anything itself: SPEC.md §11 M2 scoped this
+    to "converge passwd/groups state" being *testable*, the same way
     issue #31's apt/dpkg/snap guards were unit-tested standalone with real
     activation-image wiring explicitly deferred (see docs/guards.md's "What
-    is deferred"). Real execution inside a running system's activation path
-    is follow-up work once that wiring exists; see docs/users.md.
+    is deferred"). Real execution of THIS subcommand's own output is
+    follow-up work once that wiring exists; see docs/users.md. Password
+    hashes are deliberately NOT part of this subcommand's own output --
+    see immediately below.
 
-Keeping `execute` a thin, separate translation step (rather than folding
-command-emission into `plan`) is what SPEC.md's own convergence-diagram
-row means by "Live switch ... users/home ... none [downtime]": the plan is
-inspectable and diffable on its own before anything is applied, and unit
-tests cover the planner's decisions in complete isolation from how those
-decisions eventually get executed.
+  ubx-users apply-passwords --plan FILE --shadow FILE
+                             [--run-secrets-dir DIR] [--apply | --dry-run]
+                             [--out FILE]
+    The one REAL executor in this file (unlike `execute` above): reads
+    each `password_set` plan entry's referenced secret straight off its
+    real, already-materialized runtime path (`--run-secrets-dir/<secret>`,
+    i.e. `secrets.<name>.path`/`/run/secrets/<name>`, GitHub issue #78) and
+    writes the resulting hash into `--shadow`'s matching user line, IN
+    PLACE -- see "Password hashes (hashedPasswordSecret, issue #80)"
+    below for the full design and why this is the one place in this file
+    that both reads real secret material and mutates a real file. Exactly
+    bin/ubx-secrets-apply's own "root only for real system files, no root
+    needed against a temp fixture" posture: writing a plain file needs no
+    special privilege by itself. `--dry-run` (the default) computes and
+    reports the same changed/errors without writing anything.
+
+Keeping `execute`/`apply-passwords` thin, separate translation/application
+steps (rather than folding either into `plan`) is what SPEC.md's own
+convergence-diagram row means by "Live switch ... users/home ... none
+[downtime]": the plan is inspectable and diffable on its own before
+anything is applied, and unit tests cover the planner's decisions in
+complete isolation from how those decisions eventually get executed.
 
 -- The manifest schema (produced by nix/users.nix's `renderManifestJSON`) --
 
@@ -52,7 +74,8 @@ decisions eventually get executed.
     "users": [
       { "name": ..., "uid": <int|null>, "system": <bool>,
         "shell": "/usr/bin/bash", "home": <str|null>, "createHome": <bool>,
-        "groups": [ ... ], "authorizedKeys": [ "ssh-ed25519 ... ", ... ] },
+        "groups": [ ... ], "authorizedKeys": [ "ssh-ed25519 ... ", ... ],
+        "hashedPasswordSecret": <str|null> },
       ...
     ],
     "groups": [
@@ -91,27 +114,34 @@ managed group's observed gid disagrees with an explicit declared one; a
 malformed passwd/group line) are reported as `drift` entries -- surfaced,
 never silently auto-corrected (SPEC.md §7's converge-report posture) --
 and do not by themselves fail the run (only `errors` -- uid/gid conflicts
-with a FOREIGN account -- do that; see "Errors vs. drift" below).
+with a FOREIGN account, or a bad `hashedPasswordSecret` reference -- do
+that; see "Errors vs. drift" below).
 
 -- Errors vs. drift ---------------------------------------------------------
 
-A hard `errors` entry (nonzero exit) is reserved for exactly one class of
-problem: a declared, explicit uid/gid that a FOREIGN (non-declared) account
-already holds. SPEC.md's own acceptance line for this issue is explicit:
-"declared uid already taken by a foreign user -> error, not silent
-adoption" -- creating (or renaming into) that identity would either fail at
-the OS level anyway or, worse, silently start managing an account this
-manifest never declared. Every other anomaly is `drift`: informational,
-inspectable, and left for a human to resolve deliberately.
+A hard `errors` entry (nonzero exit) is reserved for: (1) a declared,
+explicit uid/gid that a FOREIGN (non-declared) account already holds --
+SPEC.md's own acceptance line for issue #28 is explicit: "declared uid
+already taken by a foreign user -> error, not silent adoption" -- creating
+(or renaming into) that identity would either fail at the OS level anyway
+or, worse, silently start managing an account this manifest never
+declared; and (2), as of issue #80, a declared `hashedPasswordSecret` that
+cannot be validated against a real secrets manifest -- see "Password
+hashes" below. Every other anomaly is `drift`: informational, inspectable,
+and left for a human to resolve deliberately.
 
 -- Machine-local exceptions -------------------------------------------------
 
 `--exceptions FILE`: a JSON object `{ "<user>": ["shell", "home", "uid",
-"groups", "authorizedKeys"], ... }` naming, per declared user, which fields
-the planner must leave alone even if the declared value disagrees with what
-it observes -- SPEC.md §4.2's "machine-local mutable exceptions" concept,
-narrowed to this primitive's own fields (no exceptions file at all, or a
-user/field pair not listed in it, is fully converged as normal).
+"groups", "authorizedKeys", "hashedPasswordSecret"], ... }` naming, per
+declared user, which fields the planner must leave alone even if the
+declared value disagrees with what it observes -- SPEC.md §4.2's
+"machine-local mutable exceptions" concept, narrowed to this primitive's
+own fields (no exceptions file at all, or a user/field pair not listed in
+it, is fully converged as normal). `hashedPasswordSecret` in this list
+skips PLANNING a `password_set` entry for that user (the reference is
+still syntactically/referentially validated -- see "Password hashes"
+below -- exceptions cover convergence intent, not manifest correctness).
 
 -- authorizedKeys materialization -------------------------------------------
 
@@ -123,6 +153,56 @@ user's authorizedKeys plan entry is only emitted when it differs from this
 (omitted user/key entirely -> treated as empty, i.e. "nothing observed
 yet"); this is what makes the "no-op on an already-converged fixture"
 acceptance case reachable even for a manifest that declares keys.
+
+-- Password hashes (hashedPasswordSecret, issue #80) ------------------------
+
+SPEC.md §6's own example: `hashedPasswordSecret = "gunnarPassword";`. This
+is a REFERENCE -- the declared NAME of a secret in `secrets/index.nix`
+(nix/secrets.nix's own declaration surface) -- never a hash or path value;
+see that file's header, "hashedPasswordSecret: a reference, never a
+value", for the structural reason the MANIFEST this script consumes can
+carry that name completely safely. This script never reads real secret
+material during `plan` -- only during `apply-passwords`, and even there
+only the referenced secret's own runtime-materialized bytes
+(`--run-secrets-dir/<name>`), never anything from the manifest itself.
+
+  `plan`'s own validation (--secrets-manifest FILE, OPTIONAL as a flag but
+  NOT optional in effect): for every declared user with a non-null
+  `hashedPasswordSecret`, the referenced name must appear in
+  `--secrets-manifest`'s own declared `secrets[].name` list (SPEC.md
+  §8.1's manifest shape, nix/secrets.nix's `renderManifestJSON`) or `plan`
+  reports a hard `errors` entry -- including when `--secrets-manifest`
+  was not passed AT ALL (a `hashedPasswordSecret` with nothing to validate
+  it against is refused, not silently trusted): "a missing/unreferenced
+  secret is a clear, explicit error", this issue's own acceptance
+  criterion. A validated reference (not excepted -- see "Machine-local
+  exceptions" above) becomes one `password_set` entry:
+  `{"user": ..., "secret": ...}` -- metadata only, still no hash. `plan`
+  cannot diff this against the real, currently-set hash (it has no access
+  to the real secret's bytes, nor to real /etc/shadow hash fields beyond
+  "does this user exist" -- see `parse_shadow_names`) -- idempotency (skip
+  a no-op rewrite) is therefore `apply-passwords`' own job, at the point
+  it actually CAN compare hashes for real.
+
+  `apply-passwords` (the real executor): for each `password_set` entry,
+  reads `--run-secrets-dir/<secret>` (the real materialized secret file
+  bin/ubx-secrets-apply produces, SPEC.md §8.1's `secrets.<name>.path`) --
+  a missing file there is ALSO a clear, explicit error ("has the secrets
+  domain been applied yet?"), never a silent skip -- and, if the resulting
+  hash differs from that user's CURRENT shadow-file hash field, rewrites
+  only that one field, preserving every other shadow field (lockout
+  status, aging, etc.) verbatim. Already-matching hashes are left
+  untouched: a converged user is a real no-op, not a spurious rewrite,
+  exactly this project's standing idempotency posture for every other
+  domain. `--dry-run` (the default) computes and reports the same
+  changed/errors without ever writing `--shadow`.
+
+  Ordering: `apply-passwords` depends on the secrets domain having ALREADY
+  materialized `--run-secrets-dir/<secret>` for real -- bin/ubx's own
+  `execute_domains` therefore runs the secrets domain's real applier
+  (bin/ubx-secrets-apply) BEFORE calling this subcommand (SPEC.md §8.1;
+  GitHub issue #80's own acceptance criterion, "secrets delivery must run
+  before users convergence").
 """
 import argparse
 import json
@@ -141,6 +221,17 @@ GID_MIN, GID_MAX = 1000, 59999
 
 NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 KEY_LINE_RE = re.compile(r"^\S+ \S+")
+
+# Secret-name grammar for `hashedPasswordSecret` -- deliberately the exact
+# same regex nix/secrets.nix's own `nameRe` (and nix/users.nix's own
+# duplicate, `secretNameRe`) uses for a declared secret's attribute name:
+# a plain Nix attribute identifier, NOT this file's own lowercase-only
+# username `NAME_RE` above.
+SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+
+# A real /etc/shadow line's field count (name, hash, lastchange, min, max,
+# warn, inactive, expire, reserved) -- shadow(5).
+SHADOW_FIELD_COUNT = 9
 
 
 def die(msg):
@@ -296,6 +387,13 @@ def validate_manifest(manifest):
         ):
             errors.append(f"{label} 'authorizedKeys' must be a list of single key lines")
 
+        hps = u.get("hashedPasswordSecret")
+        if hps is not None and (not isinstance(hps, str) or not SECRET_NAME_RE.match(hps)):
+            errors.append(
+                f"{label} 'hashedPasswordSecret' must be null or a valid secret name "
+                f"(must match {SECRET_NAME_RE.pattern}), got {hps!r}"
+            )
+
     seen_group_names = set()
     seen_gids = {}
     for i, g in enumerate(groups):
@@ -329,6 +427,22 @@ def validate_manifest(manifest):
     return errors
 
 
+def validate_secrets_manifest(doc):
+    """A minimal shape check for a --secrets-manifest fixture (nix/secrets.nix's
+    own renderManifestJSON output, SPEC.md §8.1) -- just enough to safely pull
+    out the declared secret NAMES this file's own `plan` cross-checks
+    `hashedPasswordSecret` against. Not a full re-validation of every secret
+    field (that is bin/ubx-secrets' own `validate_manifest` job, a different
+    script, a different manifest consumer)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("secrets"), list):
+        return None
+    names = set()
+    for s in doc["secrets"]:
+        if isinstance(s, dict) and isinstance(s.get("name"), str):
+            names.add(s["name"])
+    return names
+
+
 # -- id allocation ------------------------------------------------------------
 
 
@@ -354,7 +468,7 @@ class PlannerError(Exception):
 
 
 def build_plan(manifest, passwd, group_entries, shadow_names, exceptions, home_state,
-                passwd_malformed, group_malformed):
+                passwd_malformed, group_malformed, secrets_manifest_names=None):
     errors = []
     drift = []
 
@@ -512,12 +626,42 @@ def build_plan(manifest, passwd, group_entries, shadow_names, exceptions, home_s
             "keys": list(keys),
         })
 
+    # -- password_set (hashedPasswordSecret, GitHub issue #80) --------------
+    #
+    # See this file's header, "Password hashes (hashedPasswordSecret, issue
+    # #80)", for the full design. Metadata only -- {"user", "secret"} -- the
+    # real hash is never read here; a bad/unreferenced secret name is a hard
+    # `errors` entry, not drift (this file's header, "Errors vs. drift").
+    password_set = []
+    for name in sorted(declared_users):
+        decl = declared_users[name]
+        exc = set(exceptions.get(name, []))
+        secret = decl.get("hashedPasswordSecret")
+        if secret is None:
+            continue
+        if secrets_manifest_names is None:
+            errors.append(
+                f"user '{name}': hashedPasswordSecret '{secret}' declared but no "
+                "--secrets-manifest was given to validate it against (refusing to plan "
+                "an unvalidated password source)"
+            )
+            continue
+        if secret not in secrets_manifest_names:
+            errors.append(
+                f"user '{name}': hashedPasswordSecret '{secret}' is not declared in the "
+                "secrets manifest (--secrets-manifest) -- no such secret"
+            )
+            continue
+        if "hashedPasswordSecret" in exc:
+            continue
+        password_set.append({"user": name, "secret": secret})
+
     drift.sort(key=lambda d: json.dumps(d, sort_keys=True))
     errors.sort()
 
     empty = not (
         users_create or users_modify or groups_create
-        or membership_add or membership_remove or authorized_keys
+        or membership_add or membership_remove or authorized_keys or password_set
     )
 
     return {
@@ -535,6 +679,7 @@ def build_plan(manifest, passwd, group_entries, shadow_names, exceptions, home_s
             "remove": sorted(membership_remove, key=lambda m: (m["group"], m["user"])),
         },
         "authorized_keys": sorted(authorized_keys, key=lambda a: a["user"]),
+        "password_set": sorted(password_set, key=lambda p: p["user"]),
         "drift": drift,
         "errors": errors,
     }
@@ -565,9 +710,19 @@ def cmd_plan(args):
     exceptions = load_json(args.exceptions, {})
     home_state = load_json(args.home_state, {})
 
+    secrets_manifest_names = None
+    if args.secrets_manifest is not None:
+        secrets_doc = load_json(args.secrets_manifest, None)
+        secrets_manifest_names = validate_secrets_manifest(secrets_doc)
+        if secrets_manifest_names is None:
+            die(
+                f"--secrets-manifest {args.secrets_manifest!r} is not a valid secrets "
+                "manifest (expected {\"version\": 1, \"secrets\": [...]})"
+            )
+
     plan = build_plan(
         manifest, passwd, group_entries, shadow_names, exceptions, home_state,
-        passwd_malformed, group_malformed,
+        passwd_malformed, group_malformed, secrets_manifest_names,
     )
     write_json(plan, args.out)
     sys.exit(1 if plan["errors"] else 0)
@@ -575,12 +730,15 @@ def cmd_plan(args):
 
 # -- the executor: plan -> exact command sequence (emission only) -----------
 #
-# See this file's header, "The two subcommands, and why they're separate":
-# this never runs anything itself. Ordering is fixed and deterministic:
-# groups.create, users.create, users.modify, membership.remove,
-# membership.add, authorized_keys -- each already sorted by the planner
-# (groups/users by name, membership by (group, user)), so iterating them in
-# plan order is itself deterministic.
+# See this file's header, "The three subcommands, and why they're
+# separate": this never runs anything itself. Ordering is fixed and
+# deterministic: groups.create, users.create, users.modify,
+# membership.remove, membership.add, authorized_keys -- each already
+# sorted by the planner (groups/users by name, membership by (group,
+# user)), so iterating them in plan order is itself deterministic.
+# `password_set` is deliberately NOT translated into a step here -- see
+# "Password hashes" in this file's header for why that domain has its own
+# real executor (`apply-passwords`) instead of an emitted-only command.
 
 
 def build_steps(plan):
@@ -680,12 +838,118 @@ def cmd_execute(args):
     sys.exit(0)
 
 
+# -- apply-passwords: the real password-hash executor (issue #80) -----------
+#
+# See this file's header, "Password hashes (hashedPasswordSecret, issue
+# #80)", for the full design. Unlike `execute` above, this SUBCOMMAND
+# performs real I/O: it reads a real (or, in tests, fixture) secret file
+# and, unless --dry-run, really rewrites --shadow's matching line.
+
+
+def read_shadow_lines(path):
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    return lines
+
+
+def apply_passwords(plan, run_secrets_dir, shadow_path, dry_run=False):
+    """Applies plan['password_set'] (see build_plan's own comment for its
+    shape) against `shadow_path`, sourcing each entry's real hash from
+    `run_secrets_dir/<secret>` (the runtime secret path bin/ubx-secrets-apply
+    materializes, SPEC.md §8.1's `secrets.<name>.path`). Returns
+    `(changed, errors)`: `changed` is the sorted list of usernames whose
+    shadow line's hash field actually differed and was (unless `dry_run`)
+    rewritten -- an already-matching hash is left untouched, so a fully
+    converged input is a real, idempotent no-op, matching every other
+    domain's own apply posture. `errors` is a list of human-readable
+    strings for anything that could not be resolved (a missing
+    materialized secret, an empty secret, an unknown user, or a malformed
+    shadow line) -- never raises for one of these expected, reportable
+    conditions (mirrors build_plan's own `errors` list).
+
+    The hash value itself NEVER appears in `errors`/`changed` (or, at any
+    point in this file, in a manifest or plan) -- only user/secret NAMES
+    and paths do; see this file's header, "THE ABSOLUTE INVARIANT" (via
+    nix/secrets.nix's own, which this function's own posture mirrors).
+    """
+    entries = plan.get("password_set", [])
+    errors = []
+    if not entries:
+        return [], errors
+
+    lines = read_shadow_lines(shadow_path)
+    index = {}
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        index[line.split(":", 1)[0]] = i
+
+    changed = []
+    for entry in sorted(entries, key=lambda e: e["user"]):
+        user = entry["user"]
+        secret = entry["secret"]
+        secret_path = os.path.join(run_secrets_dir, secret)
+        if not os.path.isfile(secret_path):
+            errors.append(
+                f"user '{user}': hashedPasswordSecret '{secret}' has no materialized "
+                f"secret at {secret_path} (has the secrets domain been applied yet? "
+                "see this file's header, 'Password hashes')"
+            )
+            continue
+        with open(secret_path, encoding="utf-8") as f:
+            new_hash = f.read().strip()
+        if not new_hash:
+            errors.append(f"user '{user}': secret '{secret}' at {secret_path} is empty")
+            continue
+        if user not in index:
+            errors.append(
+                f"user '{user}': not present in {shadow_path} (create the user, e.g. "
+                "via 'ubx-users execute', before setting its password)"
+            )
+            continue
+        fields = lines[index[user]].split(":")
+        if len(fields) != SHADOW_FIELD_COUNT:
+            errors.append(
+                f"user '{user}': malformed shadow line in {shadow_path} (expected "
+                f"{SHADOW_FIELD_COUNT} colon-separated fields, got {len(fields)})"
+            )
+            continue
+        if fields[1] == new_hash:
+            continue
+        fields[1] = new_hash
+        lines[index[user]] = ":".join(fields)
+        changed.append(user)
+
+    if changed and not dry_run:
+        tmp = shadow_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines))
+        os.replace(tmp, shadow_path)
+
+    return sorted(changed), errors
+
+
+def cmd_apply_passwords(args):
+    plan = load_json(args.plan, None)
+    if plan is None:
+        die("--plan is required")
+    changed, errors = apply_passwords(plan, args.run_secrets_dir, args.shadow, dry_run=not args.apply)
+    write_json({"applied": bool(args.apply), "changed": changed, "errors": errors}, args.out)
+    sys.exit(1 if errors else 0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
-            "Users-primitive convergence planner and thin command-sequence "
-            "executor (SPEC.md §4.3 'Users'; issue #28, milestone M2)."
+            "Users-primitive convergence planner, thin command-sequence "
+            "executor, and password-hash applier (SPEC.md §4.3 'Users'; "
+            "issue #28, milestone M2; issue #80, milestone M4)."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -697,6 +961,9 @@ def main():
     p_plan.add_argument("--shadow", required=True, help="observed /etc/shadow (or a fixture copy)")
     p_plan.add_argument("--exceptions", default=None, help="optional machine-local-exceptions JSON")
     p_plan.add_argument("--home-state", default=None, dest="home_state", help="optional observed authorized_keys JSON")
+    p_plan.add_argument("--secrets-manifest", default=None, dest="secrets_manifest",
+                         help="declared secrets manifest (nix/secrets.nix's renderManifestJSON output) -- "
+                              "cross-checks every declared hashedPasswordSecret against it")
     p_plan.add_argument("--out", default=None, help="write the plan here instead of stdout")
     p_plan.set_defaults(func=cmd_plan)
 
@@ -705,6 +972,19 @@ def main():
     p_exec.add_argument("--format", choices=["shell", "json"], default="shell", help="output format (default: shell)")
     p_exec.add_argument("--out", default=None, help="write the sequence here instead of stdout")
     p_exec.set_defaults(func=cmd_execute)
+
+    p_apply_pw = sub.add_parser(
+        "apply-passwords",
+        help="set /etc/shadow password hashes for hashedPasswordSecret users from their real, materialized secrets",
+    )
+    p_apply_pw.add_argument("--plan", required=True, help="a plan produced by 'plan' (reads its password_set entries)")
+    p_apply_pw.add_argument("--shadow", required=True, help="the shadow file to update (real /etc/shadow, or a fixture copy)")
+    p_apply_pw.add_argument("--run-secrets-dir", default="/run/secrets", dest="run_secrets_dir",
+                             help="the real (or, for tests, temp) canonical root each password_set entry's secret is read from, as DIR/<secret> (default /run/secrets)")
+    p_apply_pw.add_argument("--apply", dest="apply", action="store_true", default=False, help="actually rewrite --shadow (default: dry-run)")
+    p_apply_pw.add_argument("--dry-run", dest="apply", action="store_false", help="compute and report only, never write --shadow (default)")
+    p_apply_pw.add_argument("--out", default=None, help="write the changed/errors summary here instead of stdout")
+    p_apply_pw.set_defaults(func=cmd_apply_passwords)
 
     args = parser.parse_args()
     try:

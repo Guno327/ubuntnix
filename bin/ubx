@@ -352,6 +352,44 @@ else:
 PYEOF
 }
 
+# ubx_domain_refs_split PREFIX < <(ubx_rebuild_domain_refs ROOT GEN) — reads
+# ONE tab-separated "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP\n" line from stdin
+# (ubx_rebuild_domain_refs' own output shape, bin/ubx-rebuild-lib) and
+# assigns DOM_<PREFIX>ETC_REF / DOM_<PREFIX>SYSTEMD_REF / DOM_<PREFIX>USERS_REF
+# / DOM_<PREFIX>SNAP_REF (PREFIX is "OLD_" or "NEW_" at every call site below).
+#
+# NOT a plain `IFS=$'\t' read -r a b c d` (every call site here used to be
+# exactly that, until GitHub issue #64's M3 snap-convergence e2e caught the
+# bug this rewrite fixes): bash's `read` treats a tab as a WHITESPACE-CLASS
+# IFS character, which means it TRIMS AND COLLAPSES adjacent/leading/
+# trailing EMPTY FIELDS instead of preserving them positionally. A
+# generation that declares a domain ONLY in a later field — e.g. only a
+# snap manifest, no etc/systemd/users, exactly ubx_rebuild_domain_refs' own
+# "\t\t\t<snapref>" output shape for that case — fed a plain tab `read`
+# silently shifts <snapref> into the FIRST variable (DOM_*_ETC_REF) instead
+# of the fourth, and leaves the real fourth variable (DOM_*_SNAP_REF)
+# empty: a real generation's declared snap manifest silently vanishes from
+# its own domain, AND gets misfed to `ubx-etc plan` as an etc ref instead.
+# `readarray -td $'\t'` does not collapse anything -- every field, including
+# empty ones, lands at its real positional index, which is exactly the
+# property this fixed-field, fixed-order line format needs from its reader.
+ubx_domain_refs_split() {
+  local prefix="$1"
+  local -a fields
+  readarray -td $'\t' fields
+  # readarray's split-on-delimiter leaves a trailing NEWLINE on the LAST
+  # field when the input line ends in "\n" (ubx_rebuild_domain_refs always
+  # terminates its line that way, per its own `printf '...\n'`) -- strip
+  # exactly that one trailing newline off the last field only; every other
+  # field is used verbatim.
+  local last=$(( ${#fields[@]} - 1 ))
+  [ "$last" -ge 0 ] && fields[last]="${fields[last]%$'\n'}"
+  printf -v "DOM_${prefix}ETC_REF" '%s' "${fields[0]:-}"
+  printf -v "DOM_${prefix}SYSTEMD_REF" '%s' "${fields[1]:-}"
+  printf -v "DOM_${prefix}USERS_REF" '%s' "${fields[2]:-}"
+  printf -v "DOM_${prefix}SNAP_REF" '%s' "${fields[3]:-}"
+}
+
 # -- plan_domains: computes (never executes) the three domain plans -------
 #
 # Reads DOM_OLD_* / DOM_NEW_* (refs, may be empty) plus the observed/
@@ -830,8 +868,7 @@ do_rebuild() {
 
   local old_current
   old_current="$(ubx_rebuild_effective_booted "$root")"
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
-    < <(ubx_rebuild_domain_refs "$root" "$old_current")
+  ubx_domain_refs_split OLD_ < <(ubx_rebuild_domain_refs "$root" "$old_current")
   DOM_NEW_ETC_REF="$etc_ref"
   DOM_NEW_SYSTEMD_REF="$systemd_ref"
   DOM_NEW_USERS_REF="$users_manifest"
@@ -1066,10 +1103,8 @@ cmd_rollback() {
   # set with single quotes fired after the function returned)
   trap "rm -rf -- '$workdir'" EXIT
 
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
-    < <(ubx_rebuild_domain_refs "$root" "$booted_gen")
-  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF DOM_NEW_SNAP_REF \
-    < <(ubx_rebuild_domain_refs "$root" "$target")
+  ubx_domain_refs_split OLD_ < <(ubx_rebuild_domain_refs "$root" "$booted_gen")
+  ubx_domain_refs_split NEW_ < <(ubx_rebuild_domain_refs "$root" "$target")
 
   plan_domains "$workdir"
 
@@ -1205,10 +1240,8 @@ cmd_diff() {
   # set with single quotes fired after the function returned)
   trap "rm -rf -- '$workdir'" EXIT
 
-  IFS=$'\t' read -r DOM_OLD_ETC_REF DOM_OLD_SYSTEMD_REF DOM_OLD_USERS_REF DOM_OLD_SNAP_REF \
-    < <(ubx_rebuild_domain_refs "$root" "$a")
-  IFS=$'\t' read -r DOM_NEW_ETC_REF DOM_NEW_SYSTEMD_REF DOM_NEW_USERS_REF DOM_NEW_SNAP_REF \
-    < <(ubx_rebuild_domain_refs "$root" "$b")
+  ubx_domain_refs_split OLD_ < <(ubx_rebuild_domain_refs "$root" "$a")
+  ubx_domain_refs_split NEW_ < <(ubx_rebuild_domain_refs "$root" "$b")
 
   plan_domains "$workdir"
 

@@ -87,6 +87,22 @@ cat > "$snap_manifest" <<'EOF'
 ]}
 EOF
 
+# GitHub issue #72 wired bin/ubx-snap's own plan+apply convergence into
+# execute_domains too, running immediately BEFORE this file's snap-purge
+# sweep (see bin/ubx's execute_domains header) -- every scenario below now
+# also exercises that new plan+apply path for the declared 'firefox' snap.
+# Stub its own UBX_SNAP_CMD mutation seam (bin/ubx-snap-apply's header) so
+# it never shells out to a real 'snap' binary; ordering/behavior of that
+# path is asserted in detail by its own dedicated wiring test
+# (tests/unit/150), this file only needs it to not blow up.
+snap_cmd_stub="$work/stub-snap-cmd"
+cat > "$snap_cmd_stub" <<'STUBEOF'
+#!/usr/bin/env bash
+exit 0
+STUBEOF
+chmod +x "$snap_cmd_stub"
+export UBX_SNAP_CMD="$snap_cmd_stub"
+
 export UBX_SNAP_BIN="$stub"
 export STUB_LIST_OUTPUT="$list_output"
 # Every scenario below is a first-ever generation with a real rootfs image

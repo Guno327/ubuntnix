@@ -2234,7 +2234,7 @@ let
     # -- clean-fallback gate 1: systemd version (semantics note 1 above) --
     sd_version="$(systemctl --version | head -n1 | awk '{print $2}')"
     case "$sd_version" in
-      '' | *[!0-9]*)
+      ''' | *[!0-9]*)
         mark_note "could not parse a numeric systemd version from 'systemctl --version' (got: '$sd_version') -- skipping the real soft-reboot re-exec"
         ;;
     esac

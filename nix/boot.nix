@@ -63,6 +63,10 @@ let
   inherit (config.flake.lib.stdenv) runInUbuntuBase;
   inherit (config.flake.lib.archive) lockfile debs;
   inherit (config.flake.lib.compose) composeRootfs squashfsImage toolsFHS;
+  # nix/snap.nix's declared-snap compiler + vendored fetchers -- consumed
+  # below by this file's own "snap-converge-proof" section (GitHub issue
+  # #64, milestone M3's exit criterion).
+  inherit (config.flake.lib.snap) compileManifest snaps;
 
   # -- primitive defaults (SPEC.md §6, this issue's task item 1) -----------
   #
@@ -282,6 +286,24 @@ let
     # own "proof-only, additive" posture). Empty by default: M1's own
     # boot-image-proof passes nothing here and is completely unaffected.
     , extraFilesScript ? ""
+    # extraEnv — additional derivation ENV ATTRS merged into this
+    # derivation's own `env` (alongside `base`/`ubxBin` below), so an
+    # `extraFilesScript` can reference a DERIVATION OUTPUT (a store path
+    # carrying string context — e.g. a vendored fetched artifact) from
+    # inside its script text. Exists for exactly the reason
+    # nix/stdenv.nix's `runInUbuntuBase` header documents under "NOTE":
+    # the script itself is rendered via `builtins.toFile`, which REJECTS
+    # any string carrying a reference to a derivation output — only env
+    # attrs may carry one. `switchLoopVarStore` (this file, M2) sidestepped
+    # this by using its OWN separate derivation's `env`; the M3
+    # snap-converge-proof (GitHub issue #64) needs to bake real fetched
+    # `.snap`/`.snap-declaration` bytes (nix/snap.nix's `fetchSnap`/
+    # `fetchAssert` outputs) directly into THIS rootfs tree, so bootRootfs
+    # itself grows this one small, backward-compatible extension point
+    # rather than a third bespoke derivation. Empty by default: every
+    # existing caller (M1's boot-image-proof, M2's switch-loop-proof) is
+    # unaffected.
+    , extraEnv ? { }
     , system ? "x86_64-linux"
     }:
     let
@@ -460,7 +482,7 @@ let
     runInUbuntuBase {
       inherit system;
       name = "boot-rootfs-${name}";
-      env = { inherit base ubxBin; };
+      env = { inherit base ubxBin; } // extraEnv;
       script = ''
         ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
 
@@ -2008,6 +2030,617 @@ let
         ubxrun "$UBX_BASE/bin/cp" disk.img "$out/disk.img"
       '';
     };
+
+  # ===========================================================================
+  # snap-converge-proof — SPEC.md §11 M3 exit criterion's QEMU end-to-end
+  # exercise (GitHub issue #64): "declared snap set converged live + drift
+  # purge" -- modeled directly on this file's own switch-loop-proof section
+  # above (M2, issue #32); see that section's header for the fuller
+  # discussion of the general technique (bake fixture assets at Nix build
+  # time, run the real verbs BETWEEN them, host harness only trusts serial
+  # markers) this one reuses without repeating verbatim.
+  #
+  # -- The three scenarios (GitHub issue #64's acceptance criteria) --------
+  #
+  #   S1  Boot a generation declaring a small snap set (hello-world, the
+  #       one snap already vendored end-to-end in snaps.lock.json/
+  #       snaps/assertions -- see nix/snap.nix's own header on why reusing
+  #       it, rather than resolving a new pin, is this proof's deliberate
+  #       choice); converge it LIVE via a real
+  #       `ubx rebuild switch --apply` (bin/ubx's real snap-domain block,
+  #       GitHub issues #66/#72: `bin/ubx-snap plan` -> `bin/ubx-snap-apply`
+  #       -> `bin/ubx-snap-purge`) from VENDORED payloads only (no Store
+  #       fetch reachable from inside the guest -- see "What's real vs
+  #       simulated" below); assert the snap lands at its pinned revision
+  #       with its declared connections/config, and that auto-refresh is
+  #       held permanently.
+  #   S2  Simulate an undeclared snap already being present (this proof's
+  #       own documented drift stand-in -- see below); demonstrate the
+  #       drift guard (bin/ubx-guard-snap, issue #31) BLOCKS an interactive
+  #       `snap install`; then reconverge (SAME declared manifest) and
+  #       assert the undeclared snap was PURGED by bin/ubx-snap-purge
+  #       (issues #63/#65).
+  #   S3  Reconverge AGAIN with NO manifest change and assert NO snap is
+  #       re-sideloaded (bin/ubx-snap's diff-driven no-op, issue #61) --
+  #       the declared snap stays present and correct throughout.
+  #
+  # -- What's real vs. simulated here, and why (the issue's own explicit
+  #    instruction: exercise the real path wherever the guest allows it;
+  #    stub ONLY the leaf snapd mutation/Store-fetch, and document every
+  #    stubbed segment loudly) -----------------------------------------
+  #
+  #  - REAL: `bin/ubx rebuild switch --apply`'s full snap-domain block --
+  #    `bin/ubx-snap plan` (diffing declared-vs-observed and deciding
+  #    ack/install/refresh/revert/connect/set/hold), `bin/ubx-snap-apply`
+  #    (translating that plan into an ordered sequence of snap-CLI-shaped
+  #    calls, resolving `--payload-dir`/`--assert-dir` from the manifest's
+  #    own directory exactly as bin/ubx's `execute_domains` documents), and
+  #    `bin/ubx-snap-purge` (querying the "installed" set, diffing against
+  #    the declared manifest, deciding what to purge). None of this
+  #    project's own decision-making code is stubbed -- only the ONE seam
+  #    each of those scripts already documents as injectable for exactly
+  #    this reason (`UBX_SNAP_CMD`, `UBX_SNAP_BIN`) is redirected.
+  #  - REAL: the vendored `.snap`/`.snap-declaration` bytes baked aboard
+  #    (`snapConvergeHelloWorldPayload`/`snapConvergeHelloWorldAssert`,
+  #    below) are nix/snap.nix's own real, hash-verified fixed-output
+  #    fetches of the actual hello-world Snap Store artifacts (see that
+  #    file's header) -- not synthetic placeholder bytes. The driver's
+  #    `ack`/`install` calls below really do read these exact files by the
+  #    real `<name>_<revision>` naming convention bin/ubx-snap-apply
+  #    expects.
+  #  - REAL: `bin/ubx-guard-snap`'s block decision for an interactive
+  #    `snap install` (scenario 2) -- the same real script/diversion
+  #    technique the M2 switch-loop-proof's own scenario 5 already
+  #    exercises for apt/dpkg/snap, applied here to the specific verb this
+  #    scenario's acceptance criteria calls out.
+  #  - SIMULATED (`snapConvergeSimScript`, below, /usr/local/bin/
+  #    ubx-snap-sim): the actual snapd daemon and Store network access. A
+  #    real snapd is not reachable from this offline QEMU guest (no Store
+  #    network reachable, and even a real LOCAL snapd would need a working
+  #    confinement stack this minimal guest doesn't carry -- exactly this
+  #    issue's own stated expectation). `ubx-snap-sim` stands in for BOTH
+  #    injectable seams at once (`UBX_SNAP_CMD` for bin/ubx-snap-apply's
+  #    mutating calls; `UBX_SNAP_BIN` for bin/ubx-snap-purge's list/purge
+  #    calls) -- legitimate because both already speak the exact same
+  #    "CMD <subcommand> <args...>" calling convention a real `snap`
+  #    binary invocation would use (see both scripts' own headers). It
+  #    maintains one small persistent JSON "installed snaps" state file,
+  #    mutated only in response to a real call arriving from the real
+  #    planner/executor/purge code above -- so the ASSERTIONS below are
+  #    checking real decisions this project's own code made, filtered
+  #    through a fake backend, not a scripted fake outcome.
+  #  - DOCUMENTED STAND-IN (not a seam bin/ubx itself exposes for this):
+  #    scenario 2's "undeclared snap already present" precondition is
+  #    established by calling `ubx-snap-sim seed-drift NAME REV` directly
+  #    -- a subcommand that exists ONLY on this proof's own simulator,
+  #    bypassing ack/install entirely, standing in for "a snap somehow
+  #    ended up installed outside this project's own convergence" (a stale
+  #    leftover, a bug, anything other than the interactive path this same
+  #    scenario proves IS blocked). This is the one place this proof
+  #    injects state the real code path did not itself produce; everything
+  #    that happens to that seeded snap afterward (the purge decision, the
+  #    real removal call) is real.
+  #  - DOCUMENTED STAND-IN (mirrors the M2 switch-loop-proof's own
+  #    identical stand-in verbatim, same reasoning): this is the very
+  #    FIRST generation this guest ever registers, so `bin/ubx rebuild
+  #    switch`'s soft-reboot delta classification
+  #    (`ubx_rebuild_classify_delta`, bin/ubx-rebuild-lib) sees a brand new
+  #    rootfs-image value and classifies the delta "image", which would
+  #    otherwise attempt a REAL `/run/nextroot` mount of that image path
+  #    followed by `systemctl soft-reboot`. That mechanism is already
+  #    proven for real by the M2 e2e (issue #55) and is unrelated to this
+  #    issue's own snap-domain scope, so this proof passes a fixed,
+  #    non-existent marker string as `--rootfs-image`/`--kernel`/`--initrd`
+  #    (exactly the switch-loop-proof's own gen3 marker-string fallback
+  #    technique) and points `UBX_NEXTROOT_STAGE_CMD`/`UBX_SOFT_REBOOT_CMD`
+  #    at trivial no-op stubs so that classification's side effects never
+  #    touch anything real. Nothing about the snap domain itself depends
+  #    on this.
+  #
+  # -- Marker scheme ------------------------------------------------------
+  #
+  # UBX-M3-S1-PASS / UBX-M3-S2-PASS / UBX-M3-S3-PASS, analogous to the M2
+  # switch-loop-proof's own UBX-M2-Sn-PASS convention; a scenario failure
+  # instead emits UBX-M3-Sn-FAIL: <reason> and powers off, exactly like M2
+  # (see tests/e2e/030-qemu-snap-e2e.sh, the host-side harness that scrapes
+  # these).
+  #
+  # This proof needs only ONE boot (no persistence-across-reboot claim is
+  # part of M3's own exit criterion, unlike M2's) -- `/ubx/var` is a plain
+  # tmpfs mount here (wiped every boot, irrelevant since there is only
+  # one), not the ext4 partition the switch-loop-proof needs for ITS OWN
+  # multi-reboot exit criterion; this proof therefore reuses the plain
+  # two-partition `diskImage` (this file, M1) rather than
+  # `switchLoopDiskImage`'s three-partition layout.
+
+  # -- the declared snap set (SPEC.md §6 `ubuntnix.snaps.<name>`) ----------
+  #
+  # Reuses the ALREADY-VENDORED hello-world pin (snaps.lock.json/
+  # snaps/assertions/hello-world_29.snap-declaration) per this project's
+  # All-Canonical rule and nix/snap.nix's own header ("PREFER reusing what
+  # is already committed" -- resolving a NEW pin needs live Snap Store
+  # network access this authoring environment does not have). `connections`/
+  # `config` are declared here even though the real hello-world snap has no
+  # interesting interfaces of its own (snaps.lock.json's own comment: "zero
+  # interesting interfaces") -- legitimate because the whole snapd side is
+  # simulated for this proof (see header above): `ubx-snap-sim` accepts any
+  # connect/set call for a snap it already "has installed" with no real
+  # interface/attribute validation, so declaring them here genuinely
+  # exercises bin/ubx-snap's connect/set planning + bin/ubx-snap-apply's
+  # dispatch for those ops, which the bare lockfile entry alone would not.
+  snapConvergeEntries = {
+    hello-world = {
+      channel = "stable";
+      revision = 29;
+      classic = false;
+      connections = [ "network" ];
+      config = { greeting = "hi"; };
+    };
+  };
+
+  # compileManifest (nix/snap.nix), evaluated eagerly here (pure data, no
+  # derivation build) against the real committed snaps.lock.json (its own
+  # default `lockfile`) -- the exact per-generation manifest shape
+  # bin/ubx-snap's plan/apply/purge already consume elsewhere in this
+  # project; embedding it as plain JSON text mirrors switchLoopGen2EtcManifest
+  # &c.'s own "small, non-derivation JSON, safe to interpolate directly"
+  # posture.
+  snapConvergeManifestJson = builtins.toJSON (compileManifest { entries = snapConvergeEntries; });
+
+  # -- vendored payload/assertion bytes (nix/snap.nix's real fixed-output
+  #    fetches) -- REAL derivation outputs, so they travel through
+  #    bootRootfs's new `extraEnv` (see that function's own comment on why)
+  #    rather than being interpolated into extraFilesScript's own text. --
+  snapConvergeHelloWorldPayload = snaps.hello-world.snap;
+  snapConvergeHelloWorldAssert = snaps.hello-world."assert";
+
+  # -- the simulated snapd backend (see this section's header, "What's
+  #    real vs. simulated") -------------------------------------------
+  #
+  # One script answers to BOTH injectable seams bin/ubx-snap-apply
+  # (UBX_SNAP_CMD) and bin/ubx-snap-purge (UBX_SNAP_BIN) already expose,
+  # because both already speak the identical "CMD <subcommand> <args...>"
+  # calling convention a real `snap` invocation would use (see both
+  # scripts' own headers). Maintains a small persistent JSON state file at
+  # $UBX_SNAP_SIM_STATE (`{"refreshHold": bool, "snaps": {name: {revision,
+  # channel, classic, connections, config}}}`) and appends every invocation
+  # verbatim to $UBX_SNAP_SIM_LOG (an argv-per-line trace) -- the driver
+  # script inspects that log directly to assert scenario 3's "no snap is
+  # re-sideloaded" property (no NEW ack/install lines appear across a
+  # no-op reconverge), and inspects the state file directly for every
+  # other assertion (installed revision, connections, config, refresh
+  # hold, presence/absence of a name).
+  snapConvergeSimScript = ''
+    #!/bin/sh
+    # /usr/local/bin/ubx-snap-sim -- see nix/boot.nix's snap-converge-proof
+    # section header ("What's real vs. simulated") for the full scope
+    # note: this stands in for the real snapd/`snap` client ONLY, never
+    # for this project's own planner/executor/purge decision logic, which
+    # calls this script exactly as it would call the real `snap` CLI.
+    set -eu
+    STATE="''${UBX_SNAP_SIM_STATE:?UBX_SNAP_SIM_STATE must be set}"
+    LOG="''${UBX_SNAP_SIM_LOG:?UBX_SNAP_SIM_LOG must be set}"
+    cmd="''${1:-}"
+    if [ $# -ge 1 ]; then shift; fi
+    printf '%s' "$cmd" >> "$LOG"
+    for a in "$@"; do printf ' %s' "$a" >> "$LOG"; done
+    printf '\n' >> "$LOG"
+
+    exec python3 - "$STATE" "$cmd" "$@" <<'PYEOF'
+    import json
+    import os
+    import sys
+
+    state_path, cmd = sys.argv[1], sys.argv[2]
+    args = sys.argv[3:]
+
+    if os.path.exists(state_path):
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    else:
+        state = {"refreshHold": False, "snaps": {}}
+
+
+    def save():
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, state_path)
+
+
+    def name_rev_from_snap_path(path):
+        base = os.path.basename(path)
+        if base.endswith(".snap"):
+            base = base[: -len(".snap")]
+        name, _, rev = base.rpartition("_")
+        return name, int(rev)
+
+
+    if cmd == "list":
+        print("Name  Version  Rev  Tracking  Publisher  Notes")
+        for name, s in sorted(state["snaps"].items()):
+            print(f"{name}  -  {s['revision']}  {s.get('channel') or '-'}  -  -")
+        sys.exit(0)
+
+    if cmd == "ack":
+        assert_path = args[0]
+        if not os.path.isfile(assert_path):
+            print(f"ubx-snap-sim: ack: assertion file not found: {assert_path}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    if cmd == "install":
+        classic = "--classic" in args
+        payload = [a for a in args if a not in ("--dangerous", "--classic")][-1]
+        if not os.path.isfile(payload):
+            print(f"ubx-snap-sim: install: payload not found: {payload}", file=sys.stderr)
+            sys.exit(1)
+        name, rev = name_rev_from_snap_path(payload)
+        state["snaps"][name] = {"revision": rev, "channel": "", "classic": classic, "connections": [], "config": {}}
+        save()
+        sys.exit(0)
+
+    if cmd == "refresh":
+        if args and args[0] == "--hold=forever":
+            state["refreshHold"] = True
+            save()
+            sys.exit(0)
+        payload = [a for a in args if a != "--dangerous"][-1]
+        if not os.path.isfile(payload):
+            print(f"ubx-snap-sim: refresh: payload not found: {payload}", file=sys.stderr)
+            sys.exit(1)
+        name, rev = name_rev_from_snap_path(payload)
+        existing = state["snaps"].get(name, {"channel": "", "classic": False, "connections": [], "config": {}})
+        existing["revision"] = rev
+        state["snaps"][name] = existing
+        save()
+        sys.exit(0)
+
+    if cmd == "revert":
+        name = args[0]
+        rev = None
+        for a in args[1:]:
+            if a.startswith("--revision="):
+                rev = int(a.split("=", 1)[1])
+        if name not in state["snaps"] or rev is None:
+            print(f"ubx-snap-sim: revert: no such snap or missing --revision: {args}", file=sys.stderr)
+            sys.exit(1)
+        state["snaps"][name]["revision"] = rev
+        save()
+        sys.exit(0)
+
+    if cmd == "remove":
+        names = [a for a in args if a != "--purge"]
+        for n in names:
+            state["snaps"].pop(n, None)
+        save()
+        sys.exit(0)
+
+    if cmd == "connect":
+        name, _, iface = args[0].partition(":")
+        if name not in state["snaps"]:
+            print(f"ubx-snap-sim: connect: no such snap: {name}", file=sys.stderr)
+            sys.exit(1)
+        conns = set(state["snaps"][name].get("connections", []))
+        conns.add(iface)
+        state["snaps"][name]["connections"] = sorted(conns)
+        save()
+        sys.exit(0)
+
+    if cmd == "disconnect":
+        name, _, iface = args[0].partition(":")
+        if name in state["snaps"]:
+            conns = set(state["snaps"][name].get("connections", []))
+            conns.discard(iface)
+            state["snaps"][name]["connections"] = sorted(conns)
+            save()
+        sys.exit(0)
+
+    if cmd == "set":
+        name, kv = args[0], args[1]
+        key, _, value = kv.partition("=")
+        if value in ("true", "false"):
+            parsed = value == "true"
+        else:
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                parsed = value
+        if name not in state["snaps"]:
+            print(f"ubx-snap-sim: set: no such snap: {name}", file=sys.stderr)
+            sys.exit(1)
+        state["snaps"][name].setdefault("config", {})[key] = parsed
+        save()
+        sys.exit(0)
+
+    if cmd == "unset":
+        name, key = args[0], args[1]
+        if name in state["snaps"]:
+            state["snaps"][name].get("config", {}).pop(key, None)
+            save()
+        sys.exit(0)
+
+    if cmd == "seed-drift":
+        # Proof-only, NOT a real snap subcommand -- see this section's own
+        # header, "DOCUMENTED STAND-IN": establishes scenario 2's
+        # undeclared-snap precondition directly, bypassing ack/install
+        # entirely (deliberate -- this represents drift that did NOT come
+        # from this project's own convergence path).
+        name, rev = args[0], int(args[1])
+        state["snaps"][name] = {"revision": rev, "channel": "", "classic": False, "connections": [], "config": {}}
+        save()
+        sys.exit(0)
+
+    print(f"ubx-snap-sim: unknown subcommand: {cmd!r}", file=sys.stderr)
+    sys.exit(1)
+    PYEOF
+  '';
+
+  # -- the guest driver script ----------------------------------------------
+  snapConvergeDriverScript = ''
+    #!/bin/bash
+    # /usr/local/bin/ubx-snap-converge-driver -- see nix/boot.nix's
+    # snap-converge-proof section (GitHub issue #64) for the full design,
+    # and this file's own header for exactly what is real vs. simulated.
+    set -u
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    ASSETS=/usr/local/share/ubx-snap-converge
+    ROOT=/ubx/var/generations
+    STATE=/ubx/var/snap-converge
+    UBX=/ubx/bin/ubx
+    MANIFEST="$ASSETS/gen/manifest.json"
+
+    mkdir -p "$STATE"
+    export UBX_SNAP_SIM_STATE="$STATE/snapd-state.json"
+    export UBX_SNAP_SIM_LOG="$STATE/snapd-actions.log"
+    : > "$UBX_SNAP_SIM_LOG"
+    export UBX_SNAP_CMD=/usr/local/bin/ubx-snap-sim
+    export UBX_SNAP_BIN=/usr/local/bin/ubx-snap-sim
+    # See this file's own header, "DOCUMENTED STAND-IN" (soft-reboot
+    # classification on the very first generation) -- both stubs are
+    # trivial no-ops, unrelated to the snap domain this proof targets.
+    export UBX_NEXTROOT_STAGE_CMD=/usr/local/bin/ubx-m3-nextroot-stage-stub
+    export UBX_SOFT_REBOOT_CMD=/usr/local/bin/ubx-m3-soft-reboot-stub
+
+    mark_fail() { # SCENARIO REASON
+      echo "UBX-M3-$1-FAIL: $2"
+      echo "----- BEGIN mark_fail diagnostics -----"
+      ls -la "$STATE" 2> /dev/null
+      for f in "$STATE"/*.log; do
+        [ -f "$f" ] || continue
+        echo "----- BEGIN $f -----"
+        tail -n 200 "$f"
+        echo "----- END $f -----"
+      done
+      echo "----- END mark_fail diagnostics -----"
+      sync
+      systemctl poweroff
+      exit 0
+    }
+
+    check_state() { # LABEL PYTHON_EXPR (must be a valid boolean expr over `state`)
+      python3 - "$UBX_SNAP_SIM_STATE" "$2" <<'PYEOF'
+    import json
+    import sys
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    ok = eval(sys.argv[2])
+    sys.exit(0 if ok else 1)
+    PYEOF
+    }
+
+    do_switch() { # LOG_NAME [EXTRA ubx-rebuild-switch ARGS...]
+      local log_name="$1"
+      shift
+      "$UBX" rebuild switch --root "$ROOT" \
+        --rootfs-image "ubx-m3-snap-converge-proof-rootfs-image-marker" \
+        --kernel "/vmlinuz-ubx-m3-marker" --initrd "/initrd-ubx-m3-marker" \
+        --root-device /dev/vda2 \
+        --snap-manifest "$MANIFEST" \
+        "$@" \
+        --apply \
+        > "$STATE/$log_name.log" 2>&1
+    }
+
+    # ================= scenario 1: declare + converge live =================
+    #
+    # --snap-observed is passed EXPLICITLY here (rather than bin/ubx's own
+    # default synthesis, snap_synthesize_observed) because that default
+    # unconditionally assumes 'refreshHold' is ALREADY true (bin/ubx's own
+    # documented "a fully converged system already holds it" baseline
+    # assumption) -- which would never let a real 'hold' action reach the
+    # simulated snapd seam on this guest's very first switch. Pointing at a
+    # genuinely empty/unheld observed-state fixture instead
+    # ($ASSETS/empty-snap-observed.json, baked below) makes this scenario
+    # exercise the REAL ack+install+connect+set+hold sequence end to end,
+    # which is exactly what "converge it LIVE" (this issue's own acceptance
+    # criteria) means to prove.
+    do_switch s1 --snap-observed "$ASSETS/empty-snap-observed.json"
+    rc=$?
+    [ "$rc" -eq 0 ] || mark_fail S1 "ubx rebuild switch exited $rc -- see $STATE/s1.log"
+
+    grep -q '^ack ' "$UBX_SNAP_SIM_LOG" || mark_fail S1 "no 'ack' action reached the snapd seam -- see $STATE/s1.log"
+    grep -q '^install ' "$UBX_SNAP_SIM_LOG" || mark_fail S1 "no 'install' action reached the snapd seam -- see $STATE/s1.log"
+    grep -q '^refresh --hold=forever' "$UBX_SNAP_SIM_LOG" || mark_fail S1 "no 'hold' action reached the snapd seam -- see $STATE/s1.log"
+
+    check_state S1 "state['refreshHold'] is True" ||
+      mark_fail S1 "auto-refresh was not held permanently after convergence"
+    check_state S1 "state['snaps'].get('hello-world', {}).get('revision') == 29" ||
+      mark_fail S1 "hello-world is not installed at its pinned revision (29)"
+    check_state S1 "state['snaps'].get('hello-world', {}).get('connections') == ['network']" ||
+      mark_fail S1 "hello-world's declared connection (network) did not converge"
+    check_state S1 "state['snaps'].get('hello-world', {}).get('config', {}).get('greeting') == 'hi'" ||
+      mark_fail S1 "hello-world's declared config (greeting=hi) did not converge"
+    echo "UBX-M3-S1-PASS"
+
+    # ================= scenario 2: drift block + purge ======================
+    #
+    # Real guard decision first (bin/ubx-guard-snap, issue #31): an
+    # interactive sideload attempt must be BLOCKED. "snap" here is the
+    # diverted guard (see extraFilesScript below), never this proof's own
+    # ubx-snap-sim -- a completely separate binary/seam, see this file's
+    # header.
+    s2_guard_log="$STATE/s2-guard.log"
+    if snap install /nonexistent-ubx-m3-should-not-install.snap > "$s2_guard_log" 2>&1; then
+      mark_fail S2 "interactive 'snap install' was NOT blocked by the drift guard"
+    fi
+    grep -q "managed declaratively" "$s2_guard_log" || mark_fail S2 "guard refusal message missing -- see $s2_guard_log"
+
+    # Now simulate the undeclared snap already being present (this proof's
+    # own documented stand-in -- see this file's header, "DOCUMENTED
+    # STAND-IN") and confirm it really landed in the simulated backend.
+    "$UBX_SNAP_CMD" seed-drift ubx-m3-undeclared-drift-snap 1
+    check_state S2 "'ubx-m3-undeclared-drift-snap' in state['snaps']" ||
+      mark_fail S2 "seeding the drift snap into the simulated backend did not take"
+
+    # Reconverge with the SAME declared manifest -- the purge sweep
+    # (bin/ubx-snap-purge, issues #63/#65) must remove the undeclared snap.
+    do_switch s2
+    rc=$?
+    [ "$rc" -eq 0 ] || mark_fail S2 "ubx rebuild switch (reconverge) exited $rc -- see $STATE/s2.log"
+    grep -q '^remove --purge ubx-m3-undeclared-drift-snap' "$UBX_SNAP_SIM_LOG" ||
+      mark_fail S2 "no purge ('remove --purge') action for the undeclared snap reached the snapd seam -- see $STATE/s2.log"
+    check_state S2 "'ubx-m3-undeclared-drift-snap' not in state['snaps']" ||
+      mark_fail S2 "the undeclared snap was not purged from the simulated backend"
+    check_state S2 "state['snaps'].get('hello-world', {}).get('revision') == 29" ||
+      mark_fail S2 "hello-world was disturbed by the purge sweep (should be untouched)"
+    echo "UBX-M3-S2-PASS"
+
+    # ================= scenario 3: no-op reconverge =========================
+    actions_before="$(wc -l < "$UBX_SNAP_SIM_LOG")"
+
+    do_switch s3
+    rc=$?
+    [ "$rc" -eq 0 ] || mark_fail S3 "ubx rebuild switch (no-op reconverge) exited $rc -- see $STATE/s3.log"
+
+    actions_after="$(wc -l < "$UBX_SNAP_SIM_LOG")"
+    new_installs="$(tail -n "+$((actions_before + 1))" "$UBX_SNAP_SIM_LOG" | grep -c '^install \|^ack \|^refresh ' || true)"
+    [ "$new_installs" -eq 0 ] ||
+      mark_fail S3 "a snap was re-sideloaded on a no-op reconverge ($new_installs new ack/install/refresh action(s) -- see $STATE/s3.log)"
+    check_state S3 "state['snaps'].get('hello-world', {}).get('revision') == 29" ||
+      mark_fail S3 "hello-world is no longer correctly converged after the no-op reconverge"
+    echo "UBX-M3-S3-PASS"
+
+    sync
+    systemctl poweroff
+  '';
+
+  # -- the extra-files script layered onto bootRootfs for this proof only --
+  snapConvergeExtraFilesScript = ''
+    # -- the "snap" drift guard (SPEC.md §7, bin/ubx-guard-snap; mirrors the
+    #    switch-loop-proof's own identical block verbatim -- "snap" is
+    #    never part of this image's composed package set, so there is
+    #    nothing to divert, only the fallback /usr/local/bin install
+    #    path). --------------------------------------------------------
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/bin"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/snap" <<'UBX_M3_GUARD_EOF'
+    #!/bin/sh
+    export UBX_GUARD_REAL_BIN=/bin/true
+    exec /ubx/bin/ubx-guard-snap "$@"
+    UBX_M3_GUARD_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/snap"
+
+    # -- the simulated snapd backend (this proof's own; see this section's
+    #    header) -------------------------------------------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-snap-sim" <<'UBX_M3_SIM_EOF'
+    ${snapConvergeSimScript}
+    UBX_M3_SIM_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-snap-sim"
+
+    # -- the two trivial soft-reboot-classification stubs (see this
+    #    section's header, "DOCUMENTED STAND-IN") -----------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-m3-nextroot-stage-stub" <<'UBX_M3_STUB_EOF'
+    #!/bin/sh
+    # Stands in for bin/ubx's real _ubx_stage_nextroot (UBX_NEXTROOT_STAGE_CMD
+    # default) -- see nix/boot.nix's snap-converge-proof header for why a
+    # real /run/nextroot mount is out of scope for this snap-domain-only
+    # proof (already proven for real by the M2 switch-loop e2e, issue #55).
+    exit 0
+    UBX_M3_STUB_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-m3-nextroot-stage-stub"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-m3-soft-reboot-stub" <<'UBX_M3_STUB_EOF'
+    #!/bin/sh
+    # Stands in for `systemctl soft-reboot` -- see nix/boot.nix's
+    # switch-loop-proof header (ubx-soft-reboot-stub) for the identical
+    # precedent this reuses verbatim, one level up the milestone.
+    mkdir -p /run/ubx-m3-snap-converge
+    : > /run/ubx-m3-snap-converge/soft-reboot-invoked
+    exit 0
+    UBX_M3_STUB_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-m3-soft-reboot-stub"
+
+    # -- the declared snap manifest + its vendored payload/assertion,
+    #    together in ONE directory (bin/ubx's own "--payload-dir/
+    #    --assert-dir derived from the manifest's own directory"
+    #    convention -- see execute_domains' comment in bin/ubx). ---------
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/share/ubx-snap-converge/gen"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-snap-converge/gen/manifest.json" <<'UBX_M3_JSON_EOF'
+    ${snapConvergeManifestJson}
+    UBX_M3_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cp" "$snapConvergeHelloWorldPayload" \
+      "$out/usr/local/share/ubx-snap-converge/gen/hello-world_29.snap"
+    ubxrun "$UBX_BASE/bin/cp" "$snapConvergeHelloWorldAssert" \
+      "$out/usr/local/share/ubx-snap-converge/gen/hello-world_29.snap-declaration"
+
+    # -- scenario 1's genuinely-empty/unheld --snap-observed fixture (see
+    #    the driver script's own comment on why the default
+    #    snap_synthesize_observed synthesis is deliberately NOT used for
+    #    the very first switch). ----------------------------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-snap-converge/empty-snap-observed.json" <<'UBX_M3_JSON_EOF'
+    {"version": 1, "refreshHold": false, "snaps": []}
+    UBX_M3_JSON_EOF
+
+    # -- the /ubx/var mountpoint + its tmpfs mount unit (see this
+    #    section's header: no ext4/persistence needed, this proof is a
+    #    single boot). Unit filename must equal the systemd-escaped form
+    #    of Where= (systemd.mount(5)), same rule bootRootfs's own
+    #    mountUnit helper documents for /tmp,/home. --------------------
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/ubx/var"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-var.mount" <<'UBX_M3_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix M3 snap-converge proof: /ubx/var (tmpfs; single-boot proof, no persistence needed)
+    DefaultDependencies=no
+    Before=local-fs.target
+
+    [Mount]
+    What=tmpfs
+    Where=/ubx/var
+    Type=tmpfs
+    Options=mode=0755
+
+    [Install]
+    WantedBy=local-fs.target
+    UBX_M3_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/local-fs.target.wants"
+    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-var.mount \
+      "$out/etc/systemd/system/local-fs.target.wants/ubx-var.mount"
+
+    # -- the guest driver + its unit --------------------------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-snap-converge-driver" <<'UBX_M3_DRIVER_EOF'
+    ${snapConvergeDriverScript}
+    UBX_M3_DRIVER_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-snap-converge-driver"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-snap-converge-driver.service" <<'UBX_M3_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix M3 snap-converge proof driver (tests/e2e/030-qemu-snap-e2e.sh; GitHub issue #64)
+    After=ubx-var.mount multi-user.target
+    Requires=ubx-var.mount multi-user.target
+
+    [Service]
+    Type=oneshot
+    StandardOutput=journal+console
+    StandardError=journal+console
+    ExecStart=/usr/local/bin/ubx-snap-converge-driver
+
+    [Install]
+    WantedBy=multi-user.target
+    UBX_M3_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/multi-user.target.wants"
+    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-snap-converge-driver.service \
+      "$out/etc/systemd/system/multi-user.target.wants/ubx-snap-converge-driver.service"
+  '';
 in
 {
   flake.lib.boot = {
@@ -2160,6 +2793,52 @@ in
         grubCfgDrv = switchLoopGrubCfgDrv;
         varImage = switchLoopVarImageDrv;
       };
+
+      # -- the M3 snap-converge-proof (GitHub issue #64; see nix/boot.nix's
+      #    own "snap-converge-proof" section above for the full design).
+      #    Kernel reused from M1's proofKernel, exactly like the M2
+      #    switch-loop-proof above; no ext4 partition needed (single-boot
+      #    proof, see that section's header), so this reuses the plain
+      #    two-partition `diskImage` (M1) rather than
+      #    `switchLoopDiskImage`. ------------------------------------------
+      snapConvergeRootfs = bootRootfs {
+        inherit system bootSpec;
+        name = "snap-converge-proof";
+        extraFilesScript = snapConvergeExtraFilesScript;
+        extraEnv = { inherit snapConvergeHelloWorldPayload snapConvergeHelloWorldAssert; };
+      };
+
+      snapConvergeSquashfs = squashfsImage {
+        inherit system;
+        name = "snap-converge-proof";
+        rootfs = snapConvergeRootfs;
+      };
+
+      snapConvergeGeneration = {
+        index = 1;
+        title = "ubuntnix snap-converge-proof generation 1 (${bootSpec.kernel})";
+        kernelPath = "/vmlinuz-${flavor}";
+        initrdPath = "/initrd.img-${flavor}";
+        rootDevice = "/dev/vda2";
+        kernelParams = bootSpec.kernelParams ++ [
+          "rootfstype=squashfs"
+          "console=ttyS0"
+        ];
+      };
+
+      snapConvergeGrubCfgDrv = grubCfg {
+        inherit system;
+        name = "snap-converge-proof";
+        generations = [ snapConvergeGeneration ];
+      };
+
+      snapConvergeDiskImageDrv = diskImage {
+        inherit system flavor;
+        name = "snap-converge-proof";
+        squashfs = snapConvergeSquashfs;
+        kernel = proofKernel;
+        grubCfgDrv = snapConvergeGrubCfgDrv;
+      };
     in
     {
       packages.boot-kernel-artifacts-proof = proofKernel;
@@ -2170,5 +2849,8 @@ in
       # SPEC.md §11 M2's own exit-criterion proof (GitHub issue #32) --
       # tests/e2e/020-qemu-switch-e2e.sh boots this one.
       packages.switch-loop-proof = switchLoopDiskImageDrv;
+      # SPEC.md §11 M3's own exit-criterion proof (GitHub issue #64) --
+      # tests/e2e/030-qemu-snap-e2e.sh boots this one.
+      packages.snap-converge-proof = snapConvergeDiskImageDrv;
     };
 }

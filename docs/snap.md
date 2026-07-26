@@ -1,6 +1,6 @@
 # Snaps: declared surface, lockfile, and vendoring
 
-```{admonition} Contracts implemented (M3); a few wiring gaps remain
+```{admonition} Contracts implemented (M3); one wiring gap remains
 :class: note
 
 `snaps.packages.json`, `snaps.lock.json`, `bin/ubx-snap-resolve`,
@@ -8,20 +8,33 @@
 repository as of milestone **M3** (`SPEC.md` §4.3, §4.4, §4.5, §5, §6;
 issues #60, #61, #62): the declared-surface validation, lockfile schema,
 resolver, fixed-output vendoring, convergence planner, and convergence
-executor described below are all real. What is **not** implemented yet: a
+executor described below are all real. `bin/ubx-snap`/`bin/ubx-snap-apply`
+ARE now wired into `ubx rebuild switch` (GitHub issue #72, by analogy with
+`bin/ubx-etc`/`bin/ubx-etc-apply`'s own wiring): `plan_domains` computes a
+real convergence plan against an observed-state manifest (default:
+synthesized "assume the old generation's own declaration is already
+converged", exactly `--systemd-observed`'s own precedent — override with
+`--snap-observed`); `report_domains` prints it; `execute_domains` applies
+it through `bin/ubx-snap-apply`, `--apply`-gated, running immediately
+before the pre-existing undeclared-snap purge sweep (issue #66) — see
+`bin/ubx`'s own header and `tests/unit/150` for the exact wiring and its
+`switch`/`test`/`boot` safety posture. What is **not** implemented yet: a
 real `ubuntnix.snaps.<name>` module option (`nix/snap.nix`'s
 `validate`/`compileManifest` are ready for one to call once real module
 evaluation exists — the same "no `modules/` tree yet" caveat
-`nix/etc.nix`'s and `nix/systemd.nix`'s own docs describe), wiring
-`bin/ubx-snap`/`bin/ubx-snap-apply` into `ubx rebuild switch` itself (by
-analogy with `bin/ubx-etc`/`bin/ubx-etc-apply`'s own wiring — currently
-both are standalone, independently-testable scripts, not yet invoked from
-`bin/ubx`), and wiring `bin/ubx-snap-resolve` into `ubx update` (SPEC.md
-§4.5's three pin sources — flake inputs, archive, snap — are expected to
-be wired together in one later issue; see `bin/ubx-snap-resolve`'s own
-header for why `ubx update` deliberately stays a stub until then,
-mirroring the identical precedent `bin/ubx-resolve` already set for the
-archive-pins portion).
+`nix/etc.nix`'s and `nix/systemd.nix`'s own docs describe); wiring
+`bin/ubx-snap-resolve` into `ubx update` (SPEC.md §4.5's three pin
+sources — flake inputs, archive, snap — are expected to be wired together
+in one later issue; see `bin/ubx-snap-resolve`'s own header for why
+`ubx update` deliberately stays a stub until then, mirroring the identical
+precedent `bin/ubx-resolve` already set for the archive-pins portion); and
+a real per-generation directory of vendored `.snap` payloads/
+`.snap-declaration` assertions for `--payload-dir`/`--assert-dir` to
+resolve against (`bin/ubx-generations`' reserved `GEN_SNAP_MANIFEST` field
+only carries a manifest.json path today — see `bin/ubx-snap-apply`'s own
+header and `bin/ubx`'s `execute_domains` for the documented stand-in: both
+directories are derived from the resolved manifest's own location until a
+real on-device build places these files somewhere else).
 ```
 
 ubuntnix prefers snaps over debs where a good one exists (`SPEC.md` §5:
@@ -371,7 +384,8 @@ generation's snap-domain manifest build actually placed these files).
 The snap lockfile and resolver land at milestone **M3** (`SPEC.md` §11,
 issue #60); the convergence planner/executor pair lands in the same
 milestone (issues #61, #62). Wiring `bin/ubx-snap`/`bin/ubx-snap-apply`
-into `ubx rebuild switch` itself, and wiring `bin/ubx-snap-resolve` into
-`ubx update`'s snap-pins portion, are separate, later work — see
-{doc}`workflows` for the planned `ubx update` flow across all three pin
-sources.
+into `ubx rebuild switch` itself is DONE (issue #72 — see the admonition at
+the top of this page and `bin/ubx`'s own header/`execute_domains`).
+Wiring `bin/ubx-snap-resolve` into `ubx update`'s snap-pins portion is
+separate, later work — see {doc}`workflows` for the planned `ubx update`
+flow across all three pin sources.

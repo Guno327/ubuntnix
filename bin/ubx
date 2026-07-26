@@ -169,10 +169,12 @@ not_implemented() {
 # =====================================================================
 # shared plan/report/execute helpers
 #
-# Domain order is FIXED throughout this file: etc, systemd, users —
+# Domain order is FIXED throughout this file: etc, systemd, users, snap —
 # mirrors SPEC.md §4.3's switching table (row 1 combines /etc + systemd
-# units, row 2 is users). Every report this script prints lists domains in
-# exactly this order, regardless of which verb produced it.
+# units, row 2 is users, row 3 is snaps) and matches the position
+# bin/ubx-snap-purge's own sweep already established at the end of
+# execute_domains (issue #66). Every report this script prints lists
+# domains in exactly this order, regardless of which verb produced it.
 # =====================================================================
 
 peek_next_index() { # ROOT
@@ -237,6 +239,62 @@ for u in old.get("units", []):
 
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({"version": 1, "units": units}, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+# summarize_snap_plan PLAN_JSON — prints the action count. Same technique
+# as summarize_systemd_plan (bin/ubx-snap's plan JSON is pretty-printed the
+# same way bin/ubx-systemd's is: each action object contributes exactly one
+# `"op":` line, and the top-level object has no such key of its own).
+summarize_snap_plan() {
+  grep -c '"op":' "$1" || true
+}
+
+# snap_synthesize_observed OLD_DECLARED_JSON OUT_JSON — the snap domain's
+# "assume no drift" default observed-state manifest, derived FROM the old
+# generation's own DECLARED manifest — chosen over an `ubx-snap observe`
+# call for the same reason systemd_synthesize_observed (above) is chosen
+# over a live `ubx-systemd observe`: this is the "no caller-supplied
+# observed state" DEFAULT, and shelling out to the real, impure
+# UBX_SNAP_QUERY_CMD seam (which talks to the host's own `snap` client) is
+# neither expected to be available nor desired every time a plan is merely
+# being computed against an assumed-converged baseline; a caller who wants
+# a real, live-observed answer instead passes --snap-observed (fed from a
+# real `ubx-snap observe`), bypassing this synthesis entirely, exactly
+# mirroring --systemd-observed.
+#
+# Unlike bin/ubx-systemd's declared/observed schemas (which genuinely
+# differ in shape — see systemd_synthesize_observed's own comment), bin/
+# ubx-snap's declared and observed per-snap schemas share almost the same
+# fields verbatim (channel/revision/classic/connections/config — see that
+# script's header for both schemas side by side): the only observed-only
+# addition is the top-level `refreshHold` flag. So this synthesis is a
+# straight copy of the old manifest's declared snaps into the observed
+# shape, plus `refreshHold: true` (a fully-converged system, per SPEC.md
+# §4.3's "auto-refresh held permanently" invariant, already holds it).
+snap_synthesize_observed() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+old_path, out_path = sys.argv[1:3]
+with open(old_path, encoding="utf-8") as f:
+    old = json.load(f)
+
+snaps = []
+for s in old.get("snaps", []):
+    snaps.append({
+        "name": s["name"],
+        "revision": s["revision"],
+        "channel": s["channel"],
+        "classic": bool(s.get("classic", False)),
+        "connections": list(s.get("connections", [])),
+        "config": dict(s.get("config", {})),
+    })
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "refreshHold": True, "snaps": snaps}, f, indent=2)
     f.write("\n")
 PYEOF
 }
@@ -420,24 +478,48 @@ plan_domains() {
     DOM_USERS_ERRORS=0
   fi
 
-  # -- snap (GitHub issue #66) -------------------------------------------
+  # -- snap (GitHub issues #66, #72) --------------------------------------
   #
-  # Unlike etc/systemd/users, there is no separate plan/observed-state
-  # step here: bin/ubx-snap-purge does its OWN observation (a live `snap
-  # list`) and diffs it against the declared manifest directly -- this
-  # block only resolves DOM_NEW_SNAP_REF to a real manifest.json path (the
-  # real per-generation manifest nix/snap.nix's renderManifest produces,
-  # issue #60) for execute_domains to hand it. Skipped (like every other
-  # domain) only when NEITHER the old nor the new generation declares
-  # anything for this domain.
+  # Two independent things use this domain's manifests, both computed
+  # here:
+  #   - the real plan+apply convergence (issue #72, this block): a plan
+  #     computed via `bin/ubx-snap plan` against the OLD declared
+  #     manifest, the NEW declared manifest, and an observed-state
+  #     manifest -- exactly etc/systemd's own plan_domains shape above.
+  #   - bin/ubx-snap-purge's OWN separate undeclared-snap sweep (issue
+  #     #66, execute_domains below): that tool does its OWN observation (a
+  #     live `snap list`) and diffs it against the declared manifest
+  #     directly, so it only ever needs DOM_NEW_SNAP_JSON -- which this
+  #     block keeps resolving exactly as before, unconditionally, so the
+  #     purge sweep's own wiring (tests/unit/149) is untouched by this
+  #     addition.
+  # Skipped (like every other domain) only when NEITHER the old nor the
+  # new generation declares anything for this domain.
   DOM_SNAP_SKIP=0
   if [ -z "$DOM_OLD_SNAP_REF" ] && [ -z "$DOM_NEW_SNAP_REF" ]; then
     DOM_SNAP_SKIP=1
   fi
   if [ "$DOM_SNAP_SKIP" = 0 ]; then
+    local snap_old_json snap_obs_json
+    snap_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_SNAP_REF" "$UBX_REBUILD_EMPTY_SNAP_MANIFEST" "$workdir" old-snap)" \
+      || die "could not resolve the old generation's snap manifest"
     DOM_NEW_SNAP_JSON="$(ubx_rebuild_resolve_ref "$DOM_NEW_SNAP_REF" "$UBX_REBUILD_EMPTY_SNAP_MANIFEST" "$workdir" new-snap)" \
       || die "could not resolve the new generation's snap manifest"
+    if [ -n "${OPT_SNAP_OBSERVED:-}" ]; then
+      snap_obs_json="$OPT_SNAP_OBSERVED"
+    else
+      snap_obs_json="$workdir/snap-obs-synth.json"
+      snap_synthesize_observed "$snap_old_json" "$snap_obs_json"
+    fi
+
+    DOM_SNAP_PLAN="$workdir/snap-plan.json"
+    "$bindir/ubx-snap" plan --old-manifest "$snap_old_json" --new-manifest "$DOM_NEW_SNAP_JSON" \
+      --observed-manifest "$snap_obs_json" --out "$DOM_SNAP_PLAN" \
+      || die "ubx-snap plan refused (see its stderr above)"
+    DOM_SNAP_TOUCH="$(summarize_snap_plan "$DOM_SNAP_PLAN")"
   else
+    DOM_SNAP_PLAN=""
+    DOM_SNAP_TOUCH=0
     DOM_NEW_SNAP_JSON=""
   fi
 }
@@ -481,21 +563,36 @@ report_domains() {
   else
     echo "users: $DOM_USERS_TOUCH action(s) touched ($DOM_USERS_DRIFT drift)"
   fi
+
+  # snap is reported LAST, after etc/systemd/users, keeping this file's
+  # documented FIXED domain order (see this section's own header comment,
+  # above) and the same append-at-the-end position the snap-purge sweep
+  # already established in execute_domains for issue #66.
+  if [ "$DOM_SNAP_SKIP" = 1 ]; then
+    echo "snap: nothing declared (no old or new snap manifest)"
+  elif [ "$verbose" = 1 ]; then
+    "$bindir/ubx-snap" report --plan "$DOM_SNAP_PLAN"
+  else
+    echo "snap: $DOM_SNAP_TOUCH action(s) touched"
+  fi
 }
 
 # execute_domains — attempts real activation for the domains that have a
 # real executor (see this file's header). Only ever called for
 # switch/test, never boot, and never in --dry-run mode.
 #
-# VERB (GitHub issue #66's snap-purge sweep only -- "" from bin/ubx's own
-# cmd_rollback, which deliberately never triggers a snap purge; see the
-# snap block below) selects bin/ubx-snap-purge's dry-run/apply mode:
-# `switch` honors the caller's own --apply/--dry-run exactly like
-# etc/systemd above; `test` NEVER passes --apply, even when APPLY=1 --
-# purging is destructive (it removes installed snap payloads) and `ubx
-# rebuild test` is meant to be safely re-tried/rolled back from (a plain
-# reboot already returns to the last-good generation, SPEC.md §4.3) without
-# first destroying anything undeclared on the live system.
+# VERB (the snap domain only -- both its plan+apply convergence, GitHub
+# issue #72, and its purge sweep, issue #66; "" from bin/ubx's own
+# cmd_rollback, which deliberately never triggers either; see the snap
+# block below) gates both bin/ubx-snap-apply's real invocation and
+# bin/ubx-snap-purge's dry-run/apply mode: `switch` honors the caller's own
+# --apply/--dry-run exactly like etc/systemd above; `test` NEVER really
+# applies either one, even when APPLY=1 -- both are potentially
+# irreversible live snapd mutations (installing/reverting a snap
+# revision; purging a payload) and `ubx rebuild test` is meant to be
+# safely re-tried/rolled back from (a plain reboot already returns to the
+# last-good generation, SPEC.md §4.3) without first mutating anything on
+# the live system.
 execute_domains() {
   local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4" etc_content_dir="$5" etc_dir="$6" verb="${7:-}"
 
@@ -534,6 +631,57 @@ execute_domains() {
   fi
 
   if [ "$DOM_SNAP_SKIP" = 0 ] && { [ "$verb" = switch ] || [ "$verb" = test ]; }; then
+    # -- snap plan+apply convergence (GitHub issue #72) --------------------
+    #
+    # Runs BEFORE the purge sweep just below: converge the DECLARED snaps
+    # first (install/refresh/revert/connect/config/hold), then sweep away
+    # whatever is left undeclared -- the same "converge what's wanted
+    # before removing what isn't" order etc/systemd/users already imply by
+    # running ahead of this whole snap block.
+    #
+    # Unlike bin/ubx-etc-apply/bin/ubx-systemd-apply, bin/ubx-snap-apply
+    # has no --apply/--dry-run flag of its own (see its own header/usage):
+    # every invocation mutates for real through the injectable UBX_SNAP_CMD
+    # seam. So the dry-run/apply gate lives entirely HERE, at the call
+    # site: dry-run means simply never invoking it at all (report_domains,
+    # called earlier in bin/ubx's do_rebuild/cmd_rollback, has already
+    # printed this plan, so nothing is lost by skipping the call).
+    #
+    # Safety posture mirrors the snap-purge sweep immediately below
+    # (per this issue's acceptance criteria, "honor the same safety
+    # posture the existing snap-purge block uses"): `switch --apply` is
+    # the only combination that ever calls ubx-snap-apply for real;
+    # `test` NEVER does, even when APPLY=1 -- ack/install/refresh/revert
+    # actions can be just as destructive/irreversible (installing a new
+    # snap revision, reverting one) as the purge sweep's own removals, and
+    # `ubx rebuild test` is meant to be safely re-tried/rolled back from
+    # (a plain reboot already returns to the last-good generation) without
+    # first mutating live snapd state.
+    if [ "$apply" = 1 ] && [ "$verb" = switch ]; then
+      # --payload-dir/--assert-dir SHOULD resolve to wherever the new
+      # generation's snap-domain manifest build actually placed the
+      # vendored .snap payloads and .snap-declaration assertions --
+      # bin/ubx-generations' reserved GEN_SNAP_MANIFEST field is exactly
+      # that location (see bin/ubx-snap-apply's own header, "Payload/
+      # assertion resolution", and docs/snap.md's "tracked gap"). That
+      # field is resolved to a manifest.json path above
+      # (ubx_rebuild_resolve_ref), but no on-device Nix composition wires
+      # a REAL directory tree of payloads/assertions alongside it yet
+      # (this file's own header, "on-device Nix evaluation/composition
+      # does not exist yet"). Rather than inventing new generation
+      # machinery to bridge that gap, this derives both directories from
+      # DOM_NEW_SNAP_JSON's own location -- exactly the same "alongside
+      # the resolved manifest" convention DOM_NEW_ETC_JSON/
+      # DOM_NEW_SYSTEMD_JSON's own content-dir defaults already use above
+      # -- and documents the assumption loudly here, as this project's own
+      # posture demands, rather than gloss over it.
+      local snap_dir
+      snap_dir="$(dirname "$DOM_NEW_SNAP_JSON")"
+      "$bindir/ubx-snap-apply" --plan "$DOM_SNAP_PLAN" --payload-dir "$snap_dir" --assert-dir "$snap_dir"
+    else
+      echo "snap: dry-run only -- ubx-snap-apply not invoked (pass --apply under 'rebuild switch' to converge snapd for real; 'ubx rebuild test' never mutates snapd, mirroring the snap-purge sweep's own safety posture below)"
+    fi
+
     local snap_purge_args=("$bindir/ubx-snap-purge" --manifest "$DOM_NEW_SNAP_JSON")
     if [ "$apply" = 1 ] && [ "$verb" = switch ]; then
       snap_purge_args+=(--apply)
@@ -583,6 +731,12 @@ manifest already matches reality — i.e. no drift; override to plan
 against a real, observed system instead):
   --etc-observed FILE --etc-exceptions FILE
   --systemd-observed FILE
+  --snap-observed FILE    (default: synthesized from the OLD generation's
+                          own declared snap manifest, assuming it is
+                          already fully converged -- see
+                          snap_synthesize_observed's own comment in this
+                          file for why this is a straight copy rather than
+                          a real 'ubx-snap observe' call)
   --passwd FILE --group FILE --shadow FILE (default /etc/{passwd,group,shadow})
   --users-exceptions FILE --home-state FILE
 
@@ -593,10 +747,13 @@ Execution options:
                            only; registers NO generation, writes NO GRUB
                            default, executes nothing (needs no root)
   --apply                  attempt real activation where an executor
-                           exists (bin/ubx-etc-apply, bin/ubx-systemd-apply;
-                           the latter requires systemctl on PATH — see its
-                           own --help). Default without --apply: dry-run
-                           print.
+                           exists (bin/ubx-etc-apply, bin/ubx-systemd-apply,
+                           bin/ubx-snap-apply; the systemd one requires
+                           systemctl on PATH — see its own --help). 'test'
+                           never really applies bin/ubx-snap-apply/
+                           ubx-snap-purge even when given (see
+                           execute_domains' own header). Default without
+                           --apply: dry-run print.
   --systemd-unit-dir DIR   (default /etc/systemd/system)
   --systemd-content-dir DIR (default: alongside the new systemd manifest)
   --etc-dir DIR             the real (or, for tests, temp) /etc root
@@ -618,7 +775,7 @@ do_rebuild() {
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
   local etc_dir="/etc" etc_content_dir=""
   local apply=0 dry_run=0
-  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
 
   while [ $# -gt 0 ]; do
@@ -637,6 +794,7 @@ do_rebuild() {
       --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -826,6 +984,9 @@ is no longer retained under the given/default retention policy is refused
                          (see 'ubx rebuild --help')
   --etc-observed FILE --etc-exceptions FILE
   --systemd-observed FILE
+  --snap-observed FILE    (default: synthesized from the booted generation's
+                          own declared snap manifest — see 'ubx rebuild
+                          --help')
   --passwd FILE --group FILE --shadow FILE (default /etc/{passwd,group,shadow})
   --users-exceptions FILE --home-state FILE
   --systemd-unit-dir DIR --systemd-content-dir DIR --users-out FILE
@@ -837,7 +998,7 @@ cmd_rollback() {
   local root="" retain=5 apply=0 dry_run=0 target_arg=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
   local etc_dir="/etc" etc_content_dir=""
-  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
 
   while [ $# -gt 0 ]; do
@@ -847,6 +1008,7 @@ cmd_rollback() {
       --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -982,6 +1144,7 @@ aware diff instead.
   --root DIR
   --etc-observed FILE --etc-exceptions FILE
   --systemd-observed FILE
+  --snap-observed FILE
   --passwd FILE --group FILE --shadow FILE
   --users-exceptions FILE --home-state FILE
 USAGE
@@ -989,7 +1152,7 @@ USAGE
 
 cmd_diff() {
   local root=""
-  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED=""
+  OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
   local -a pos=()
 
@@ -999,6 +1162,7 @@ cmd_diff() {
       --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
+      --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;

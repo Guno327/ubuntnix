@@ -1166,6 +1166,55 @@ let
     authorizedKeys = [ ];
   };
 
+  # -- M4 password-login fixture (GitHub issue #90/#80; SPEC.md §6, §8.1,
+  #    §11 M4 exit criterion "password login from a secret-sourced hash
+  #    works end-to-end") --------------------------------------------------
+  #
+  # A clearly-fake, non-production fixture: `switchLoopPwPlaintext` is a
+  # made-up string that exists ONLY in this proof (never a real
+  # credential), and `switchLoopPwHash` is the real glibc crypt(3) SHA-512
+  # hash of that exact plaintext (computed once, offline, with Python's
+  # own `crypt` module -- the same module the guest driver below uses to
+  # RE-derive and check it; nothing about generating this literal string
+  # needs to happen inside the Nix sandbox, exactly like
+  # switchLoopEtcHelloV2Content's own baked fixture bytes above).
+  switchLoopPwPlaintext = "ubxM4FixturePw1";
+  switchLoopPwHash = "$6$JTGhqtTMNCHHb/0Z$Z32aCjtVsmptBsTEECH1jEhdnZYfXvg1kHRwDC6GTN62ASyGOIj55V0Lln6QhBVXejMnH15EBbsQ3uh26/vTu.";
+  switchLoopPwUserName = "ubxm4pw";
+  switchLoopPwSecretName = "ubxm4pwSecret";
+
+  # bin/ubx-users' own manifest schema (see manifest_with_secret in
+  # tests/unit/106-ubx-users-password-secret.sh): the secret NAME only,
+  # never the hash itself -- the hash lives solely in the secrets-domain
+  # fixture file (switchLoopPwHash, staged under pw/secrets-src/<name> by
+  # switchLoopExtraFilesScript below), materialized to /run/secrets/<name>
+  # by the REAL secrets domain at guest boot time.
+  switchLoopPwUsersManifest = builtins.toJSON {
+    version = 1;
+    users = [
+      (switchLoopUsersEntry switchLoopPwUserName // { hashedPasswordSecret = switchLoopPwSecretName; })
+    ];
+    groups = [ ];
+  };
+
+  # nix/secrets.nix's own per-generation manifest shape (see
+  # tests/unit/162-ubx-secrets-plan-materialize.sh): the default `dst`
+  # (bare /run/secrets/<name>, tmpfs, no custom symlink) is exactly what
+  # bin/ubx-users' apply-passwords reads back out of `--run-secrets-dir`.
+  switchLoopPwSecretsManifest = builtins.toJSON {
+    version = 1;
+    secrets = [
+      {
+        name = switchLoopPwSecretName;
+        owner = "root";
+        group = "root";
+        mode = "0400";
+        dst = "/run/secrets/${switchLoopPwSecretName}";
+        environmentVariable = null;
+      }
+    ];
+  };
+
   # -- the four generations' domain manifests (gen1's are also the "real,
   #    baked baseline" this image boots with; gen2/gen3/gen4's are read-
   #    only fixtures the guest driver feeds to real `ubx rebuild` calls --
@@ -1393,6 +1442,25 @@ let
     ${switchLoopEtcTestMarkerContent}
     UBX_M2_ETC_EOF
 
+    # -- (3b) the M4 password-login fixture (GitHub issue #90/#80) -------
+    #
+    # `secrets-src/<name>` holds the REAL glibc crypt(3) hash bytes
+    # `bin/ubx-secrets-apply --secrets-dir` materializes to
+    # `/run/secrets/<name>` (mirroring `--secrets-dir`'s own
+    # "DIR/<name>" convention, bin/ubx-secrets-apply's header) -- the
+    # guest driver never bakes/derives a hash itself, exactly like every
+    # other domain here only ever converges pre-baked fixture bytes.
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/usr/local/share/ubx-switch-loop/pw/secrets-src"
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/pw/users-manifest.json" <<'UBX_M4_JSON_EOF'
+    ${switchLoopPwUsersManifest}
+    UBX_M4_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/pw/secrets-manifest.json" <<'UBX_M4_JSON_EOF'
+    ${switchLoopPwSecretsManifest}
+    UBX_M4_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-switch-loop/pw/secrets-src/${switchLoopPwSecretName}" <<'UBX_M4_HASH_EOF'
+    ${switchLoopPwHash}
+    UBX_M4_HASH_EOF
+
     # -- (4) the soft-reboot stub (see this section's own header) --------
     ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-soft-reboot-stub" <<'UBX_M2_SCRIPT_EOF'
     #!/bin/sh
@@ -1521,6 +1589,41 @@ let
       done
 
       echo "----- END mark_fail diagnostics -----"
+      sync
+      systemctl poweroff
+      exit 0
+    }
+
+    # mark_fail_pw REASON -- the M4 password-login scenario's own sibling
+    # of mark_fail above (GitHub issue #90): a fixed "PW" marker (per this
+    # issue's own contract, UBX-M4-PW-FAIL, not the UBX-M2-Sn family
+    # mark_fail emits) with the identical diagnostics-dump-then-poweroff
+    # body, duplicated here (rather than generalizing mark_fail's own
+    # hardcoded "UBX-M2-" prefix) exactly the way this file's other
+    # driver scripts (see softRebootDriverScript, snapConvergeDriverScript
+    # below) each already carry their own independent copy of this same
+    # pattern.
+    mark_fail_pw() { # REASON
+      echo "UBX-M4-PW-FAIL: $1"
+      echo "----- BEGIN mark_fail_pw diagnostics -----"
+      referenced_log="$(printf '%s\n' "$1" | grep -o '[^ ]*\.log' | tail -n 1)"
+      if [ -n "$referenced_log" ] && [ -f "$referenced_log" ]; then
+        echo "----- BEGIN $referenced_log -----"
+        tail -n 200 "$referenced_log"
+        echo "----- END $referenced_log -----"
+      elif [ -n "$referenced_log" ]; then
+        echo "(referenced log $referenced_log not found)"
+      fi
+      echo "----- BEGIN ls -la $STATE -----"
+      ls -la "$STATE" 2> /dev/null
+      echo "----- END ls -la $STATE -----"
+      for f in "$STATE"/*.log; do
+        [ -f "$f" ] || continue
+        echo "----- BEGIN $f -----"
+        tail -n 200 "$f"
+        echo "----- END $f -----"
+      done
+      echo "----- END mark_fail_pw diagnostics -----"
       sync
       systemctl poweroff
       exit 0
@@ -1784,6 +1887,92 @@ let
         [ "$(cat "$ROOT/booted" 2>/dev/null)" = "2" ] || mark_fail S4 "booted marker did not survive the reboot"
         [ "$(cat "$ROOT/grub-default" 2>/dev/null)" = "2" ] || mark_fail S4 "grub-default did not survive the reboot"
         echo "UBX-M2-S4-PASS"
+
+        # ===== M4: hashedPasswordSecret login proof (GitHub issue #90) ===
+        #
+        # Runs here, after every M2 scenario above has finished asserting,
+        # deliberately -- a real `ubx rebuild switch --apply` call below
+        # moves `current`/`grub-default`, which would corrupt S2/S3/S4's
+        # own hardcoded generation-number assertions if run any earlier in
+        # this driver (see this file's switch-loop-proof section header).
+        # Nothing downstream of this point reads either value again.
+        #
+        # Two real switches, mirroring what a real machine does the FIRST
+        # time it declares a brand-new hashedPasswordSecret user (see
+        # bin/ubx's own execute_domains, "password hashes" comment): the
+        # FIRST call creates the account (`ubx-users execute` only ever
+        # EMITS an activation script; `apply-passwords` cannot set a
+        # password for an account not yet present in --shadow -- a clear,
+        # expected error at this point, not a bug) -- this driver runs
+        # that emitted script for real, exactly like scenario 1's own
+        # gen2-users-activate.sh pattern, so the account genuinely exists.
+        # The SECOND call, against the identical users/secrets manifests,
+        # converges the password for real: the secrets domain
+        # materializes the fixture hash to /run/secrets/<name> BEFORE the
+        # users domain's apply-passwords step reads it back out (GitHub
+        # issue #80's own ordering requirement -- execute_domains' own
+        # "secrets" block runs before its own "users" block).
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$gen1_rootfs_image" --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
+          --root-device /dev/vda2 \
+          --users-manifest "$ASSETS/pw/users-manifest.json" \
+          --secrets-manifest "$ASSETS/pw/secrets-manifest.json" \
+          --secrets-dir "$ASSETS/pw/secrets-src" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --users-out "$STATE/pw-users-activate.sh" \
+          > "$STATE/m4-create.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail_pw "first 'ubx rebuild switch' (account creation) exited $rc -- see $STATE/m4-create.log"
+        bash "$STATE/pw-users-activate.sh" >> "$STATE/m4-create.log" 2>&1
+        getent passwd "${switchLoopPwUserName}" > /dev/null 2>&1 \
+          || mark_fail_pw "declared hashedPasswordSecret user ${switchLoopPwUserName} is not present after running its activation script -- see $STATE/m4-create.log"
+
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$gen1_rootfs_image" --kernel "$gen1_kernel" --initrd "$gen1_initrd" \
+          --root-device /dev/vda2 \
+          --users-manifest "$ASSETS/pw/users-manifest.json" \
+          --secrets-manifest "$ASSETS/pw/secrets-manifest.json" \
+          --secrets-dir "$ASSETS/pw/secrets-src" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --users-out "$STATE/pw-users-activate-2.sh" \
+          > "$STATE/m4-password.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail_pw "second 'ubx rebuild switch' (password convergence) exited $rc -- see $STATE/m4-password.log"
+
+        [ -f "/run/secrets/${switchLoopPwSecretName}" ] \
+          || mark_fail_pw "the secrets domain did not materialize /run/secrets/${switchLoopPwSecretName} before the users domain converged -- see $STATE/m4-password.log"
+
+        shadow_hash="$(awk -F: -v u="${switchLoopPwUserName}" '$1==u{print $2}' /etc/shadow)"
+        [ -n "$shadow_hash" ] || mark_fail_pw "${switchLoopPwUserName} has no /etc/shadow hash field after apply-passwords -- see $STATE/m4-password.log"
+        case "$shadow_hash" in
+          '$6$'*) ;;
+          *) mark_fail_pw "${switchLoopPwUserName}'s shadow hash does not look like a real crypt(3) SHA-512 hash: $shadow_hash" ;;
+        esac
+
+        # -- the real login check: feed the KNOWN fixture plaintext
+        # through the same glibc crypt(3) machinery a real PAM/`su` login
+        # would use (Python's own `crypt` module -- already required on
+        # this image, bin/ubx-users' own shebang is python3) and assert
+        # it reproduces the EXACT hash that landed in /etc/shadow -- i.e.
+        # the plaintext really does authenticate against the
+        # secret-sourced hash the secrets+users domains just converged,
+        # never a scripted stand-in that only checks byte equality
+        # against a value this driver already knows in advance.
+        m4_login_rc=0
+        UBX_M4_STORED_HASH="$shadow_hash" python3 <<'UBX_M4_LOGIN_PY_EOF' || m4_login_rc=$?
+import crypt
+import os
+import sys
+
+plaintext = "${switchLoopPwPlaintext}"
+stored_hash = os.environ["UBX_M4_STORED_HASH"]
+computed = crypt.crypt(plaintext, stored_hash)
+sys.exit(0 if computed == stored_hash else 1)
+UBX_M4_LOGIN_PY_EOF
+        [ "$m4_login_rc" -eq 0 ] \
+          || mark_fail_pw "the known fixture plaintext does not authenticate (crypt(3)) against ${switchLoopPwUserName}'s shadow hash -- login would fail"
+        echo "UBX-M4-PW-PASS"
+
         advance 3
         sync
         systemctl poweroff

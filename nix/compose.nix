@@ -785,7 +785,38 @@ let
           debconf-set-selections /.ubx-compose/preseed.selections
         fi
 
+        # GitHub issue #48 follow-on -- setuid maintainer-script helpers.
+        # Some postinsts (e.g. dhcpcd-base -> adduser) exec the setuid helper
+        # `chfn` (and `chsh`) to set a system user's GECOS/shell. A setuid
+        # binary cannot be exec'd under this fakeroot + single-id
+        # `unshare --user` sandbox -- the kernel returns EACCES on the execve
+        # -- so `dpkg --configure -a` aborts in that postinst (CI:
+        # `Cannot exec /bin/chfn: Permission denied`, dhcpcd-base postinst
+        # exit 82). Neutralize just those two helpers to /bin/true for the
+        # configure pass, then restore the real binaries so the SHIPPED image
+        # is unchanged: a system user's GECOS/shell is cosmetic, and the mv
+        # back preserves each file's inode so its faked root:root ownership
+        # (recorded in the fakeroot db by dev/inode) still applies. Fully
+        # self-contained -- touches no dpkg state and is reversed before the
+        # rootfs is packed, so R1 determinism is preserved.
+        ubx_setuid_saved=/.ubx-compose/.setuid-helpers-saved
+        mkdir -p "$ubx_setuid_saved"
+        for ubx_h in chfn chsh; do
+          if [ -f "/usr/bin/$ubx_h" ] && [ ! -L "/usr/bin/$ubx_h" ]; then
+            mv "/usr/bin/$ubx_h" "$ubx_setuid_saved/$ubx_h"
+            ln -s /bin/true "/usr/bin/$ubx_h"
+          fi
+        done
+
         dpkg --configure -a
+
+        for ubx_h in chfn chsh; do
+          if [ -e "$ubx_setuid_saved/$ubx_h" ]; then
+            rm -f "/usr/bin/$ubx_h"
+            mv "$ubx_setuid_saved/$ubx_h" "/usr/bin/$ubx_h"
+          fi
+        done
+        rm -rf "$ubx_setuid_saved"
 
         # R1 determinism (issue #22): canonical final `ldconfig`
         # regeneration. libc6's own postinst/triggers already invoke

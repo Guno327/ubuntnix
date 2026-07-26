@@ -220,6 +220,30 @@ fi
 [ "$(grep -cE '^ *export FAKEROOTDONTTRYCHOWN=1' "$compose_nix")" -ge 2 ] ||
   fail "$compose_nix does not 'export FAKEROOTDONTTRYCHOWN=1' in BOTH the compose and pack fakeroot blocks (issue #48: the real chown to an unmapped gid EINVALs under unshare --user, which libfakeroot does not swallow)"
 
+#   (5) configure.sh neutralizes the setuid chfn/chsh helpers to /bin/true
+#       for the `dpkg --configure -a` pass and restores them afterwards. A
+#       setuid binary EACCESes on execve under fakeroot + unshare --user, so
+#       a postinst that runs adduser with a GECOS (e.g. dhcpcd-base) would
+#       otherwise abort configure. Assert both the neutralize and the restore
+#       exist and bracket the configure call (never ship /bin/true in place
+#       of the real helpers).
+# shellcheck disable=SC2016 # literal configure.sh source text, not an expansion here
+neutralize_line=$(grep -n 'ln -s /bin/true "/usr/bin/$ubx_h"' "$configure_sh" | head -1 | cut -d: -f1)
+[ -n "$neutralize_line" ] ||
+  fail "configure.sh does not neutralize the setuid chfn/chsh helpers to /bin/true before dpkg --configure -a (issue #48: a setuid binary EACCESes on execve under fakeroot + unshare --user, aborting e.g. dhcpcd-base's postinst)"
+# shellcheck disable=SC2016 # literal configure.sh source text, not an expansion here
+restore_line=$(grep -n 'mv "$ubx_setuid_saved/$ubx_h" "/usr/bin/$ubx_h"' "$configure_sh" | head -1 | cut -d: -f1)
+[ -n "$restore_line" ] ||
+  fail "configure.sh neutralizes chfn/chsh but never restores them -- the shipped image would carry /bin/true in place of the real setuid helpers"
+if [ -n "$neutralize_line" ] && [ -n "$configure_a_line" ]; then
+  [ "$neutralize_line" -lt "$configure_a_line" ] ||
+    fail "the setuid-helper neutralization (line $neutralize_line) must come BEFORE dpkg --configure -a (line $configure_a_line)"
+fi
+if [ -n "$restore_line" ] && [ -n "$configure_a_line" ]; then
+  [ "$restore_line" -gt "$configure_a_line" ] ||
+    fail "the setuid-helper restore (line $restore_line) must come AFTER dpkg --configure -a (line $configure_a_line)"
+fi
+
 # -- squashfsImage packs with no -pf/pseudo-file mechanism, and loads a
 # fakeroot database back via -i --------------------------------------------
 #

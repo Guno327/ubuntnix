@@ -139,25 +139,30 @@ ubx_rebuild_write_sidecar() {
   mv -f "$tmp" "$dir/ubx-extra"
 }
 
-# ubx_rebuild_domain_refs ROOT GEN — prints three TAB-separated fields:
-# ETC_REF<TAB>SYSTEMD_REF<TAB>USERS_REF for generation GEN under ROOT. GEN
-# may be "" (no generation, e.g. the very first switch ever) — in that case
-# every field is "" ("nothing declared"), which is exactly how an existing
-# generation with legally-empty fields reads too (bin/ubx-generations'
-# header: "present as fields, legally empty today").
+# ubx_rebuild_domain_refs ROOT GEN — prints four TAB-separated fields:
+# ETC_REF<TAB>SYSTEMD_REF<TAB>USERS_REF<TAB>SNAP_REF for generation GEN
+# under ROOT. GEN may be "" (no generation, e.g. the very first switch
+# ever) — in that case every field is "" ("nothing declared"), which is
+# exactly how an existing generation with legally-empty fields reads too
+# (bin/ubx-generations' header: "present as fields, legally empty today").
+# SNAP_REF (GitHub issue #66) is read directly off the generation's own
+# manifest -- GEN_SNAP_MANIFEST, unlike GEN_SYSTEMD_REF, is already a real
+# bin/ubx-generations manifest field (see that script's header), so it
+# needs no sidecar of its own.
 ubx_rebuild_domain_refs() {
   local root="$1" gen="$2" mf sidecar
   if [ -z "$gen" ]; then
-    printf '\t\t\n'
+    printf '\t\t\t\n'
     return 0
   fi
   mf="$root/$gen/manifest"
   sidecar="$(ubx_rebuild_sidecar_path "$root" "$gen")"
-  local etc_ref users_ref systemd_ref
+  local etc_ref users_ref systemd_ref snap_ref
   etc_ref="$(ubx_rebuild_manifest_get "$mf" GEN_ETC_REF)"
   users_ref="$(ubx_rebuild_manifest_get "$mf" GEN_USERS_MANIFEST)"
   systemd_ref="$(ubx_rebuild_manifest_get "$sidecar" SYSTEMD_MANIFEST)"
-  printf '%s\t%s\t%s\n' "$etc_ref" "$systemd_ref" "$users_ref"
+  snap_ref="$(ubx_rebuild_manifest_get "$mf" GEN_SNAP_MANIFEST)"
+  printf '%s\t%s\t%s\t%s\n' "$etc_ref" "$systemd_ref" "$users_ref" "$snap_ref"
 }
 
 # ubx_rebuild_resolve_ref REF DEFAULT_CONTENT WORKDIR NAME — resolves a
@@ -196,6 +201,7 @@ ubx_rebuild_resolve_ref() {
 UBX_REBUILD_EMPTY_ETC_MANIFEST='{"version": 1, "entries": []}'
 UBX_REBUILD_EMPTY_SYSTEMD_MANIFEST='{"version": 1, "units": []}'
 UBX_REBUILD_EMPTY_USERS_MANIFEST='{"version": 1, "users": [], "groups": []}'
+UBX_REBUILD_EMPTY_SNAP_MANIFEST='{"version": 1, "snaps": []}'
 
 # -- GRUB default marker ------------------------------------------------------
 #

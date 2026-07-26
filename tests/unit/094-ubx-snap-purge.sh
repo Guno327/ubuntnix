@@ -79,12 +79,15 @@ run() {
 
 # -- undeclared purge, declared spared, base-snap spared (dry-run) ----------
 #
-# Manifest shape is issue #60's: a JSON object keyed by snap name, each
-# entry carrying channel/revision, classic, connections, config -- this
-# script reads only the top-level keys (see bin/ubx-snap-purge's header).
+# Manifest shape is issue #60's REAL shape: a JSON object with a top-level
+# "snaps" array, each entry carrying "name" plus channel/revision, classic,
+# connections, config -- this script reads only each entry's "name" (see
+# bin/ubx-snap-purge's header).
 
 cat > "$manifest" <<'EOF'
-{"firefox": {"channel": "stable/latest", "revision": "789", "classic": false, "connections": [], "config": {}}}
+{"version": 1, "snaps": [
+  {"name": "firefox", "channel": "stable/latest", "revision": 789, "classic": false, "connections": [], "config": {}}
+]}
 EOF
 
 run --dry-run
@@ -123,8 +126,11 @@ esac
 
 cat > "$manifest" <<'EOF'
 {
-  "firefox": {"channel": "stable", "revision": "789", "classic": false, "connections": [], "config": {}},
-  "htop-snap": {"channel": "stable", "revision": "12", "classic": false, "connections": [], "config": {}}
+  "version": 1,
+  "snaps": [
+    {"name": "firefox", "channel": "stable", "revision": 789, "classic": false, "connections": [], "config": {}},
+    {"name": "htop-snap", "channel": "stable", "revision": 12, "classic": false, "connections": [], "config": {}}
+  ]
 }
 EOF
 run --dry-run
@@ -136,7 +142,7 @@ esac
 # -- empty declared manifest: only the protected base snaps survive ---------
 
 cat > "$manifest" <<'EOF'
-{}
+{"version": 1, "snaps": []}
 EOF
 run --dry-run
 [ "$rc" -eq 0 ] || fail "empty manifest: expected exit 0, got $rc (err: $err)"
@@ -157,7 +163,7 @@ cat > "$manifest" <<'EOF'
 ["firefox", "htop-snap"]
 EOF
 run --dry-run
-[ "$rc" -ne 0 ] || fail "malformed manifest (bare array, not an object keyed by name): expected nonzero exit, got 0"
+[ "$rc" -ne 0 ] || fail "malformed manifest (bare array, not an object with a 'snaps' array): expected nonzero exit, got 0"
 [ -z "$purged" ] || fail "malformed manifest: must not purge anything, got: $purged"
 
 cat > "$manifest" <<'EOF'
@@ -167,10 +173,22 @@ run --dry-run
 [ "$rc" -ne 0 ] || fail "malformed manifest (bare scalar): expected nonzero exit, got 0"
 
 cat > "$manifest" <<'EOF'
-{"": {"channel": "stable"}}
+{"version": 1}
 EOF
 run --dry-run
-[ "$rc" -ne 0 ] || fail "malformed manifest (empty-string snap name key): expected nonzero exit, got 0"
+[ "$rc" -ne 0 ] || fail "malformed manifest (object with no top-level 'snaps' array): expected nonzero exit, got 0"
+
+cat > "$manifest" <<'EOF'
+{"version": 1, "snaps": [{"channel": "stable"}]}
+EOF
+run --dry-run
+[ "$rc" -ne 0 ] || fail "malformed manifest ('snaps' entry missing 'name'): expected nonzero exit, got 0"
+
+cat > "$manifest" <<'EOF'
+{"version": 1, "snaps": [{"name": "", "channel": "stable"}]}
+EOF
+run --dry-run
+[ "$rc" -ne 0 ] || fail "malformed manifest ('snaps' entry with empty-string 'name'): expected nonzero exit, got 0"
 
 # -- missing --manifest / missing file ---------------------------------------
 
@@ -187,7 +205,7 @@ rc=$?
 # -- UBX_SNAP_DECLARED_MANIFEST env var fallback -----------------------------
 
 cat > "$manifest" <<'EOF'
-{"firefox": {"channel": "stable"}, "htop-snap": {"channel": "stable"}}
+{"version": 1, "snaps": [{"name": "firefox", "channel": "stable"}, {"name": "htop-snap", "channel": "stable"}]}
 EOF
 out="$(UBX_SNAP_BIN="$stub" STUB_LIST_OUTPUT="$list_output" STUB_PURGE_RECORD="$purge_record" \
   UBX_SNAP_DECLARED_MANIFEST="$manifest" "$tool" --dry-run 2>/dev/null)"
@@ -199,7 +217,7 @@ rc=$?
 # not silently swallowed -----------------------------------------------------
 
 cat > "$manifest" <<'EOF'
-{"firefox": {"channel": "stable"}}
+{"version": 1, "snaps": [{"name": "firefox", "channel": "stable"}]}
 EOF
 rm -f "$purge_record"
 out="$(UBX_SNAP_BIN="$stub" STUB_LIST_OUTPUT="$list_output" STUB_PURGE_RECORD="$purge_record" \

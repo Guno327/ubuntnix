@@ -559,8 +559,11 @@ let
         # the manpages, `-sysv` picks the always-shipped default frontend,
         # and `-L` on the library lets `-type f` follow the
         # `libfakeroot-sysv.so -> libfakeroot-0.so` symlink to a real file.
-        # (Fix for CI run 30199370520: found fakeroot='' + a manpage for
-        # faked + libfakeroot=''.)
+        # (Fix for CI run 30199370520, where the old bare-name find returned
+        # an empty fakeroot path, a manpage for faked, and an empty library
+        # path. NB: no adjacent single-quote pair may appear in this comment
+        # -- it lives inside a Nix indented-string, where that pair would
+        # terminate the string.)
         if [ -z "''${FAKEROOTKEY:-}" ]; then
           ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
           ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"

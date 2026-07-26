@@ -299,6 +299,96 @@ with open(out_path, "w", encoding="utf-8") as f:
 PYEOF
 }
 
+# summarize_secrets_plan PLAN_JSON — prints the total actionable-action
+# count across materialize/env/symlink (bin/ubx-secrets' own plan schema).
+summarize_secrets_plan() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+n = (
+    len(p["materialize"]["create"]) + len(p["materialize"]["update"]) + len(p["materialize"]["remove"])
+    + len(p["env"]["create"]) + len(p["env"]["update"]) + len(p["env"]["remove"])
+    + len(p["symlink"]["create"])
+)
+print(n)
+PYEOF
+}
+
+# secrets_plan_report PLAN_JSON — a human-readable render of a secrets plan
+# (bin/ubx-secrets has no `report` subcommand of its own, unlike
+# bin/ubx-systemd/bin/ubx-snap — mirrors bin/ubx's own `users_plan_report`
+# for the same reason: kept local to bin/ubx since nothing else needs it).
+secrets_plan_report() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+lines = []
+for e in p["materialize"]["create"]:
+    lines.append(f"materialize (create): {e['name']} -> {e['dst']}")
+for e in p["materialize"]["update"]:
+    lines.append(f"materialize (update): {e['name']} ({', '.join(sorted(e['changes']))})")
+for e in p["materialize"]["remove"]:
+    lines.append(f"materialize (remove): {e['name']}")
+for e in p["env"]["create"]:
+    lines.append(f"env (create): {e['name']}.env ({e['environmentVariable']})")
+for e in p["env"]["update"]:
+    lines.append(f"env (update): {e['name']}.env")
+for e in p["env"]["remove"]:
+    lines.append(f"env (remove): {e['name']}.env")
+for e in p["symlink"]["create"]:
+    lines.append(f"symlink: {e['path']} -> {e['target']}")
+
+if not lines:
+    print("secrets: nothing to do (fully converged)")
+else:
+    print(f"secrets: {len(lines)} action(s) planned:")
+    for line in lines:
+        print(f"  - {line}")
+PYEOF
+}
+
+# secrets_synthesize_observed OLD_DECLARED_JSON OUT_JSON — the secrets
+# domain's "assume no drift" default observed-state manifest, derived FROM
+# the old generation's own DECLARED manifest — exactly
+# systemd_synthesize_observed/snap_synthesize_observed's own role (see
+# either one's comment for why this is the default absent a real
+# `--secrets-observed`/`ubx-secrets observe` call): a fully-converged
+# system running exactly the old declaration already has every secret's
+# canonical copy materialized with the declared owner/group/mode, its env
+# file rendered (when declared), and its custom-dst symlink (when
+# declared) already pointing at the canonical copy.
+secrets_synthesize_observed() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+old_path, out_path = sys.argv[1:3]
+with open(old_path, encoding="utf-8") as f:
+    old = json.load(f)
+
+entries = []
+for s in old.get("secrets", []):
+    name = s["name"]
+    canon = f"/run/secrets/{name}"
+    entries.append({
+        "name": name,
+        "owner": s["owner"],
+        "group": s["group"],
+        "mode": s["mode"],
+        "envVar": s.get("environmentVariable"),
+        "symlinkTarget": canon if s.get("dst") and s["dst"] != canon else None,
+    })
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "entries": entries}, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
 # summarize_users_plan PLAN_JSON — prints "ACTIONABLE<TAB>DRIFT<TAB>ERRORS".
 summarize_users_plan() {
   python3 - "$1" <<'PYEOF'
@@ -353,10 +443,11 @@ PYEOF
 }
 
 # ubx_domain_refs_split PREFIX < <(ubx_rebuild_domain_refs ROOT GEN) — reads
-# ONE tab-separated "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP\n" line from stdin
-# (ubx_rebuild_domain_refs' own output shape, bin/ubx-rebuild-lib) and
-# assigns DOM_<PREFIX>ETC_REF / DOM_<PREFIX>SYSTEMD_REF / DOM_<PREFIX>USERS_REF
-# / DOM_<PREFIX>SNAP_REF (PREFIX is "OLD_" or "NEW_" at every call site below).
+# ONE tab-separated "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP<TAB>SECRETS\n" line
+# from stdin (ubx_rebuild_domain_refs' own output shape, bin/ubx-rebuild-lib)
+# and assigns DOM_<PREFIX>ETC_REF / DOM_<PREFIX>SYSTEMD_REF /
+# DOM_<PREFIX>USERS_REF / DOM_<PREFIX>SNAP_REF / DOM_<PREFIX>SECRETS_REF
+# (PREFIX is "OLD_" or "NEW_" at every call site below).
 #
 # NOT a plain `IFS=$'\t' read -r a b c d` (every call site here used to be
 # exactly that, until GitHub issue #64's M3 snap-convergence e2e caught the
@@ -388,6 +479,7 @@ ubx_domain_refs_split() {
   printf -v "DOM_${prefix}SYSTEMD_REF" '%s' "${fields[1]:-}"
   printf -v "DOM_${prefix}USERS_REF" '%s' "${fields[2]:-}"
   printf -v "DOM_${prefix}SNAP_REF" '%s' "${fields[3]:-}"
+  printf -v "DOM_${prefix}SECRETS_REF" '%s' "${fields[4]:-}"
 }
 
 # -- plan_domains: computes (never executes) the three domain plans -------
@@ -560,6 +652,44 @@ plan_domains() {
     DOM_SNAP_TOUCH=0
     DOM_NEW_SNAP_JSON=""
   fi
+
+  # -- secrets (GitHub issue #78, milestone M4) ---------------------------
+  #
+  # SPEC.md §4.3's own switching-table row for this domain is "none"
+  # downtime -- exactly etc/systemd/users' own posture, so this block
+  # mirrors their plan_domains shape (old/new declared manifest + an
+  # observed-state default synthesized from the OLD declared manifest,
+  # overridable via --secrets-observed) rather than snap's own
+  # plan+separate-purge-sweep shape (there is no secrets-purge sweep: an
+  # undeclared canonical copy is already `materialize.remove`, computed by
+  # bin/ubx-secrets' own planner -- see that script's header, "What counts
+  # as managed").
+  DOM_SECRETS_SKIP=0
+  if [ -z "$DOM_OLD_SECRETS_REF" ] && [ -z "$DOM_NEW_SECRETS_REF" ]; then
+    DOM_SECRETS_SKIP=1
+  fi
+  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
+    local secrets_old_json secrets_obs_json
+    secrets_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" old-secrets)" \
+      || die "could not resolve the old generation's secrets manifest"
+    DOM_NEW_SECRETS_JSON="$(ubx_rebuild_resolve_ref "$DOM_NEW_SECRETS_REF" "$UBX_REBUILD_EMPTY_SECRETS_MANIFEST" "$workdir" new-secrets)" \
+      || die "could not resolve the new generation's secrets manifest"
+    if [ -n "${OPT_SECRETS_OBSERVED:-}" ]; then
+      secrets_obs_json="$OPT_SECRETS_OBSERVED"
+    else
+      secrets_obs_json="$workdir/secrets-obs-synth.json"
+      secrets_synthesize_observed "$secrets_old_json" "$secrets_obs_json"
+    fi
+
+    DOM_SECRETS_PLAN="$workdir/secrets-plan.json"
+    "$bindir/ubx-secrets" plan --manifest "$DOM_NEW_SECRETS_JSON" --observed "$secrets_obs_json" --out "$DOM_SECRETS_PLAN" \
+      || die "ubx-secrets plan refused (see its stderr above)"
+    DOM_SECRETS_TOUCH="$(summarize_secrets_plan "$DOM_SECRETS_PLAN")"
+  else
+    DOM_SECRETS_PLAN=""
+    DOM_SECRETS_TOUCH=0
+    DOM_NEW_SECRETS_JSON=""
+  fi
 }
 
 # report_domains VERBOSE — prints the deterministic touched-domains report
@@ -613,6 +743,17 @@ report_domains() {
   else
     echo "snap: $DOM_SNAP_TOUCH action(s) touched"
   fi
+
+  # secrets is reported LAST (GitHub issue #78), after snap -- this file's
+  # documented FIXED domain order (see this section's own header comment)
+  # simply appends each new domain at the end as it's added.
+  if [ "$DOM_SECRETS_SKIP" = 1 ]; then
+    echo "secrets: nothing declared (no old or new secrets manifest)"
+  elif [ "$verbose" = 1 ]; then
+    secrets_plan_report "$DOM_SECRETS_PLAN"
+  else
+    echo "secrets: $DOM_SECRETS_TOUCH action(s) touched"
+  fi
 }
 
 # execute_domains — attempts real activation for the domains that have a
@@ -633,6 +774,7 @@ report_domains() {
 # the live system.
 execute_domains() {
   local systemd_unit_dir="$1" systemd_content_dir="$2" apply="$3" users_out="$4" etc_content_dir="$5" etc_dir="$6" verb="${7:-}"
+  local secrets_dir="${8:-}" run_secrets_dir="${9:-/run/secrets}" secrets_mounts_file="${10:-}"
 
   if [ "$DOM_ETC_SKIP" = 0 ]; then
     local content_dir="$etc_content_dir"
@@ -728,6 +870,29 @@ execute_domains() {
     fi
     "${snap_purge_args[@]}"
   fi
+
+  # -- secrets (GitHub issue #78) ------------------------------------------
+  #
+  # "none" downtime, real executor exists (unlike bin/ubx-users' own
+  # execute, which only ever emits a script) -- gated exactly like
+  # bin/ubx-etc-apply/bin/ubx-systemd-apply above: --apply runs it for
+  # real under EITHER switch or test (materializing a secret to tmpfs is
+  # safe to retry/roll back from, unlike a snapd mutation or a purge --
+  # there is no snap-purge-style "test never really applies" carve-out
+  # here), --dry-run (the default) only prints.
+  if [ "$DOM_SECRETS_SKIP" = 0 ]; then
+    local secrets_apply_args=("$bindir/ubx-secrets-apply" --plan "$DOM_SECRETS_PLAN" --run-secrets-dir "$run_secrets_dir")
+    local real_secrets_dir="$secrets_dir"
+    [ -n "$real_secrets_dir" ] || real_secrets_dir="$(dirname "$DOM_NEW_SECRETS_JSON")"
+    secrets_apply_args+=(--secrets-dir "$real_secrets_dir")
+    [ -z "$secrets_mounts_file" ] || secrets_apply_args+=(--mounts-file "$secrets_mounts_file")
+    if [ "$apply" = 1 ]; then
+      secrets_apply_args+=(--apply)
+    else
+      secrets_apply_args+=(--dry-run)
+    fi
+    "${secrets_apply_args[@]}"
+  fi
 }
 
 # =====================================================================
@@ -799,6 +964,24 @@ Execution options:
   --etc-content-dir DIR     (default: alongside the new etc manifest)
   --users-out FILE          where to write the generated users activation
                             shell script (default: a temp file, printed)
+  --secrets-manifest PATH   new generation's declared secrets manifest
+                            (nix/secrets.nix's per-generation manifest,
+                            issue #78). Omitted entirely means "nothing
+                            declared for this domain", same as every other
+                            domain above.
+  --secrets-observed FILE   (default: synthesized from the OLD generation's
+                            own declared secrets manifest, assuming it is
+                            already fully converged -- see
+                            secrets_synthesize_observed's own comment)
+  --secrets-dir DIR         where bin/ubx-secrets-apply reads real secret
+                            material from, as DIR/<name> (default:
+                            alongside the new secrets manifest)
+  --run-secrets-dir DIR     the real (or, for tests, temp) canonical root
+                            bin/ubx-secrets-apply targets (default
+                            /run/secrets)
+  --secrets-mounts-file FILE the mount table bin/ubx-secrets-apply consults
+                            for its persistent-filesystem warning (default
+                            /proc/self/mounts)
 
 See SPEC.md §4.3, §4.5 for the full verb semantics.
 USAGE
@@ -809,12 +992,14 @@ do_rebuild() {
   shift
 
   local root="" title="" rootfs_image="" kernel="" initrd="" root_device="" kernel_params="" snap_manifest=""
-  local etc_ref="" systemd_ref="" users_manifest=""
+  local etc_ref="" systemd_ref="" users_manifest="" secrets_manifest=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
   local etc_dir="/etc" etc_content_dir=""
+  local secrets_dir="" run_secrets_dir="/run/secrets" secrets_mounts_file=""
   local apply=0 dry_run=0
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+  OPT_SECRETS_OBSERVED=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -829,10 +1014,12 @@ do_rebuild() {
       --etc-ref) [ $# -ge 2 ] || die "--etc-ref requires an argument"; etc_ref="$2"; shift 2 ;;
       --systemd-ref) [ $# -ge 2 ] || die "--systemd-ref requires an argument"; systemd_ref="$2"; shift 2 ;;
       --users-manifest) [ $# -ge 2 ] || die "--users-manifest requires an argument"; users_manifest="$2"; shift 2 ;;
+      --secrets-manifest) [ $# -ge 2 ] || die "--secrets-manifest requires an argument"; secrets_manifest="$2"; shift 2 ;;
       --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
       --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
+      --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -843,6 +1030,9 @@ do_rebuild() {
       --etc-dir) [ $# -ge 2 ] || die "--etc-dir requires an argument"; etc_dir="$2"; shift 2 ;;
       --etc-content-dir) [ $# -ge 2 ] || die "--etc-content-dir requires an argument"; etc_content_dir="$2"; shift 2 ;;
       --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
+      --secrets-dir) [ $# -ge 2 ] || die "--secrets-dir requires an argument"; secrets_dir="$2"; shift 2 ;;
+      --run-secrets-dir) [ $# -ge 2 ] || die "--run-secrets-dir requires an argument"; run_secrets_dir="$2"; shift 2 ;;
+      --secrets-mounts-file) [ $# -ge 2 ] || die "--secrets-mounts-file requires an argument"; secrets_mounts_file="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h | --help) cmd_rebuild_usage; exit 0 ;;
@@ -873,6 +1063,7 @@ do_rebuild() {
   DOM_NEW_SYSTEMD_REF="$systemd_ref"
   DOM_NEW_USERS_REF="$users_manifest"
   DOM_NEW_SNAP_REF="$snap_manifest"
+  DOM_NEW_SECRETS_REF="$secrets_manifest"
 
   local new_idx=""
   if [ "$dry_run" = 0 ]; then
@@ -885,8 +1076,8 @@ do_rebuild() {
     [ -z "$snap_manifest" ] || create_args+=(--snap-manifest "$snap_manifest")
     new_idx="$("$bindir/ubx-generations" "${create_args[@]}")" \
       || die "rebuild $verb: failed to register the new generation"
-    ubx_rebuild_write_sidecar "$root" "$new_idx" "$systemd_ref" \
-      || die "rebuild $verb: failed to record the systemd manifest reference for generation $new_idx"
+    ubx_rebuild_write_sidecar "$root" "$new_idx" "$systemd_ref" "$secrets_manifest" \
+      || die "rebuild $verb: failed to record the systemd/secrets manifest references for generation $new_idx"
   fi
 
   plan_domains "$workdir"
@@ -905,7 +1096,8 @@ do_rebuild() {
     if [ "$dry_run" = 0 ]; then
       local exec_users_out="$users_out"
       [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
-      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "$verb"
+      execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "$verb" \
+        "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file"
       ubx_rebuild_write_booted "$root" "$new_idx"
 
       # -- Soft-reboot activation (issue #30) -----------------------------
@@ -1028,6 +1220,8 @@ is no longer retained under the given/default retention policy is refused
   --users-exceptions FILE --home-state FILE
   --systemd-unit-dir DIR --systemd-content-dir DIR --users-out FILE
   --etc-dir DIR --etc-content-dir DIR
+  --secrets-observed FILE --secrets-dir DIR --run-secrets-dir DIR
+  --secrets-mounts-file FILE
 USAGE
 }
 
@@ -1035,8 +1229,10 @@ cmd_rollback() {
   local root="" retain=5 apply=0 dry_run=0 target_arg=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
   local etc_dir="/etc" etc_content_dir=""
+  local secrets_dir="" run_secrets_dir="/run/secrets" secrets_mounts_file=""
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+  OPT_SECRETS_OBSERVED=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1046,6 +1242,7 @@ cmd_rollback() {
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
       --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
+      --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -1056,6 +1253,9 @@ cmd_rollback() {
       --etc-dir) [ $# -ge 2 ] || die "--etc-dir requires an argument"; etc_dir="$2"; shift 2 ;;
       --etc-content-dir) [ $# -ge 2 ] || die "--etc-content-dir requires an argument"; etc_content_dir="$2"; shift 2 ;;
       --users-out) [ $# -ge 2 ] || die "--users-out requires an argument"; users_out="$2"; shift 2 ;;
+      --secrets-dir) [ $# -ge 2 ] || die "--secrets-dir requires an argument"; secrets_dir="$2"; shift 2 ;;
+      --run-secrets-dir) [ $# -ge 2 ] || die "--run-secrets-dir requires an argument"; run_secrets_dir="$2"; shift 2 ;;
+      --secrets-mounts-file) [ $# -ge 2 ] || die "--secrets-mounts-file requires an argument"; secrets_mounts_file="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h | --help) cmd_rollback_usage; exit 0 ;;
@@ -1119,7 +1319,8 @@ cmd_rollback() {
     # own header: `ubx rollback` never triggers the snap-purge sweep
     # (GitHub issue #66 scoped this to `ubx rebuild switch|test` only), even
     # though a target generation may itself declare a snap manifest.
-    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" ""
+    execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "" \
+      "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file"
     ubx_rebuild_write_booted "$root" "$target"
     ubx_rebuild_write_grub_default "$root" "$target"
     echo "grub default: set to generation $target"
@@ -1180,6 +1381,7 @@ aware diff instead.
   --etc-observed FILE --etc-exceptions FILE
   --systemd-observed FILE
   --snap-observed FILE
+  --secrets-observed FILE
   --passwd FILE --group FILE --shadow FILE
   --users-exceptions FILE --home-state FILE
 USAGE
@@ -1189,6 +1391,7 @@ cmd_diff() {
   local root=""
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
+  OPT_SECRETS_OBSERVED=""
   local -a pos=()
 
   while [ $# -gt 0 ]; do
@@ -1198,6 +1401,7 @@ cmd_diff() {
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
       --snap-observed) [ $# -ge 2 ] || die "--snap-observed requires an argument"; OPT_SNAP_OBSERVED="$2"; shift 2 ;;
+      --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;

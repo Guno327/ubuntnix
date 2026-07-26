@@ -28,6 +28,7 @@
         ./nix/etc.nix
         ./nix/boot.nix
         ./nix/systemd.nix
+        ./nix/secrets.nix
       ];
     };
 }

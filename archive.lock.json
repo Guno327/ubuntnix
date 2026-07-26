@@ -159,6 +159,15 @@
         "size": 56062
       },
       {
+        "name": "fakeroot",
+        "version": "1.33-1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/f/fakeroot/fakeroot_1.33-1_amd64.deb",
+        "sha256": "d58b7fc73f0b7ae8b9441b0aa41e44ead0d7e4deedf5aaf5696db182eac71031",
+        "size": 67216
+      },
+      {
         "name": "gcc-14-base",
         "version": "14.2.0-4ubuntu2~24.04.1",
         "arch": "amd64",
@@ -544,6 +553,15 @@
         "path": "pool/main/e/e2fsprogs/libext2fs2t64_1.47.0-2.4%7eexp1ubuntu4.1_amd64.deb",
         "sha256": "276686704314749497f1530ff9e62fd0280328be786a28db0cfe2aa31c88119e",
         "size": 221728
+      },
+      {
+        "name": "libfakeroot",
+        "version": "1.33-1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/f/fakeroot/libfakeroot_1.33-1_amd64.deb",
+        "sha256": "a78087f50586595375f850b4445261f7a47a83005b05ce521331929fab49df4b",
+        "size": 32374
       },
       {
         "name": "libfdisk1",

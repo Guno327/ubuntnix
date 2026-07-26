@@ -118,10 +118,13 @@ ldconfig_line=$(grep -n 'ldconfig$' "$configure_sh" | head -1 | cut -d: -f1)
 aux_cache_line=$(grep -n 'rm -f /var/cache/ldconfig/aux-cache' "$configure_sh" | head -1 | cut -d: -f1)
 dat_old_line=$(grep -n 'rm -f /var/cache/debconf/\*\.dat-old' "$configure_sh" | head -1 | cut -d: -f1)
 # The pre-existing R1 mtime-reset sequence: dev/proc unmount immediately
-# followed by the epoch `find / -exec touch` (both already present before
+# followed by the epoch `find ... -exec touch` (both already present before
 # this issue; only their relative position to the new lines above is
-# being checked here).
-touch_line=$(grep -n 'find / -exec touch -h -d @0 {} +' "$configure_sh" | head -1 | cut -d: -f1)
+# being checked here). Match on the stable `-exec touch -h -d @0 {} +`
+# action suffix so the guard survives the /proc + /dev-bind `-prune`
+# predicate the find carries (issue #48: those mountpoints can be locked
+# under unshare --user and must be skipped, not touched).
+touch_line=$(grep -n -- '-exec touch -h -d @0 {} +' "$configure_sh" | head -1 | cut -d: -f1)
 
 for pair_name in "configure_a_line:dpkg --configure -a" "ldconfig_line:ldconfig re-run" "aux_cache_line:aux-cache deletion" "dat_old_line:debconf *.dat-old deletion" "touch_line:final epoch touch"; do
   var="${pair_name%%:*}"

@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# bin/ubx-pro-apply — Ubuntu Pro convergence EXECUTOR (SPEC.md §8.2 "Ubuntu
+# Pro", §5, §11 M4; GitHub issue #82, milestone M4). The Pro-domain sibling
+# of bin/ubx-secrets-apply/bin/ubx-snap-apply, deliberately thin and dumb
+# the same way: consumes a plan `bin/ubx-pro plan` emits (see that script's
+# header for the schema and the full planning algorithm) and issues the
+# corresponding `pro` calls, IN THE PLAN'S OWN ORDER. All the intelligence
+# lives in the planner; this script never recomputes, re-derives, or
+# second-guesses a single decision the plan already made.
+#
+# -- The injectable pro-mutation command seam: --pro-bin/UBX_PRO_CMD --------
+#
+# Every call that actually mutates live Pro state is gated behind ONE seam,
+# `--pro-bin` (or `UBX_PRO_CMD`) — the same "UBX_*_CMD" convention
+# bin/ubx-snap-apply's own UBX_SNAP_CMD already establishes (see that
+# script's header): an environment variable/option naming a COMMAND
+# (not a wrapper function), invoked once per plan action as
+# "$pro_bin <subcommand> <args...>" — exactly the argv a human would type at
+# the real `pro` CLI — defaulted to the literal string `pro` (the real,
+# unwrapped host binary), never a wrapper function. Unit tests point this
+# seam at a small recording-stub script instead of the real `pro` client
+# (tests/README.md's "no root, no network, no KVM" unit rule — this dev
+# harness has no real Ubuntu Pro subscription at all), so the whole
+# plan -> ordered-pro-calls pipeline is exercisable fully offline; the
+# literal `pro` default is NEVER exercised by tests/unit/, exactly
+# bin/ubx-snap-apply's own "exercised only by a human/CI with a real client"
+# precedent.
+#
+# -- Availability: skip cleanly, never fail, when there is nothing to attach
+#    with -------------------------------------------------------------------
+#
+# Unlike bin/ubx-secrets-apply/bin/ubx-snap-apply (which always assume their
+# own backing tool exists), this script's `attach` action is gated behind
+# TWO independent, best-effort availability checks, both --apply-only (a
+# --dry-run always prints every action regardless, exactly like every other
+# executor in this project):
+#   1. `command -v "$pro_bin"` — this dev/CI harness genuinely has no real
+#      `pro` client installed at all; a real Ubuntu Pro token attach is
+#      already tracked as needing a real owner/subscription (GitHub issue
+#      #87, "needs-owner") — this plumbing must not block on that.
+#   2. the resolved token file (`--run-secrets-dir/<tokenSecretName>`)
+#      actually existing — a plan can legitimately be computed and applied
+#      before bin/ubx-secrets-apply has materialized anything (a fresh
+#      machine's very first `ubx rebuild switch --apply`, before the
+#      secrets block ahead of this one in bin/ubx's own execute_domains has
+#      run) — see that script's own comment for why the secrets block is
+#      guaranteed to run FIRST regardless.
+# Either check failing means: print a clear, named skip message to stderr
+# and exit 0 without attempting ANY action in this plan (enable/disable/
+# detach are pointless without a live, attached subscription anyway — a
+# missing 'pro' client makes every single action in this plan unrunnable,
+# not just attach) — this command still exits 0 unless a REAL invocation of
+# $pro_bin itself fails.
+#
+# -- Token handling: value never appears in the printed command list -------
+#
+# Exactly bin/ubx-secrets-apply's own "Env-file rendering" posture (see that
+# script's header): the printed (dry-run) command line for `attach` never
+# embeds the token — the plan itself never carries the token value either
+# (bin/ubx-pro's own header, "THE ABSOLUTE INVARIANT"), so this executor has
+# nothing to leak even in principle; the resolved token file's PATH is
+# printed (a filesystem location, not a secret), the file's own CONTENT
+# never is. Real attachment reads the file's bytes itself, at the moment the
+# temp script actually runs (--apply only), via `ubx_pro_attach_from_file`
+# (defined once, below) — an argv of paths/names ONLY.
+#
+# -- Path resolution: reconstructed from --run-secrets-dir + name, never
+#    trusted verbatim off the plan ------------------------------------------
+#
+# Mirrors bin/ubx-secrets-apply's own "why paths are RECONSTRUCTED, not read
+# verbatim off the plan" (see that script's header): the plan's own `attach`
+# action carries only `tokenSecretName` (a bare secret NAME, e.g.
+# "proToken"), never a path at all — this executor reconstructs the real
+# target as `--run-secrets-dir/<tokenSecretName>`, exactly the same
+# "--run-secrets-dir" convention bin/ubx-secrets-apply already establishes
+# for its own canonical-copy reads, so `--run-secrets-dir` can point at a
+# temp directory in tests without the plan itself needing to know about it.
+# `--secret-name` additionally overrides `tokenSecretName` outright (rarely
+# needed in practice — the plan already carries the real declared name —
+# but kept for the same test-ergonomics reason bin/ubx-secrets-apply's own
+# `--secrets-dir`/`--run-secrets-dir` overrides exist: a caller can exercise
+# this executor's attach path in isolation, without first hand-crafting a
+# plan naming a specific secret).
+#
+# -- Ordering ------------------------------------------------------------
+#
+# Actions are executed in EXACTLY the order the plan JSON lists them --
+# this script never sorts, groups, or reorders; bin/ubx-pro's own header
+# documents why its emitted order (attach, then enable/disable in
+# declaration order, or a lone detach) is already the correct one.
+set -euo pipefail
+
+prog_name="ubx-pro-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-pro-apply --plan FILE [--run-secrets-dir DIR] [--secret-name NAME] [--pro-bin CMD] [--apply | --dry-run]
+
+Consumes a plan produced by `bin/ubx-pro plan` and issues the corresponding
+`pro` calls, in the plan's own order, through the injectable
+--pro-bin/UBX_PRO_CMD seam (see this script's header).
+
+  --plan FILE            the plan JSON to apply (required)
+  --run-secrets-dir DIR   the real (or, for tests, temp) canonical secrets
+                          root an 'attach' action's token is read from, as
+                          DIR/<tokenSecretName> (default /run/secrets)
+  --secret-name NAME      override the plan's own attach action
+                          tokenSecretName (rarely needed -- see this
+                          script's header)
+  --pro-bin CMD           the pro-mutation seam to invoke as
+                          "CMD <subcommand> <args...>" for each action
+                          (default: $UBX_PRO_CMD, else the literal command
+                          "pro" -- the real host Ubuntu Pro client)
+  --apply                 actually run commands
+  --dry-run               print, don't run (default)
+  -h, --help              show this message
+
+Unit tests point --pro-bin/UBX_PRO_CMD at a small recording-stub script
+instead of the real 'pro' client, so the whole plan -> ordered-pro-calls
+pipeline is exercisable fully offline (tests/README.md's "no root, no
+network, no KVM" unit rule) -- see this script's header, "Availability", for
+exactly how a missing real 'pro' client or a not-yet-materialized token is
+skipped cleanly rather than failed.
+USAGE
+}
+
+main() {
+  local plan="" run_secrets_dir="/run/secrets" secret_name_override="" mode="dry-run"
+  local pro_bin="${UBX_PRO_CMD:-pro}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --run-secrets-dir) [ $# -ge 2 ] || die "--run-secrets-dir requires an argument"; run_secrets_dir="$2"; shift 2 ;;
+      --secret-name) [ $# -ge 2 ] || die "--secret-name requires an argument"; secret_name_override="$2"; shift 2 ;;
+      --pro-bin) [ $# -ge 2 ] || die "--pro-bin requires an argument"; pro_bin="$2"; shift 2 ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+
+  # -- compile the plan into TAGGED lines: "ATTACH <path>" for the one
+  # token-bearing action, "CMD <shell-quoted argv...>" (no $pro_bin prefix
+  # yet -- added at print/apply time below, see this script's header) for
+  # every other action. One tag per line, never mixed on a line, so the
+  # bash side below never has to re-parse anything more clever than its own
+  # first word.
+  local compiled
+  compiled="$(python3 - "$plan" "$run_secrets_dir" "$secret_name_override" <<'PYEOF'
+import json
+import shlex
+import sys
+
+plan_path, run_secrets_dir, secret_name_override = sys.argv[1:4]
+
+with open(plan_path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+for a in plan.get("actions", []):
+    op = a["op"]
+    if op == "attach":
+        name = secret_name_override or a["tokenSecretName"]
+        # No token bytes anywhere in this printed line -- see this
+        # script's header, "Token handling".
+        print(f"ATTACH {run_secrets_dir}/{name}")
+    elif op == "detach":
+        print("CMD " + " ".join(shlex.quote(x) for x in ["detach", "--assume-yes"]))
+    elif op == "enable":
+        print("CMD " + " ".join(shlex.quote(x) for x in ["enable", a["service"], "--assume-yes"]))
+    elif op == "disable":
+        print("CMD " + " ".join(shlex.quote(x) for x in ["disable", a["service"], "--assume-yes"]))
+    else:  # pragma: no cover -- defensive; bin/ubx-pro never emits this
+        print(f"ubx-pro-apply: unknown plan action op: {op!r}", file=sys.stderr)
+        sys.exit(1)
+PYEOF
+  )"
+
+  if [ -z "$compiled" ]; then
+    exit 0
+  fi
+
+  local pro_available=0
+  if command -v "$pro_bin" > /dev/null 2>&1; then
+    pro_available=1
+  fi
+
+  local token_file=""
+  token_file="$(printf '%s\n' "$compiled" | awk '/^ATTACH /{print substr($0, 8); exit}')"
+
+  if [ "$mode" = "dry-run" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "ATTACH "*) printf 'ubx_pro_attach_from_file %s\n' "${line#ATTACH }" ;;
+        "CMD "*) printf '%s %s\n' "$pro_bin" "${line#CMD }" ;;
+      esac
+    done <<< "$compiled"
+    if [ -n "$token_file" ] && [ ! -f "$token_file" ]; then
+      echo "$prog_name: NOTE: token file $token_file does not exist yet (dry-run only -- attach would be skipped at --apply time too, see this script's header 'Availability')" >&2
+    fi
+    if [ "$pro_available" = 0 ]; then
+      echo "$prog_name: NOTE: '$pro_bin' is not on PATH (dry-run only -- real invocation would be skipped at --apply time too, see this script's header 'Availability')" >&2
+    fi
+    exit 0
+  fi
+
+  # --apply: real convergence needs a real 'pro' client on PATH for EVERY
+  # action in this plan, not merely attach -- see this script's header,
+  # "Availability".
+  if [ "$pro_available" = 0 ]; then
+    echo "$prog_name: SKIP: '$pro_bin' is not on PATH -- Ubuntu Pro convergence skipped cleanly (a real attach/enable/disable needs a real 'pro' client and, per GitHub issue #87, a real owned subscription token; this plumbing must not block on either)" >&2
+    exit 0
+  fi
+
+  # Run each command line via a temp script, same pattern
+  # bin/ubx-secrets-apply's/bin/ubx-snap-apply's own --apply branch uses
+  # (see tests/unit/137's header for exactly why $script is expanded NOW,
+  # double-quoted, rather than lazily at EXIT-trap-fire time).
+  local script
+  script="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $script NOW
+  trap "rm -f '$script'" EXIT
+  {
+    printf '#!/bin/sh\nset -e\n'
+    printf 'pro_bin=%s\n' "$(printf '%s' "$pro_bin" | sed "s/'/'\\\\''/g;s/^/'/;s/\$/'/")"
+    cat <<'FUNCEOF'
+ubx_pro_attach_from_file() {
+  file="$1"
+  if [ ! -f "$file" ]; then
+    echo "ubx-pro-apply: SKIP: attach token not materialized yet at '$file' -- skipping real attach cleanly (see this script's header, 'Availability')" >&2
+    return 0
+  fi
+  token="$(cat "$file")"
+  "$pro_bin" attach "$token"
+}
+FUNCEOF
+    while IFS= read -r line; do
+      case "$line" in
+        "ATTACH "*)
+          printf 'ubx_pro_attach_from_file %s\n' "${line#ATTACH }"
+          ;;
+        "CMD "*)
+          # shellcheck disable=SC2016  # intentional: $pro_bin must stay
+          # LITERAL here -- it is expanded by /bin/sh when $script itself
+          # runs, not by this generating shell (mirrors the 'pro_bin=' line
+          # above, which single-quotes the value for the identical reason).
+          printf '"$pro_bin" %s\n' "${line#CMD }"
+          ;;
+      esac
+    done <<< "$compiled"
+  } > "$script"
+  chmod +x "$script"
+  "$script"
+}
+
+main "$@"

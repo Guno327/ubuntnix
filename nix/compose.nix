@@ -379,10 +379,15 @@ let
       # `squashfs-tools`/`liblzo2-2` tools already are. Never added to
       # this rootfs's own `packages` -- nothing about the composed SYSTEM
       # needs fakeroot installed at runtime, only THIS BUILD does.
+      # `libfakeroot` is listed EXPLICITLY alongside `fakeroot`: toolsFHS
+      # extracts only each named package's own data and runs no maintainer
+      # scripts, so it does NOT pull dependencies -- the LD_PRELOAD payload
+      # `libfakeroot-*.so` lives in the separate `libfakeroot` deb and would
+      # otherwise be missing (CI run 30199370520: `libfakeroot=''`).
       fakerootTools = toolsFHS {
         inherit system;
         name = "fakeroot-${name}";
-        packages = [ "fakeroot" ];
+        packages = [ "fakeroot" "libfakeroot" ];
       };
 
       preseedText = renderPreseed preseed;
@@ -543,10 +548,24 @@ let
         # `find` rather than hardcoded (see this file's header "CI
         # VERIFICATION NOTE" for why: this dev harness has no `fakeroot`
         # binary to inspect directly).
+        #
+        # We target the CONCRETE `fakeroot-sysv`/`faked-sysv` binaries, not
+        # the bare `fakeroot`/`faked` names: on Ubuntu those bare names are
+        # update-alternatives symlinks (`/usr/bin/fakeroot ->
+        # /etc/alternatives/fakeroot`) wired up by the package's postinst --
+        # which toolsFHS never runs -- so in a raw data-only extraction they
+        # are DANGLING symlinks `-type f` skips, and `faked-*` also matches
+        # manpages under share/man. Restricting to a `*/bin/*` path excludes
+        # the manpages, `-sysv` picks the always-shipped default frontend,
+        # and `-L` on the library lets `-type f` follow the
+        # `libfakeroot-sysv.so -> libfakeroot-0.so` symlink to a real file.
+        # (Fix for CI run 30199370520: found fakeroot='' + a manpage for
+        # faked + libfakeroot=''.)
         if [ -z "''${FAKEROOTKEY:-}" ]; then
-          ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -type f -name fakeroot | head -n1)"
-          ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -type f \( -name faked -o -name 'faked-*' \) | head -n1)"
-          ubx_libfakeroot="$(find /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-*.so' | head -n1)"
+          ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
+          ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
+          ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+          [ -n "$ubx_libfakeroot" ] || ubx_libfakeroot="$(find -L /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-*.so' | head -n1)"
           if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
             echo "configure.sh: could not locate fakeroot/faked/libfakeroot under /.ubx-compose/fakeroot-tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
             exit 1
@@ -914,7 +933,9 @@ let
       tools = toolsFHS {
         inherit system;
         name = "squashfs-${name}";
-        packages = [ "squashfs-tools" "liblzo2-2" "fakeroot" ];
+        # `libfakeroot` explicit for the same reason fakerootTools lists it
+        # (toolsFHS pulls no deps; the LD_PRELOAD payload is a separate deb).
+        packages = [ "squashfs-tools" "liblzo2-2" "fakeroot" "libfakeroot" ];
       };
     in
     runInUbuntuBase {
@@ -963,12 +984,14 @@ let
           exit 1
         }
 
-        # Same "discover, don't hardcode" reasoning as composeRootfs's own
-        # fakeroot re-exec block -- see this file's header "CI
-        # VERIFICATION NOTE".
-        ubx_fakeroot_bin="$(find /mnt/tools -type f -name fakeroot | head -n1)"
-        ubx_faked_bin="$(find /mnt/tools -type f \( -name faked -o -name 'faked-*' \) | head -n1)"
-        ubx_libfakeroot="$(find /mnt/tools -type f -name 'libfakeroot-*.so' | head -n1)"
+        # Same "discover, don't hardcode" reasoning -- and the same
+        # `-sysv`/`*/bin/*`/`-L` handling of the alternatives symlinks,
+        # manpages, and library symlink -- as composeRootfs's own fakeroot
+        # re-exec block above; see its comment for the full rationale.
+        ubx_fakeroot_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'fakeroot-sysv' | head -n1)"
+        ubx_faked_bin="$(find /mnt/tools -path '*/bin/*' -type f -name 'faked-sysv' | head -n1)"
+        ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-sysv.so' | head -n1)"
+        [ -n "$ubx_libfakeroot" ] || ubx_libfakeroot="$(find -L /mnt/tools -type f -name 'libfakeroot-*.so' | head -n1)"
         if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
           echo "pack.sh: could not locate fakeroot/faked/libfakeroot under /mnt/tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
           exit 1

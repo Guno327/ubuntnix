@@ -80,12 +80,28 @@ grep -qE 'toolsFHS[[:space:]]*\{' "$compose_nix" ||
 grep -qE 'fakerootTools = toolsFHS' "$compose_nix" ||
   fail "$compose_nix does not define fakerootTools via toolsFHS"
 
-grep -qE 'packages = \[ "fakeroot" \]' "$compose_nix" ||
-  fail "$compose_nix's fakerootTools does not request exactly the 'fakeroot' package"
+# Both the `fakeroot` frontend deb AND the separate `libfakeroot` deb (the
+# LD_PRELOAD payload) must be requested: toolsFHS extracts each named
+# package's data with no dependency resolution, so libfakeroot would
+# otherwise be absent (regression guard for CI run 30199370520).
+grep -qE 'packages = \[ "fakeroot" "libfakeroot" \]' "$compose_nix" ||
+  fail "$compose_nix's fakerootTools does not request the 'fakeroot' and 'libfakeroot' packages"
 
 # -- composeRootfs re-execs itself under fakeroot exactly once, guarded --
 grep -qE 'FAKEROOTKEY' "$compose_nix" ||
   fail "$compose_nix does not guard its fakeroot re-exec with a FAKEROOTKEY check"
+
+# -- tool discovery targets the CONCRETE -sysv binaries, not the bare
+# alternatives-symlink names (regression guard for CI run 30199370520,
+# where `-name fakeroot`/`-name 'faked-*'` found a dangling symlink and a
+# manpage). Both discovery blocks (configure.sh + pack.sh) must use them.
+[ "$(grep -cE "\-name 'fakeroot-sysv'" "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not discover the concrete 'fakeroot-sysv' binary in both the compose and pack blocks"
+[ "$(grep -cE "\-name 'faked-sysv'" "$compose_nix")" -ge 2 ] ||
+  fail "$compose_nix does not discover the concrete 'faked-sysv' binary in both the compose and pack blocks"
+if grep -qE -- "-type f -name fakeroot( |$)" "$compose_nix"; then
+  fail "$compose_nix still discovers fakeroot by the bare 'fakeroot' name -- that is the update-alternatives symlink, dangling in a data-only extraction (CI run 30199370520)"
+fi
 
 # shellcheck disable=SC2016 # single-quoted on purpose: matching literal shell text in the source, not an expansion here
 grep -qF 'exec "$ubx_fakeroot_bin"' "$compose_nix" ||
@@ -135,8 +151,8 @@ if grep -qE -- '-pf ' "$compose_nix"; then
   fail "$compose_nix still passes mksquashfs a -pf pseudo-file manifest -- GitHub issue #48 retires that mechanism entirely once fakeroot is wired in"
 fi
 
-grep -qE 'packages = \[ "squashfs-tools" "liblzo2-2" "fakeroot" \]' "$compose_nix" ||
-  fail "$compose_nix's squashfsImage does not request fakeroot alongside squashfs-tools/liblzo2-2"
+grep -qE 'packages = \[ "squashfs-tools" "liblzo2-2" "fakeroot" "libfakeroot" \]' "$compose_nix" ||
+  fail "$compose_nix's squashfsImage does not request fakeroot + libfakeroot alongside squashfs-tools/liblzo2-2"
 
 # -- archive.packages.json: fakeroot declared (lockfile regeneration is a
 # separate, PM-owned step -- see that file's own comment / the PM handoff

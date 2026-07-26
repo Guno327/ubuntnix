@@ -1,0 +1,674 @@
+#!/usr/bin/env bash
+# bin/ubx-snap — diff-driven snap convergence PLANNER (SPEC.md §4.3
+# switching-table row "Snaps (add/remove/pin/connect/config) | converge
+# snapd via its API; vendored payloads signed-sideloaded; auto-refresh held
+# permanently", §4.4; GitHub issue #61, milestone M3). Mirrors
+# bin/ubx-etc/bin/ubx-systemd's planner shape exactly, applied to the snap
+# domain nix/snap.nix's `renderManifest` compiles for (see that file's
+# header, "Interface with a future bin/ubx-snap").
+#
+# -- Scope: planner only, never touches snapd -------------------------------
+#
+# This script computes what SHOULD happen; it never runs `snap
+# ack`/`install`/`refresh`/`revert`/`connect`/`disconnect`/`set`/`unset`/
+# `refresh --hold` for real. Given the declared per-generation snap manifest
+# (nix/snap.nix's `renderManifest` output, see that file's header) and an
+# observed-state manifest describing what snapd actually reports right now
+# (see `observe`, below), `plan` prints a deterministic, ordered JSON action
+# plan. Applying that plan to a real snapd is a SEPARATE script's job
+# (issue #62, "bin/ubx-snap-apply" by analogy with bin/ubx-etc-apply/
+# bin/ubx-systemd-apply) — this project's existing planner/executor split
+# (bin/ubx-etc plans /etc; bin/ubx-systemd plans units; bin/ubx-users plans
+# passwd/group state; nothing in any of those scripts mutates anything for
+# real).
+#
+# -- Why python3 (like bin/ubx-etc, bin/ubx-systemd) ------------------------
+#
+# See bin/ubx-etc's own header for the full reasoning — it applies here
+# verbatim: nix/snap.nix's manifest is JSON (an array of small per-snap
+# objects), and `python3` is a safe, always-present dependency on stock
+# Ubuntu.
+#
+# -- Inputs: three manifests, two schemas -----------------------------------
+#
+#   --old-manifest / --new-manifest   nix/snap.nix's `renderManifest` output
+#                                       for generation N and N+1 — the
+#                                       DECLARED schema (nix/snap.nix's own
+#                                       header, "The per-generation snap
+#                                       manifest"):
+#     { "version": 1, "snaps": [
+#         { "name": "firefox", "channel": "stable", "revision": 4090,
+#           "classic": false, "publisher": "Canonical",
+#           "publisherVerified": true, "connections": ["camera"],
+#           "config": {"key": "value"} },
+#         ... ] }
+#
+#   --observed-manifest                what snapd ACTUALLY reports right
+#                                       now — the OBSERVED schema (see
+#                                       `observe` below for how a real one
+#                                       is produced):
+#     { "version": 1, "refreshHold": true, "snaps": [
+#         { "name": "firefox", "revision": 4080, "channel": "stable",
+#           "classic": false, "connections": ["network"],
+#           "config": {"key": "old-value"} },
+#         ... ] }
+#
+# Exactly the same "diff against OBSERVED state, not against the previous
+# generation's own record of itself" posture bin/ubx-etc's/bin/ubx-systemd's
+# headers explain at length: a snap hand-`snap set`/hand-connected outside
+# `ubx` since the last switch must still converge correctly on the NEXT
+# switch. `--old-manifest` is consulted for exactly one thing: which snap
+# names were previously MANAGED (so `remove` only ever targets a name this
+# project itself declared before — bin/ubx-etc's own "Removal scope").
+#
+# -- The injectable snapd-query command seam ---------------------------------
+#
+# Real snapd access (network-adjacent, and the host's own `snap` client) is
+# gated behind ONE seam, `UBX_SNAP_QUERY_CMD` (or `--query-cmd`) — the same
+# "UBX_*_CMD" convention bin/ubx-snap-resolve's `UBX_SNAP_RESOLVE_CMD`,
+# bin/ubx's `UBX_SOFT_REBOOT_CMD`/`UBX_NEXTROOT_STAGE_CMD`, and
+# bin/ubx-etc-apply already establish: an environment variable naming a
+# command, defaulted to a real internal implementation, invoked with a
+# small fixed argv (here: none at all — see below) and expected to
+# communicate over stdout/exit-status only. `observe` invokes it as plain
+# `"$UBX_SNAP_QUERY_CMD"` (no arguments — unlike bin/ubx-snap-resolve's
+# per-package seam, there is no natural per-item decomposition matching a
+# single `snap` invocation here: real snapd state is gathered from several
+# separate `snap` subcommands — `list --all`, `connections --all`,
+# `get`, and the system-wide refresh-hold setting — combined into ONE
+# observed-state manifest) and requires it print exactly one JSON object,
+# already in the OBSERVED schema above, to stdout; a nonzero exit fails
+# `observe`. Unit tests point this seam at small canned-output stubs
+# instead of the real `snap` client, so the whole
+# declared-manifest -> observed-manifest -> plan pipeline is exercisable
+# fully offline (tests/README.md's "unit tests must not require root,
+# network, or KVM" rule) even though `_ubx_snap_query_real` (below) is
+# unapologetically impure.
+#
+# `_ubx_snap_query_real` is NEVER exercised by tests/unit/ (no snapd in this
+# harness's containers) — exactly bin/ubx-snap-resolve's own
+# `_ubx_snap_resolve_real` precedent (see that script's header): it is
+# exercised only by a human/CI with a real snapd instance.
+#
+# -- The plan algorithm -------------------------------------------------
+#
+# For every snap in the NEW manifest (`tgt`), let `obs` be its observed
+# entry (absent -> never installed):
+#
+#   - obs is absent
+#       -> `ack` (the vendored assertion for tgt.revision) then `install`
+#          (the vendored payload, signed-sideloaded per SPEC.md §4.3) —
+#          always emitted as a pair, `ack` first (an uninstalled snap can't
+#          be sideloaded without its assertion acked first).
+#   - obs is present, tgt.revision != obs.revision:
+#       - tgt.revision > obs.revision -> `ack` + `refresh` (moving FORWARD
+#         to a newer pinned revision needs a fresh sideload + assertion,
+#         same as install)
+#       - tgt.revision < obs.revision -> `revert` (moving BACK to an older
+#         revision assumes snapd/this project's retained-artifact set
+#         (SPEC.md §4.3 "Local artifact retention") still has it locally —
+#         no new ack/sideload needed, mirrors a real `snap revert`)
+#   - obs is present, tgt.revision == obs.revision -> no revision action
+#     (already converged on revision)
+#
+#   Connections (always compared, regardless of whether a revision action
+#   fired): tgt.connections - obs.connections -> `connect` per interface;
+#   obs.connections - tgt.connections -> `disconnect` per interface. A
+#   freshly-installed snap (obs absent) is treated as having no observed
+#   connections, so every declared connection is planned as `connect`.
+#
+#   Config (same "always compared" posture): for every key in tgt.config
+#   whose value differs from (or is absent from) obs.config -> `set`; for
+#   every key in obs.config not present in tgt.config -> `unset`. A
+#   freshly-installed snap is treated as having no observed config, so
+#   every declared key is planned as `set`.
+#
+# For every snap in the OLD manifest but not the NEW one (dropped from the
+# declaration): `remove`, but ONLY if still present in `--observed-manifest`
+# — exactly bin/ubx-etc's own "Removal scope": only a name this project's
+# OWN old manifest once declared can ever be planned for removal, so a
+# snap this project never declared (e.g. `core`, `snapd`, a
+# hand-`snap install`ed one) can never be silently removed just because the
+# new manifest doesn't mention it.
+#
+# Permanent auto-refresh hold (SPEC.md §4.3 "auto-refresh held
+# permanently"): a SYSTEM-WIDE invariant, not a per-snap one, so it is
+# checked exactly once regardless of how many snaps are declared — iff
+# `--observed-manifest`'s `refreshHold` is not already `true`, exactly one
+# `hold` action is planned; already held -> no action (diff-driven: a
+# system already converged on this invariant produces nothing for it).
+#
+# -- Deterministic, safe ordering ------------------------------------------
+#
+# The action list is grouped in this FIXED sequence (each group internally
+# sorted by snap name, then — for connect/disconnect/set/unset — by the
+# interface/key name too): install-group (ack, install — interleaved per
+# name, names sorted) -> refresh-group (ack, refresh — same pairing) ->
+# revert-group -> remove-group -> connect-group -> disconnect-group ->
+# set-group -> unset-group -> hold (at most one, no snap name). ack/install
+# and ack/refresh always precede connect/disconnect/set/unset for the SAME
+# snap (per this issue's acceptance criteria, "ack/install before
+# connect/config") because a snap must exist on the system before its
+# interfaces can be connected or its config set. `hold` is always last: it
+# is independent of every per-snap action and has nothing to sequence
+# against.
+#
+# -- Output -----------------------------------------------------------------
+#
+# A single JSON object on stdout (or --out):
+#   { "version": 1, "actions": [ { "op": ..., ... }, ... ] }
+# An empty (fully converged) input produces `"actions": []` and exit 0 — a
+# no-op plan is success, not an error. See this script's `--help` output
+# (cmd_plan_usage) for the full per-op action-object schema, and docs/snap.md
+# for the human-readable version the PM/issue #62 executor should read.
+#
+# `report` renders an already-computed plan as human-readable text (feeds
+# `ubx diff` / the converge report, SPEC.md §7) — kept as a SEPARATE
+# subcommand from `plan` itself, mirroring bin/ubx-systemd's own
+# plan/report split.
+set -euo pipefail
+
+prog_name="ubx-snap"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-snap <command> [options]
+
+commands:
+  plan       compute a deterministic, ordered snap-convergence action plan
+             from two generations' snap manifests plus an observed-state
+             manifest
+  observe    query real (or stubbed) snapd state via the injectable
+             UBX_SNAP_QUERY_CMD seam and emit an observed-state manifest
+  report     render an already-computed plan as human-readable text
+  -h, --help  show this message
+
+Run 'ubx-snap <command> --help' for a command's own options. See this
+script's header for the manifest schemas, the plan algorithm, the
+injectable snapd-query seam, and the deterministic ordering rules (SPEC.md
+§4.3, §4.4).
+USAGE
+}
+
+write_out() {
+  local out="$1" content="$2"
+  if [ "$out" = - ]; then
+    printf '%s' "$content"
+  else
+    local tmp
+    tmp="$(mktemp "$(dirname "$out")/.ubx-snap.XXXXXX")"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$out"
+  fi
+}
+
+# =====================================================================
+# observe
+# =====================================================================
+
+cmd_observe_usage() {
+  cat <<'USAGE'
+usage: ubx-snap observe [--query-cmd CMD] [--out FILE|-]
+
+Invokes the injectable snapd-query seam (--query-cmd, else
+$UBX_SNAP_QUERY_CMD, else the real internal implementation, which shells
+out to the host's own 'snap' client) as plain "CMD" (no arguments) and
+requires it print exactly one JSON object, already in this script's
+observed-state schema (see this script's header):
+
+  { "version": 1, "refreshHold": <bool>,
+    "snaps": [ { "name", "revision", "channel", "classic", "connections",
+                 "config" }, ... ] }
+
+to stdout. A nonzero exit, or output that is not well-formed JSON matching
+this shape, fails 'observe'. --out defaults to stdout ("-"); a real path is
+written atomically.
+
+Unit tests point the seam at a small canned-output stub instead of the real
+'snap' client, so the whole declared-manifest -> observed-manifest -> plan
+pipeline is exercisable fully offline.
+USAGE
+}
+
+cmd_observe() {
+  local query_cmd="${UBX_SNAP_QUERY_CMD:-_ubx_snap_query_real}" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --query-cmd) [ $# -ge 2 ] || die "--query-cmd requires an argument"; query_cmd="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_observe_usage; exit 0 ;;
+      *) echo "$prog_name: observe: unknown option: $1" >&2; cmd_observe_usage >&2; exit 2 ;;
+    esac
+  done
+
+  local raw
+  if [ "$query_cmd" = "_ubx_snap_query_real" ]; then
+    raw="$(_ubx_snap_query_real)" || die "observe: the real snapd-query implementation failed"
+  else
+    raw="$("$query_cmd")" || die "observe: query seam '$query_cmd' exited nonzero"
+  fi
+
+  local raw_file
+  raw_file="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $raw_file now
+  trap "rm -f '$raw_file'" RETURN
+  printf '%s' "$raw" > "$raw_file"
+
+  local content
+  content="$(python3 - "$raw_file" <<'PYEOF'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+except json.JSONDecodeError as e:
+    print(f"ubx-snap: observe: query seam did not print well-formed JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if data.get("version") != 1:
+    print("ubx-snap: observe: query seam's output must have version 1", file=sys.stderr)
+    sys.exit(1)
+if "refreshHold" not in data:
+    print("ubx-snap: observe: query seam's output is missing 'refreshHold'", file=sys.stderr)
+    sys.exit(1)
+for s in data.get("snaps", []):
+    missing = [k for k in ("name", "revision", "channel", "classic", "connections", "config") if k not in s]
+    if missing:
+        print(f"ubx-snap: observe: a snap entry is missing field(s) {missing}: {s}", file=sys.stderr)
+        sys.exit(1)
+
+print(json.dumps(data, indent=2, ensure_ascii=False))
+PYEOF
+  )" || exit 1
+  write_out "$out" "$content"$'\n'
+}
+
+# -- the real (impure) snapd-query seam: UBX_SNAP_QUERY_CMD's default -------
+#
+# Shells out to the host's own `snap` client to assemble an observed-state
+# manifest from several separate queries (see this script's header, "The
+# injectable snapd-query command seam"). Best-effort: `snap` output is
+# line-oriented text, not JSON, so this parses the same columns a human
+# reads. NEVER exercised by tests/unit/ (see header) — exercised only by a
+# human/CI with real snapd.
+_ubx_snap_query_real() {
+  command -v snap > /dev/null 2>&1 || die "'snap' not found on PATH -- real observation needs the host's own snapd client"
+
+  local list_file connections_file
+  list_file="$(mktemp)"
+  connections_file="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand the paths now
+  trap "rm -f '$list_file' '$connections_file'" RETURN
+  snap list --all > "$list_file" 2> /dev/null || true
+  snap connections --all > "$connections_file" 2> /dev/null || true
+  local hold_out
+  hold_out="$(snap get system refresh.hold 2> /dev/null || true)"
+
+  python3 - "$list_file" "$connections_file" "$hold_out" <<'PYEOF'
+import re
+import subprocess
+import sys
+
+list_path, connections_path, hold_out = sys.argv[1:4]
+with open(list_path, encoding="utf-8") as f:
+    list_out = f.read()
+with open(connections_path, encoding="utf-8") as f:
+    connections_out = f.read()
+
+snaps = {}
+for line in list_out.splitlines()[1:]:
+    line = line.rstrip("\n")
+    if not line.strip():
+        continue
+    cols = line.split()
+    if len(cols) < 6:
+        continue
+    name, _version, rev, tracking = cols[0], cols[1], cols[2], cols[3]
+    notes = cols[5] if len(cols) > 5 else "-"
+    if "disabled" in notes.split(","):
+        # A non-active revision of a multi-revision snap -- not what a
+        # declared manifest's single `revision` field targets.
+        continue
+    try:
+        revision = int(rev.lstrip("v"))
+    except ValueError:
+        continue
+    classic = "classic" in notes.split(",")
+    config = {}
+    try:
+        raw = subprocess.run(
+            ["snap", "get", "-d", name],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if raw.returncode == 0 and raw.stdout.strip():
+            import json as _json
+            parsed = _json.loads(raw.stdout)
+            if isinstance(parsed, dict):
+                config = parsed
+    except Exception:
+        # Best-effort only (see this function's header) -- an unreadable
+        # config is treated as empty rather than failing the whole query.
+        config = {}
+    snaps[name] = {
+        "name": name,
+        "revision": revision,
+        "channel": tracking,
+        "classic": classic,
+        "connections": [],
+        "config": config,
+    }
+
+for line in connections_out.splitlines()[1:]:
+    line = line.rstrip("\n")
+    if not line.strip():
+        continue
+    cols = line.split()
+    if len(cols) < 3:
+        continue
+    _interface, plug, _slot = cols[0], cols[1], cols[2]
+    if plug in ("-",):
+        continue
+    plug_snap = plug.split(":", 1)[0]
+    if plug_snap in snaps:
+        snaps[plug_snap]["connections"].append(cols[0])
+
+for s in snaps.values():
+    s["connections"] = sorted(set(s["connections"]))
+
+refresh_hold = bool(re.search(r"\S", hold_out)) and "error" not in hold_out.lower() and "not found" not in hold_out.lower()
+
+import json
+print(json.dumps({
+    "version": 1,
+    "refreshHold": refresh_hold,
+    "snaps": sorted(snaps.values(), key=lambda s: s["name"]),
+}, indent=2, ensure_ascii=False))
+PYEOF
+}
+
+# =====================================================================
+# plan
+# =====================================================================
+
+cmd_plan_usage() {
+  cat <<'USAGE'
+usage: ubx-snap plan --old-manifest FILE --new-manifest FILE \\
+         --observed-manifest FILE [--out FILE|-]
+
+Computes a deterministic, ordered snap-convergence action plan (see this
+script's header for the full algorithm) and prints it as a JSON object:
+
+  { "version": 1, "actions": [ {"op": ..., ...}, ... ] }
+
+Per-op action-object schema:
+  {"op": "ack", "name", "revision"}
+  {"op": "install", "name", "revision", "channel", "classic"}
+  {"op": "refresh", "name", "fromRevision", "toRevision", "channel"}
+  {"op": "revert", "name", "fromRevision", "toRevision"}
+  {"op": "remove", "name"}
+  {"op": "connect", "name", "interface"}
+  {"op": "disconnect", "name", "interface"}
+  {"op": "set", "name", "key", "value"}
+  {"op": "unset", "name", "key"}
+  {"op": "hold", "mode": "forever"}
+
+--out defaults to stdout ("-"); a real path is written atomically. Exits 0
+on an empty (fully converged) plan, and also exits 0 for any well-formed
+plan with changes -- `plan` never fails just because changes exist.
+USAGE
+}
+
+cmd_plan() {
+  local old="" new="" observed="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --old-manifest) [ $# -ge 2 ] || die "--old-manifest requires an argument"; old="$2"; shift 2 ;;
+      --new-manifest) [ $# -ge 2 ] || die "--new-manifest requires an argument"; new="$2"; shift 2 ;;
+      --observed-manifest) [ $# -ge 2 ] || die "--observed-manifest requires an argument"; observed="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_plan_usage; exit 0 ;;
+      *) echo "$prog_name: plan: unknown option: $1" >&2; cmd_plan_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$old" ] || die "plan: --old-manifest is required"
+  [ -n "$new" ] || die "plan: --new-manifest is required"
+  [ -n "$observed" ] || die "plan: --observed-manifest is required"
+  [ -f "$old" ] || die "plan: no such file: $old"
+  [ -f "$new" ] || die "plan: no such file: $new"
+  [ -f "$observed" ] || die "plan: no such file: $observed"
+
+  local content
+  content="$(python3 - "$old" "$new" "$observed" <<'PYEOF'
+import json
+import sys
+
+old_path, new_path, observed_path = sys.argv[1:4]
+
+
+def load_declared(path, label):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-snap: plan: {label} ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    entries = {}
+    for s in data.get("snaps", []):
+        missing = [k for k in ("name", "channel", "revision", "classic", "connections", "config") if k not in s]
+        if missing:
+            print(f"ubx-snap: plan: {label} ({path}): snap missing field(s) {missing}: {s}", file=sys.stderr)
+            sys.exit(1)
+        entries[s["name"]] = {
+            "channel": s["channel"],
+            "revision": s["revision"],
+            "classic": bool(s["classic"]),
+            "connections": list(s["connections"]),
+            "config": dict(s["config"]),
+        }
+    return entries
+
+
+def load_observed(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-snap: plan: --observed-manifest ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    if "refreshHold" not in data:
+        print(f"ubx-snap: plan: --observed-manifest ({path}): missing 'refreshHold'", file=sys.stderr)
+        sys.exit(1)
+    entries = {}
+    for s in data.get("snaps", []):
+        missing = [k for k in ("name", "revision", "channel", "classic", "connections", "config") if k not in s]
+        if missing:
+            print(f"ubx-snap: plan: --observed-manifest ({path}): snap missing field(s) {missing}: {s}", file=sys.stderr)
+            sys.exit(1)
+        entries[s["name"]] = {
+            "revision": s["revision"],
+            "channel": s["channel"],
+            "classic": bool(s["classic"]),
+            "connections": list(s["connections"]),
+            "config": dict(s["config"]),
+        }
+    return entries, bool(data["refreshHold"])
+
+
+old = load_declared(old_path, "--old-manifest")
+new = load_declared(new_path, "--new-manifest")
+observed, refresh_hold = load_observed(observed_path)
+
+installs = []      # names getting a fresh install (ack + install)
+refreshes = []      # names getting refreshed forward (ack + refresh)
+reverts = []        # names getting reverted backward
+removes = []        # names dropped from the declaration
+connects = []        # (name, interface)
+disconnects = []      # (name, interface)
+sets = []             # (name, key, value)
+unsets = []           # (name, key)
+
+for name in sorted(new):
+    tgt = new[name]
+    obs = observed.get(name)
+
+    if obs is None:
+        installs.append(name)
+        obs_connections = []
+        obs_config = {}
+    else:
+        obs_connections = obs["connections"]
+        obs_config = obs["config"]
+        if tgt["revision"] != obs["revision"]:
+            if tgt["revision"] > obs["revision"]:
+                refreshes.append(name)
+            else:
+                reverts.append(name)
+        # else: revision already converged -- no revision action.
+
+    for interface in sorted(set(tgt["connections"]) - set(obs_connections)):
+        connects.append((name, interface))
+    for interface in sorted(set(obs_connections) - set(tgt["connections"])):
+        disconnects.append((name, interface))
+
+    for key in sorted(tgt["config"]):
+        if key not in obs_config or obs_config[key] != tgt["config"][key]:
+            sets.append((name, key, tgt["config"][key]))
+    for key in sorted(set(obs_config) - set(tgt["config"])):
+        unsets.append((name, key))
+
+for name in sorted(set(old) - set(new)):
+    if name in observed:
+        removes.append(name)
+
+actions = []
+for name in installs:
+    actions.append({"op": "ack", "name": name, "revision": new[name]["revision"]})
+    actions.append({
+        "op": "install", "name": name, "revision": new[name]["revision"],
+        "channel": new[name]["channel"], "classic": new[name]["classic"],
+    })
+for name in refreshes:
+    actions.append({"op": "ack", "name": name, "revision": new[name]["revision"]})
+    actions.append({
+        "op": "refresh", "name": name,
+        "fromRevision": observed[name]["revision"], "toRevision": new[name]["revision"],
+        "channel": new[name]["channel"],
+    })
+for name in reverts:
+    actions.append({
+        "op": "revert", "name": name,
+        "fromRevision": observed[name]["revision"], "toRevision": new[name]["revision"],
+    })
+for name in sorted(removes):
+    actions.append({"op": "remove", "name": name})
+for name, interface in connects:
+    actions.append({"op": "connect", "name": name, "interface": interface})
+for name, interface in disconnects:
+    actions.append({"op": "disconnect", "name": name, "interface": interface})
+for name, key, value in sets:
+    actions.append({"op": "set", "name": name, "key": key, "value": value})
+for name, key in unsets:
+    actions.append({"op": "unset", "name": name, "key": key})
+if not refresh_hold:
+    actions.append({"op": "hold", "mode": "forever"})
+
+plan = {"version": 1, "actions": actions}
+sys.stdout.write(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
+PYEOF
+  )"
+  write_out "$out" "$content"
+}
+
+# =====================================================================
+# report
+# =====================================================================
+
+cmd_report_usage() {
+  cat <<'USAGE'
+usage: ubx-snap report --plan FILE [--out FILE|-]
+
+Renders an already-computed plan (bin/ubx-snap plan's own output) as
+human-readable text -- feeds `ubx diff` / the converge report (SPEC.md
+§7). Kept separate from `plan` itself so the machine-readable plan stays
+inspectable/diffable on its own.
+USAGE
+}
+
+cmd_report() {
+  local plan="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_report_usage; exit 0 ;;
+      *) echo "$prog_name: report: unknown option: $1" >&2; cmd_report_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "report: --plan is required"
+  [ -f "$plan" ] || die "report: no such file: $plan"
+
+  local content
+  content="$(python3 - "$plan" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+actions = plan.get("actions", [])
+if not actions:
+    print("snap: nothing to do (fully converged)")
+    sys.exit(0)
+
+VERB = {
+    "ack": lambda a: f"ack assertion for {a['name']} revision {a['revision']}",
+    "install": lambda a: f"install {a['name']} revision {a['revision']} (channel {a['channel']}{', classic' if a['classic'] else ''})",
+    "refresh": lambda a: f"refresh {a['name']} {a['fromRevision']} -> {a['toRevision']} (channel {a['channel']})",
+    "revert": lambda a: f"revert {a['name']} {a['fromRevision']} -> {a['toRevision']}",
+    "remove": lambda a: f"remove {a['name']}",
+    "connect": lambda a: f"connect {a['name']}:{a['interface']}",
+    "disconnect": lambda a: f"disconnect {a['name']}:{a['interface']}",
+    "set": lambda a: f"set {a['name']} {a['key']}={a['value']!r}",
+    "unset": lambda a: f"unset {a['name']} {a['key']}",
+    "hold": lambda a: "hold auto-refresh permanently",
+}
+
+lines = [f"snap: {len(actions)} action(s) planned:"]
+for a in actions:
+    render = VERB.get(a["op"])
+    lines.append(f"  - {render(a) if render else a}")
+print("\n".join(lines))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# main
+# =====================================================================
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    -h | --help | "" | help)
+      usage
+      [ "$cmd" = "" ] && exit 2
+      exit 0
+      ;;
+    plan) shift; cmd_plan "$@" ;;
+    observe) shift; cmd_observe "$@" ;;
+    report) shift; cmd_report "$@" ;;
+    *)
+      echo "$prog_name: unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

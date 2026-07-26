@@ -620,6 +620,63 @@ jobs:
           path: switch-loop-serial.log
           if-no-files-found: ignore
 
+  snap-convergence:
+    name: M3 snap-convergence QEMU e2e (SPEC.md §11 M3 exit criterion; issue #64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # Same requirement as the "boot"/"switch-loop" jobs above --
+      # nix/boot.nix's snap-converge-proof composes a rootfs tree through
+      # the same hardened `unshare --user --map-root-user` chroot, plus a
+      # real (hash-verified, network-fetched) fixed-output derivation for
+      # the vendored hello-world .snap/.snap-declaration bytes
+      # (nix/snap.nix's fetchSnap/fetchAssert).
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: see the "boot" job's identical step for
+      # the full rationale (nix/stdenv.nix's `__noChroot = true` derivation).
+      - name: Build snap-converge-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#snap-converge-proof -L -o result-snap-converge-image
+          sudo chown -R "$USER" result-snap-converge-image
+      - name: Assert snap-converge-proof artifact
+        run: |
+          img="result-snap-converge-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e snap-convergence test below will fall back to TCG (slower, still correct; see tests/e2e/030-qemu-snap-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end snap-convergence test (SPEC.md §11's M3
+      # exit criterion): boots the just-built disk image once and asserts
+      # all three UBX-M3-Sn-PASS markers the image's own baked-in driver
+      # (nix/boot.nix's snapConvergeDriverScript) emits -- see that
+      # script's own header, and tests/e2e/030-qemu-snap-e2e.sh's, for the
+      # exact scenario-by-scenario design and what is real vs. simulated.
+      - name: QEMU e2e snap-convergence test
+        run: ./tests/e2e/030-qemu-snap-e2e.sh --image result-snap-converge-image --timeout 240 --keep-log snap-converge-serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap-converge-e2e-serial-log
+          path: snap-converge-serial.log
+          if-no-files-found: ignore
+
   resolve:
     name: Archive resolution (apt solver, end-to-end)
     runs-on: ubuntu-24.04

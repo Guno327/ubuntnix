@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""bin/ubx-crypttab -- passphrase-LUKS groundwork's convergence PLANNER,
+plus a thin `observe` subcommand (SPEC.md §11 M4 "passphrase-LUKS
+groundwork (crypttab/fileSystems)", §4.2 "generated /etc"; GitHub issue
+#83, milestone M4). The crypttab-domain sibling of bin/ubx-pro/
+bin/ubx-etc: consumes nix/crypttab.nix's rendered manifest plus observed
+on-disk state and decides what needs to change.
+
+-- Why this lives outside Nix, as a script under bin/ ----------------------
+
+Exactly bin/ubx-etc's/bin/ubx-pro's own reasoning (see those scripts'
+headers): convergence is a function of REAL, observed system state (the
+current bytes of /etc/crypttab, and which mount units are already
+installed with which content), which Nix's build graph has no business
+seeing. nix/crypttab.nix owns the declaration surface and renders it to a
+flat JSON manifest; this script CONSUMES that manifest plus observed-state
+JSON/files and decides what needs to change. Kept pure Python specifically
+so the planner half is unit-testable with zero root or `nix`/`cryptsetup`
+binary involved -- see tests/unit/176-ubx-crypttab-plan.sh.
+
+-- Two resources, one manifest ---------------------------------------------
+
+A declared LUKS volume compiles to up to two on-disk artifacts, planned
+independently:
+
+  1. ONE shared file, /etc/crypttab, whose desired content is the
+     manifest's own `crypttabContent` (every declared volume's line,
+     already assembled and sorted by nix/crypttab.nix's `render`). Diffed
+     as a single whole-file unit (crypttab(5) has no per-line ownership
+     metadata worth tracking separately, unlike nix/etc.nix's per-path
+     entries) -- a `write-crypttab` action is emitted iff the desired
+     content differs from the observed content.
+  2. Per volume that declares a `mountPoint`, ONE systemd `.mount` unit
+     file (nix/crypttab.nix's own `mountUnitName`/`mountUnitContent`),
+     diffed exactly like nix/etc.nix's own per-path entries: absent ->
+     `create-mount`, present-but-different -> `update-mount`,
+     present-and-identical -> no action. A volume's mount unit dropped
+     from the NEW manifest but present in an `--old-manifest` (this
+     issue's declaration having previously existed) and still observed on
+     disk -> `remove-mount` -- mirrors bin/ubx-etc's own "removal only
+     applies to previously-managed entries" scope rule (see that script's
+     header): `--old-manifest` is consulted for exactly this, never for
+     content/metadata diffing (that is always against OBSERVED state).
+
+-- The manifest schema (produced by nix/crypttab.nix's `render`) -----------
+
+  { "version": 1,
+    "crypttabContent": "<all lines, sorted, \"\\n\"-joined, trailing \"\\n\">",
+    "volumes": [
+      { "name", "device", "keyFile", "options", "crypttabLine",
+        "mountPoint": <string|null>, "fsType": <string|null>,
+        "mountOptions": <string|null>,
+        "mountUnitName": <string|null>, "mountUnitContent": <string|null> },
+      ... ] }
+
+-- The observed schema ------------------------------------------------------
+
+  { "version": 1,
+    "crypttabContent": "<the real, current bytes of /etc/crypttab>",
+    "units": { "<mountUnitName>": "<real, current unit file content>", ... } }
+
+`observe` (below) produces exactly this, from a real (or, in tests, a temp)
+`/etc/crypttab` path plus a real (or temp) mount-units directory; `plan`
+itself never touches a filesystem -- both subcommands' fixture-friendliness
+mirrors bin/ubx-etc's own plan/observe split.
+
+-- The plan schema ----------------------------------------------------------
+
+  { "version": 1, "empty": <bool>,
+    "actions": [
+      { "op": "write-crypttab", "sha256": <64 hex> },
+      { "op": "create-mount", "unitName": <str>, "sha256": <64 hex> },
+      { "op": "update-mount", "unitName": <str>, "sha256": <64 hex> },
+      { "op": "remove-mount", "unitName": <str> },
+      ... ] }
+
+`actions` is always emitted in this FIXED order -- write-crypttab first (if
+needed), then create/update-mount for each volume IN THE NEW MANIFEST'S OWN
+DECLARATION ORDER, then remove-mount for each dropped, still-observed unit
+IN THE OLD MANIFEST'S OWN DECLARATION ORDER -- mirrors bin/ubx-pro's own
+"attach before enable before disable" fixed-order posture (see that
+script's header, "Ordering"). Content bytes are never embedded in the plan
+itself (only a target sha256, exactly bin/ubx-etc's own convention) --
+bin/ubx-crypttab-apply re-reads the real bytes off the ORIGINAL manifest at
+apply time (see that script's header).
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+PROG = "ubx-crypttab"
+
+
+def die(msg):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_json(path, default=None):
+    if path is None:
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(obj, out_path):
+    text = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+    if out_path is None:
+        sys.stdout.write(text)
+        return
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, out_path)
+
+
+def sha256_of(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# -- manifest/observed validation --------------------------------------------
+
+
+def validate_manifest(manifest, label="manifest"):
+    errors = []
+    if not isinstance(manifest, dict):
+        return [f"{label} top level is not a JSON object"]
+    if manifest.get("version") != 1:
+        errors.append(f"{label} 'version' must be 1, got {manifest.get('version')!r}")
+    if not isinstance(manifest.get("crypttabContent"), str):
+        errors.append(f"{label} 'crypttabContent' must be a string")
+    volumes = manifest.get("volumes")
+    if not isinstance(volumes, list):
+        errors.append(f"{label} 'volumes' must be a list")
+        return errors
+    for i, v in enumerate(volumes):
+        if not isinstance(v, dict):
+            errors.append(f"{label} volumes[{i}] is not an object")
+            continue
+        if not isinstance(v.get("name"), str) or not v["name"]:
+            errors.append(f"{label} volumes[{i}] 'name' must be a non-empty string")
+        has_mount = v.get("mountUnitName") is not None
+        if has_mount and not isinstance(v.get("mountUnitContent"), str):
+            errors.append(f"{label} volumes[{i}] ({v.get('name')!r}) declares mountUnitName but has no mountUnitContent")
+    return errors
+
+
+def validate_observed(observed):
+    errors = []
+    if not isinstance(observed, dict):
+        return ["observed state top level is not a JSON object"]
+    if observed.get("version") != 1:
+        errors.append(f"observed 'version' must be 1, got {observed.get('version')!r}")
+    if not isinstance(observed.get("crypttabContent"), str):
+        errors.append("observed 'crypttabContent' must be a string")
+    if not isinstance(observed.get("units"), dict):
+        errors.append("observed 'units' must be an object")
+    return errors
+
+
+# -- the planner --------------------------------------------------------------
+
+
+def build_plan(manifest, old_manifest, observed):
+    actions = []
+
+    desired_crypttab = manifest["crypttabContent"]
+    observed_crypttab = observed["crypttabContent"]
+    if desired_crypttab != observed_crypttab:
+        actions.append({"op": "write-crypttab", "sha256": sha256_of(desired_crypttab)})
+
+    observed_units = observed.get("units", {})
+
+    new_unit_names = set()
+    for v in manifest.get("volumes", []):
+        unit_name = v.get("mountUnitName")
+        if unit_name is None:
+            continue
+        new_unit_names.add(unit_name)
+        desired_content = v["mountUnitContent"]
+        current = observed_units.get(unit_name)
+        if current is None:
+            actions.append({"op": "create-mount", "unitName": unit_name, "sha256": sha256_of(desired_content)})
+        elif current != desired_content:
+            actions.append({"op": "update-mount", "unitName": unit_name, "sha256": sha256_of(desired_content)})
+        # else: already converged, no action.
+
+    if old_manifest is not None:
+        for v in old_manifest.get("volumes", []):
+            unit_name = v.get("mountUnitName")
+            if unit_name is None or unit_name in new_unit_names:
+                continue
+            if unit_name in observed_units:
+                actions.append({"op": "remove-mount", "unitName": unit_name})
+
+    return {
+        "version": 1,
+        "empty": not actions,
+        "actions": actions,
+    }
+
+
+def cmd_plan(args):
+    manifest = load_json(args.manifest)
+    if manifest is None:
+        die("--manifest is required")
+    m_errors = validate_manifest(manifest, "manifest")
+    if m_errors:
+        die("manifest failed validation:\n" + "\n".join(f"  - {e}" for e in m_errors))
+
+    old_manifest = load_json(args.old_manifest, None)
+    if old_manifest is not None:
+        o_errors = validate_manifest(old_manifest, "old-manifest")
+        if o_errors:
+            die("--old-manifest failed validation:\n" + "\n".join(f"  - {e}" for e in o_errors))
+
+    observed = load_json(args.observed, {"version": 1, "crypttabContent": "", "units": {}})
+    obs_errors = validate_observed(observed)
+    if obs_errors:
+        die("observed state failed validation:\n" + "\n".join(f"  - {e}" for e in obs_errors))
+
+    plan = build_plan(manifest, old_manifest, observed)
+    write_json(plan, args.out)
+    sys.exit(0)
+
+
+# -- observe: real /etc/crypttab + a real mount-units dir -> observed JSON --
+
+
+def cmd_observe(args):
+    crypttab_content = ""
+    if args.crypttab_file is not None and os.path.isfile(args.crypttab_file):
+        with open(args.crypttab_file, encoding="utf-8") as f:
+            crypttab_content = f.read()
+
+    units = {}
+    if args.units_dir is not None and os.path.isdir(args.units_dir):
+        for entry in sorted(os.listdir(args.units_dir)):
+            if not entry.endswith(".mount"):
+                continue
+            path = os.path.join(args.units_dir, entry)
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as f:
+                units[entry] = f.read()
+
+    write_json({"version": 1, "crypttabContent": crypttab_content, "units": units}, args.out)
+    sys.exit(0)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description=(
+            "Passphrase-LUKS crypttab/mount-unit convergence planner and "
+            "observed-state reader (SPEC.md §11 M4; issue #83, milestone M4)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_plan = sub.add_parser("plan", help="compute a convergence plan from a manifest + observed state")
+    p_plan.add_argument("--manifest", required=True, help="declared crypttab manifest (nix/crypttab.nix's render output)")
+    p_plan.add_argument("--old-manifest", default=None, dest="old_manifest", help="the PREVIOUS generation's declared manifest (used only for mount-unit removal scope)")
+    p_plan.add_argument("--observed", default=None, help="observed state JSON (default: assume an empty /etc/crypttab and no installed units)")
+    p_plan.add_argument("--out", default=None, help="write the plan here instead of stdout")
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_obs = sub.add_parser("observe", help="read a real (or fixture) /etc/crypttab + mount-units dir and emit observed-state JSON")
+    p_obs.add_argument("--crypttab-file", default=None, dest="crypttab_file", help="a real (or fixture) /etc/crypttab path (default: treated as empty)")
+    p_obs.add_argument("--units-dir", default=None, dest="units_dir", help="a real (or fixture) directory of installed *.mount unit files (default: treated as empty)")
+    p_obs.add_argument("--out", default=None, help="write the observed state here instead of stdout")
+    p_obs.set_defaults(func=cmd_observe)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except (OSError, json.JSONDecodeError) as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()

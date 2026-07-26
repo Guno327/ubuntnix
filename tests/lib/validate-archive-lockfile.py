@@ -28,8 +28,28 @@ enforcement of the identical shape):
         ...
       ]
     },
-    "esm": { "packages": [] }           # must exist, must be empty in M1
+    "esm": {
+      "packages": [                      # [] until a real Pro-token-backed
+                                          # pin exists (SPEC.md §4.4/§8.2,
+                                          # GitHub issue #81, M4); once
+                                          # populated, each entry needs:
+        { "name": ..., "version": ..., "sha256": <64 hex>,
+          "path": "pool/....deb", "source": "esm" },
+        ...
+      ]
+    }
   }
+
+esm.packages entries (GitHub issue #81, milestone M4): pinned directly by
+(name, version, sha256) per SPEC.md §4.4's second bullet -- no snapshot
+timestamp exists for esm -- plus `path` (the esm.ubuntu.com pool-relative
+path bin/ubx-resolve-esm's fetcher needs) and a `source` field that MUST
+read exactly "esm", the marker that distinguishes an esm-tier entry from a
+public-tier one for any consumer working from a flattened package list
+(e.g. bin/ubx-archive-public-manifest's exclusion guard). An empty list
+remains valid -- that's the M1-through-M4-plumbing default until the owner
+runs bin/ubx-resolve-esm with a real Ubuntu Pro token against a real
+esm-pocket declaration and commits the result.
 
 Usage: validate-archive-lockfile.py PATH
 Exits 0 and prints "OK: ..." on success; exits 1 and prints "FAIL: ..." (one
@@ -146,7 +166,12 @@ for i, pkg in enumerate(packages):
         ):
             fail(f"{label} field '{str_field}' must be a non-empty string, got {pkg[str_field]!r}")
 
-# -- esm tier -----------------------------------------------------------
+# -- esm tier ------------------------------------------------------------
+# (SPEC.md §4.4 second bullet, §8.2; GitHub issue #81, milestone M4: the
+# tier may now be populated, pinned by (name, version, sha256) plus `path`
+# and a `source: "esm"` marker -- see this file's header. An empty list
+# stays valid too: that's the default until a real Pro-token-backed pin
+# exists.)
 esm = data.get("esm")
 if not isinstance(esm, dict):
     fail(f"'esm' must be an object, got {type(esm).__name__}")
@@ -155,11 +180,50 @@ if not isinstance(esm, dict):
 esm_packages = esm.get("packages")
 if not isinstance(esm_packages, list):
     fail(f"'esm.packages' must be a list, got {type(esm_packages).__name__}")
-elif esm_packages != []:
-    fail(
-        "'esm.packages' must be an empty list in M1 (esm fetching lands in "
-        f"M4 -- SPEC.md §4.4, R4); got {len(esm_packages)} entries"
-    )
+    esm_packages = []
+
+ESM_REQUIRED_FIELDS = ("name", "version", "sha256", "path", "source")
+esm_seen_names = set()
+for i, pkg in enumerate(esm_packages):
+    if not isinstance(pkg, dict):
+        fail(f"esm.packages[{i}] must be an object, got {type(pkg).__name__}")
+        continue
+
+    label = f"esm.packages[{i}] ({pkg.get('name', '<unnamed>')!r})"
+
+    missing = [f for f in ESM_REQUIRED_FIELDS if f not in pkg]
+    if missing:
+        fail(f"{label} missing required field(s): {', '.join(missing)}")
+
+    name = pkg.get("name")
+    if isinstance(name, str):
+        if name in esm_seen_names:
+            fail(f"duplicate package name in esm.packages: {name!r}")
+        esm_seen_names.add(name)
+    elif "name" in pkg:
+        fail(f"{label} 'name' must be a string, got {type(name).__name__}")
+
+    if "sha256" in pkg:
+        sha256 = pkg["sha256"]
+        if not isinstance(sha256, str) or not SHA256_RE.match(sha256):
+            fail(f"{label} 'sha256' must match ^[0-9a-f]{{64}}$, got {sha256!r}")
+
+    if "version" in pkg and (
+        not isinstance(pkg["version"], str) or not pkg["version"]
+    ):
+        fail(f"{label} 'version' must be a non-empty string, got {pkg['version']!r}")
+
+    if "path" in pkg:
+        pkg_path = pkg["path"]
+        if not isinstance(pkg_path, str) or not pkg_path:
+            fail(f"{label} 'path' must be a non-empty string, got {pkg_path!r}")
+
+    if "source" in pkg and pkg["source"] != "esm":
+        fail(
+            f"{label} 'source' must be exactly \"esm\" (the marker "
+            f"distinguishing an esm-tier entry from a public-tier one), "
+            f"got {pkg['source']!r}"
+        )
 
 if errors:
     print(f"FAIL: {path} failed schema validation:", file=sys.stderr)
@@ -167,5 +231,8 @@ if errors:
         print(f"  - {e}", file=sys.stderr)
     sys.exit(1)
 
-print(f"OK: {path} ({len(packages)} public package(s), schema valid)")
+print(
+    f"OK: {path} ({len(packages)} public package(s), "
+    f"{len(esm_packages)} esm package(s), schema valid)"
+)
 sys.exit(0)

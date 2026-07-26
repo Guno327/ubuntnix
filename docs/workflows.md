@@ -162,7 +162,15 @@ authentication is interim (SSH keys, from M2).
     fetched with the machine's or CI's own Ubuntu Pro token. esm content is
     subscription-gated and never redistributed — the public project cache
     and public ISOs/images contain only public-pocket packages, mirroring
-    how upstream only exposes esm after `pro attach`.
+    how upstream only exposes esm after `pro attach`. `bin/ubx-resolve-esm`
+    (milestone M4, GitHub issue #81) is the esm-tier sibling of
+    `bin/ubx-resolve`: given already-resolved `(name, version, path)` pins,
+    it fetches each with the Pro token and emits hash-verified lockfile
+    entries carrying a `"source": "esm"` marker; `nix/archive.nix`'s
+    `fetchEsmDeb` consumes the same token (env-only, via the
+    `UBUNTNIX_CI_PRO_TOKEN` CI secret) at build time. `bin/ubx-archive-
+    public-manifest` builds the public-cache/ISO manifest and, by
+    construction, never reads the esm tier at all.
 - **The snap lockfile** — pins `(name, revision, assertion hashes)`;
   payloads are vendored as fixed-output derivations and installed via
   `snap ack` plus signed sideload.

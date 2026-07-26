@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# bin/ubx-resolve-esm — esm-pocket archive resolution: declared
+# (name, version, path) pins -> the esm tier of archive.lock.json
+# (SPEC.md §4.4 second bullet, §8.2; GitHub issue #81, milestone M4).
+#
+# -- Mirrors bin/ubx-resolve's own shape, deliberately -----------------------
+#
+# This is the esm-tier sibling of bin/ubx-resolve (see that script's header
+# for the fuller "why does this live outside Nix, as a script under bin/"
+# argument — the same reasoning applies verbatim). It is kept as a SEPARATE
+# script rather than a mode of bin/ubx-resolve itself, on purpose: the
+# public tier's resolver/emitter is pinned byte-for-byte by
+# tests/unit/051-archive-resolve-emit.sh and friends, and this issue's own
+# constraint is "keep the existing public-pocket snapshot tier UNCHANGED".
+# A second script with its own emission logic makes that guarantee trivial
+# to hold, rather than threading a second code path through an
+# already-large existing one.
+#
+# -- Why esm resolution differs from the public tier -------------------------
+#
+# esm.ubuntu.com has NO snapshot service (SPEC.md §4.4, R4) and its indices
+# are themselves subscription-gated (a plain `apt-get update` against it
+# needs a Pro-attached apt, which this script does not attempt to
+# replicate) — so this script does not run an apt solve at all. Instead it
+# takes a DECLARATION of exact (name, version, path) pins the operator has
+# already resolved against a real Pro-attached host (e.g. by running
+# `apt-get install --print-uris` there once, the same way bin/ubx-resolve
+# does, just on a machine that actually has esm indices) and turns that
+# into pinned, hash-verified lockfile entries — i.e. this script's job
+# starts one step later than bin/ubx-resolve's: given exact pins, fetch
+# with the Pro token, hash locally, emit. It does not choose versions.
+#
+# Declaration shape (a JSON array — no wrapping object, since esm has no
+# series/components of its own the way archive.packages.json's public
+# declaration does):
+#   [ { "name": "some-universe-pkg", "version": "1.2.3-1ubuntu1~esm1",
+#       "path": "pool/esm-infra/main/s/some-universe-pkg/some-universe-pkg_1.2.3-1ubuntu1~esm1_amd64.deb" },
+#     ... ]
+# `path` is esm.ubuntu.com's own pool-relative path (mirroring the public
+# archive's own pool/<component>/... convention, but under an esm-specific
+# pocket prefix — confirm the exact current layout against a real
+# Pro-attached host; this script does not invent or guess it).
+#
+# -- The Pro token: UBUNTNIX_CI_PRO_TOKEN, env-only, never printed -----------
+#
+# The ONE environment variable this whole project reads an Ubuntu Pro token
+# from (nix/archive.nix's fetchEsmDeb reads the identical name for the
+# Nix-build-time fetch path; keep both in lockstep — tests/unit/056 checks
+# this). NEVER logged, echoed, or written to a file by this script: `set
+# -x` is never enabled, curl is invoked with `--user "$token:bearer"`
+# (never appears in argv the way a URL-embedded credential would show up
+# in a `ps` listing or a resolved-URL log line), and every error path below
+# reports THAT the token is missing/rejected, never its value.
+#
+# -- Emission: schema, sort order, and byte-stable formatting ---------------
+#
+# `emit_esm_lockfile`, below, is a PURE function of already-resolved esm
+# tuples (name/version/sha256/path; `source: "esm"` is added by this
+# function itself, never by the caller) — no network, just validate +
+# sort-by-name + merge into an existing archive.lock.json's `esm` section,
+# leaving that file's `public` section byte-for-byte untouched. Reachable
+# two ways:
+#   - the real path (this script's default mode): declaration -> fetch
+#     (Pro-token-authenticated) -> hash -> emit;
+#   - `--emit-lockfile FILE` (a testing hook, mirrors bin/ubx-resolve's own
+#     flag): skip declaration parsing and the network entirely, feed a
+#     fixture JSON array of already-resolved esm tuples straight into the
+#     same emission logic. This is what makes "esm lockfile emission
+#     schema + stable ordering/formatting" and "the hash-pinned fetch path"
+#     testable under tests/unit/ with NO network access and NO real Pro
+#     token (SPEC.md's own "unit tests must not require root, network, or
+#     KVM" rule, tests/README.md; and this issue's own "do not actually
+#     fetch from esm.ubuntu.com in tests" constraint).
+set -euo pipefail
+
+prog_name="ubx-resolve-esm"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The one env var this project ever reads a Pro token from — kept as a
+# single named constant so every reference (usage text, --check-token,
+# the real fetch path) stays in lockstep. Mirrors nix/archive.nix's
+# esmProTokenVar exactly (tests/unit/056 checks the two agree).
+PRO_TOKEN_VAR="UBUNTNIX_CI_PRO_TOKEN"
+
+usage() {
+  cat <<USAGE
+usage: ubx-resolve-esm [options]
+       ubx-resolve-esm --check-token
+       ubx-resolve-esm --emit-lockfile FILE [--archive-lockfile FILE] [--out FILE]
+
+Resolves esm-pocket (esm.ubuntu.com) package pins into the 'esm' tier of an
+archive lockfile (default: archive.lock.json), pinned by (name, version,
+sha256) plus the esm pool path (SPEC.md §4.4 second bullet, §8.2). Unlike
+bin/ubx-resolve, this does NOT run an apt solve — see this script's header
+for why esm resolution starts from an already-resolved (name, version,
+path) declaration rather than choosing versions itself.
+
+The 'public' tier of the target lockfile is read and re-emitted BYTE-FOR-
+BYTE unchanged; only the 'esm' section is replaced.
+
+options:
+  --declaration FILE      JSON array of {name, version, path} pins to
+                           fetch and hash (real resolution mode; requires
+                           network and the $PRO_TOKEN_VAR env var)
+  --archive-lockfile FILE existing lockfile to read the 'public' tier from
+                           and merge the resolved 'esm' tier into
+                           (default: archive.lock.json)
+  --out FILE               lockfile to write (default: same as
+                           --archive-lockfile)
+  --emit-lockfile FILE     testing/composition hook: skip declaration
+                           parsing and the network entirely. FILE is a
+                           JSON array of already-resolved esm tuples
+                           (objects with name/version/sha256/path); emits
+                           them through the exact same validate/sort/format
+                           logic real resolution uses, merged with the
+                           target lockfile's existing 'public' tier.
+  --check-token            print whether \$$PRO_TOKEN_VAR is set (never its
+                           value) and exit 0 if set, 1 if not. No network.
+  -h, --help               show this message
+
+Real resolution requires network access to esm.ubuntu.com, authenticated
+with \$$PRO_TOKEN_VAR (the machine's/CI's own Ubuntu Pro token — SPEC.md
+§8.2). --check-token and --emit-lockfile require neither network nor a
+token, and never print the token's value under any circumstance.
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+# -- --check-token: never prints the value, only whether it's set -----------
+check_token() {
+  if [ -n "${!PRO_TOKEN_VAR:-}" ]; then
+    echo "$prog_name: \$$PRO_TOKEN_VAR is set"
+    return 0
+  fi
+  echo "$prog_name: \$$PRO_TOKEN_VAR is not set -- esm-pocket fetches need the CI/machine Ubuntu Pro token (SPEC.md §8.2). This is a needs-owner item: obtaining a Pro token is an owner action (a Canonical account), not something this plumbing can do for itself." >&2
+  return 1
+}
+
+# -- lockfile emission (no network) ------------------------------------------
+#
+# emit_esm_lockfile RESOLVED_JSON ARCHIVE_LOCKFILE OUT_FILE
+#
+# RESOLVED_JSON is a JSON array of {name, version, sha256, path} objects
+# (order and extra fields don't matter — this validates, sorts by name,
+# and re-serializes only the required fields plus the "source": "esm"
+# marker this function itself adds). ARCHIVE_LOCKFILE must already exist
+# and pass schema validation; its 'public' section (and 'version') is
+# copied through byte-for-byte-equivalent (same JSON values, same
+# formatting as this script's own canonical serialization -- see
+# tests/unit/057 for the exact byte-stability check against a fixture
+# archive.lock.json). Writes atomically (OUT_FILE.tmp then rename).
+emit_esm_lockfile() {
+  local resolved_file="$1" archive_lockfile="$2" out_file="$3"
+  python3 - "$resolved_file" "$archive_lockfile" "$out_file" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+resolved_file, archive_lockfile, out_file = sys.argv[1:4]
+
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REQUIRED = ("name", "version", "sha256", "path")
+
+try:
+    with open(archive_lockfile, encoding="utf-8") as f:
+        base = json.load(f)
+except OSError as e:
+    print(f"error: could not read {archive_lockfile}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"error: {archive_lockfile} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(base, dict) or "public" not in base or "version" not in base:
+    print(
+        f"error: {archive_lockfile} does not look like an archive lockfile "
+        "(missing 'version'/'public') -- refusing to merge into it",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+try:
+    with open(resolved_file, encoding="utf-8") as f:
+        resolved = json.load(f)
+except OSError as e:
+    print(f"error: could not read {resolved_file}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"error: {resolved_file} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(resolved, list):
+    print(
+        f"error: {resolved_file} must contain a JSON array of resolved esm "
+        "tuples (an empty array is fine -- it means no esm pins yet)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+errors = []
+seen = set()
+for i, pkg in enumerate(resolved):
+    label = f"resolved[{i}]"
+    if not isinstance(pkg, dict):
+        errors.append(f"{label} is not an object")
+        continue
+
+    missing = [f for f in REQUIRED if f not in pkg]
+    if missing:
+        errors.append(f"{label} missing required field(s): {', '.join(missing)}")
+        continue
+
+    name = pkg["name"]
+    label = f"{label} ({name!r})"
+    if not isinstance(name, str) or not name:
+        errors.append(f"{label} 'name' must be a non-empty string")
+    elif name in seen:
+        errors.append(f"duplicate package name: {name!r}")
+    seen.add(name)
+
+    sha256 = pkg["sha256"]
+    if not isinstance(sha256, str) or not SHA256_RE.match(sha256):
+        errors.append(f"{label} has a malformed sha256 (want 64 lowercase hex chars): {sha256!r}")
+
+    version = pkg["version"]
+    if not isinstance(version, str) or not version:
+        errors.append(f"{label} 'version' must be a non-empty string")
+
+    path = pkg["path"]
+    if not isinstance(path, str) or not path:
+        errors.append(f"{label} 'path' must be a non-empty string")
+
+    # If the caller's fixture already carries a 'source', it must agree --
+    # this function is the ONE place that stamps the marker, so a caller
+    # claiming a different source is almost certainly a mistake, not intent.
+    if "source" in pkg and pkg["source"] != "esm":
+        errors.append(f"{label} carries a 'source' of {pkg['source']!r}, expected \"esm\" or absent")
+
+if errors:
+    print("error: resolved esm package data failed validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+packages = sorted(
+    (
+        {
+            "name": pkg["name"],
+            "version": pkg["version"],
+            "sha256": pkg["sha256"],
+            "path": pkg["path"],
+            "source": "esm",
+        }
+        for pkg in resolved
+    ),
+    key=lambda p: p["name"],
+)
+
+out = dict(base)
+out["esm"] = {
+    "_comment": (
+        "ubuntnix esm-pocket lockfile entries (SPEC.md §4.4 second bullet, "
+        "§8.2; GitHub issue #81, milestone M4). Generated by "
+        "bin/ubx-resolve-esm: pinned directly by (name, version, sha256) "
+        "-- no snapshot service exists for esm.ubuntu.com -- plus the esm "
+        "pool path each entry was fetched from, using the CI/machine's own "
+        "Ubuntu Pro token (never committed; env-only, see that script's "
+        "header). 'source': \"esm\" on every entry marks it as "
+        "subscription-gated and NEVER eligible for the public project "
+        "cache or public ISOs/images -- see bin/ubx-archive-public-"
+        "manifest, which excludes esm entries by construction. Packages "
+        "are sorted by name for a stable diff."
+    ),
+    "packages": packages,
+}
+
+text = json.dumps(out, indent=2, ensure_ascii=False) + "\n"
+
+tmp_out = out_file + ".tmp"
+with open(tmp_out, "w", encoding="utf-8") as f:
+    f.write(text)
+os.replace(tmp_out, out_file)
+
+print(f"wrote {len(packages)} esm package(s) to {out_file}")
+PYEOF
+}
+
+# -- declaration parsing (no network) ----------------------------------------
+#
+# Prints a JSON array of {name, version, path} to stdout on success (the
+# declaration, re-serialized after validation, ready to feed into
+# real resolution). Prints every violation to stderr on failure.
+validate_declaration() {
+  local file="$1"
+  [ -f "$file" ] || die "declaration file does not exist: $file"
+  python3 - "$file" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+errors = []
+
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except OSError as e:
+    print(f"FAIL: could not read {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"FAIL: {path} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(data, list):
+    print(f"FAIL: {path} top level must be a JSON array", file=sys.stderr)
+    sys.exit(1)
+
+seen = set()
+for i, entry in enumerate(data):
+    label = f"declaration[{i}]"
+    if not isinstance(entry, dict):
+        errors.append(f"{label} is not an object")
+        continue
+    for field in ("name", "version", "path"):
+        if field not in entry or not isinstance(entry[field], str) or not entry[field]:
+            errors.append(f"{label} missing/invalid required field '{field}'")
+    name = entry.get("name")
+    if isinstance(name, str):
+        if name in seen:
+            errors.append(f"duplicate package name in declaration: {name!r}")
+        seen.add(name)
+
+if errors:
+    print(f"FAIL: {path} failed schema validation:", file=sys.stderr)
+    for e in errors:
+        print(f"  - {e}", file=sys.stderr)
+    sys.exit(1)
+
+json.dump(data, sys.stdout)
+PYEOF
+}
+
+# -- real resolution: declaration -> Pro-token-authenticated fetch -> hash ---
+resolve_esm() {
+  local declaration_file="$1" archive_lockfile="$2" out_file="$3"
+
+  check_token || die "cannot fetch esm pockets: \$$PRO_TOKEN_VAR is not set (see --help)"
+
+  command -v curl > /dev/null 2>&1 || die "curl not found on PATH"
+
+  local decl_json
+  decl_json="$(validate_declaration "$declaration_file")" || exit 1
+
+  local work resolved_tmp
+  work="$(mktemp -d)"
+  resolved_tmp="$(mktemp)"
+  trap 'rm -rf "$work" "$resolved_tmp"' EXIT
+
+  echo "$prog_name: fetching esm-pocket packages from esm.ubuntu.com..." >&2
+  python3 - "$decl_json" "$work" > "$resolved_tmp" <<'PYEOF'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+decl_json, work = sys.argv[1:3]
+declaration = json.loads(decl_json)
+
+token = os.environ.get("UBUNTNIX_CI_PRO_TOKEN")
+if not token:
+    # Belt-and-suspenders: resolve_esm() above already checked this, but
+    # never trust a caller of this inline block alone with a secret-bearing
+    # network call.
+    print("error: UBUNTNIX_CI_PRO_TOKEN is not set", file=sys.stderr)
+    sys.exit(1)
+
+entries = []
+for pkg in declaration:
+    name, version, path = pkg["name"], pkg["version"], pkg["path"]
+    dest = os.path.join(work, os.path.basename(path))
+    url = f"https://esm.ubuntu.com/{path}"
+    # --user token:bearer -- never on argv as "token" alone, and curl never
+    # echoes credentials to stdout/stderr on success or on a clean HTTP
+    # failure; --fail suppresses the response body entirely, so an auth
+    # rejection reports curl's own generic HTTP-error message, not the
+    # token.
+    subprocess.run(
+        [
+            "curl", "--fail", "--silent", "--show-error", "--location",
+            "--user", f"{token}:bearer",
+            "-o", dest, url,
+        ],
+        check=True,
+    )
+    with open(dest, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    entries.append({"name": name, "version": version, "sha256": digest, "path": path})
+
+json.dump(entries, sys.stdout)
+PYEOF
+
+  emit_esm_lockfile "$resolved_tmp" "$archive_lockfile" "$out_file"
+}
+
+main() {
+  local declaration_file=""
+  local archive_lockfile="$script_dir/../archive.lock.json"
+  local out_file=""
+  local check_only=0
+  local emit_from=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --declaration)
+        [ $# -ge 2 ] || die "--declaration requires an argument"
+        declaration_file="$2"
+        shift 2
+        ;;
+      --archive-lockfile)
+        [ $# -ge 2 ] || die "--archive-lockfile requires an argument"
+        archive_lockfile="$2"
+        shift 2
+        ;;
+      --out)
+        [ $# -ge 2 ] || die "--out requires an argument"
+        out_file="$2"
+        shift 2
+        ;;
+      --emit-lockfile)
+        [ $# -ge 2 ] || die "--emit-lockfile requires an argument"
+        emit_from="$2"
+        shift 2
+        ;;
+      --check-token)
+        check_only=1
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "$prog_name: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  [ -n "$out_file" ] || out_file="$archive_lockfile"
+
+  if [ "$check_only" = 1 ]; then
+    check_token
+    exit $?
+  fi
+
+  if [ -n "$emit_from" ]; then
+    [ -f "$emit_from" ] || die "resolved-esm-package file does not exist: $emit_from"
+    [ -f "$archive_lockfile" ] || die "archive lockfile does not exist: $archive_lockfile"
+    emit_esm_lockfile "$emit_from" "$archive_lockfile" "$out_file"
+    exit 0
+  fi
+
+  [ -n "$declaration_file" ] || die "--declaration is required for real resolution (see --help)"
+  [ -f "$archive_lockfile" ] || die "archive lockfile does not exist: $archive_lockfile"
+
+  resolve_esm "$declaration_file" "$archive_lockfile" "$out_file"
+}
+
+main "$@"

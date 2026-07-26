@@ -199,20 +199,32 @@
 #       documented fallback, not a mystery to re-derive).
 #     - (GitHub issue #48) /.ubx-fakeroot-state — the saved fakeroot
 #       ownership/mode database (see this file's own "GitHub issue #48"
-#       header section). Its content should likewise be a deterministic
-#       function of the packages unpacked (same dev/inode-keyed records
-#       every time, given an identical unpack order — already pinned by
-#       `unpackLines` above), but this file has NOT independently verified
-#       byte-for-byte stability of fakeroot's own on-disk save-file
-#       serialization across two independent builds (record order keyed
-#       by internal (dev, inode) pairs, which are themselves a function of
-#       allocation order on this build's own filesystem — plausibly, but
-#       not provably, deterministic given a fixed unpack sequence). The
-#       two-run CI comparison is what actually proves or disproves this,
-#       exactly like the debconf .dat note above; if it flags this file,
-#       the follow-up is sorting/normalizing the save-file's own record
-#       order before squashfsImage reads it back, not re-deriving this
-#       comment.
+#       header section). NORMALIZED here now (issue #22 follow-up), no
+#       longer a residual risk: the CI two-run comparison DID flag this
+#       file, exactly as the previous version of this note anticipated it
+#       might. fakeroot's own raw `-s` save-file is keyed by the real
+#       (dev, inode) pairs of every file on THIS build's filesystem, and
+#       those inode numbers are allocated by the underlying store
+#       filesystem's own free-inode allocator — a function of global fs
+#       state, NOT of this build's unpack order — so they differ between
+#       any two independent builds (the registered path vs. the
+#       `--rebuild` `.check` path). That makes the raw save-file's
+#       serialized bytes non-reproducible in BOTH record order AND the
+#       key VALUES themselves; sorting record order alone could never fix
+#       the differing inode values. The fix (see the "normalize the
+#       fakeroot save-file" block at the end of composeRootfs's builder
+#       below, and pack.sh's matching reconstruction in squashfsImage):
+#       AFTER the fakeroot session has fully exited and written the raw
+#       file, rewrite it — from OUTSIDE the chroot — into a deterministic,
+#       inode-INDEPENDENT manifest keyed by PATH (`<path>\t<owner/mode
+#       tail>`, sorted `LC_ALL=C`), dropping the non-deterministic
+#       (dev,inode) key entirely. squashfsImage then RECONSTRUCTS a real,
+#       (dev,inode)-keyed fakeroot save-file from that manifest against the
+#       store path's OWN actual inodes at pack time and loads THAT via
+#       `-i`, so mksquashfs still sees the true owner/mode — and, as a
+#       bonus, this no longer depends on Nix having preserved compose's
+#       build-time inodes into the registered store path at all (see the
+#       "cross-derivation (dev,inode)" note in squashfsImage below).
 #     - any maintainer script that embeds genuinely random or
 #       machine-specific data into a file it manages (SSH host keys,
 #       D-Bus/systemd machine-id generation, ...) is categorically outside
@@ -840,6 +852,102 @@ let
           echo "composeRootfs: $out/.ubx-fakeroot-state is missing -- the fakeroot session never saved its state" >&2
           exit 1
         }
+
+        # GitHub issue #48 / issue #22 R1 determinism: NORMALIZE the raw
+        # fakeroot save-file into a deterministic, inode-INDEPENDENT
+        # manifest. See this file's header "NOT normalized -> NORMALIZED"
+        # note for the full rationale; in short: fakeroot's own `-s` output
+        # keys every record by the real (dev, inode) pair of the file on
+        # THIS build's store filesystem, and those inode numbers are
+        # allocated non-deterministically per build (the store fs's own
+        # free-inode allocator, not our unpack order), so the raw file's
+        # bytes differ across two independent builds and fail CI's strict R1
+        # `--rebuild` check -- in the key VALUES themselves, not merely
+        # record order, so a plain sort could never fix it.
+        #
+        # This runs from OUTSIDE the chroot, AFTER the fakeroot session has
+        # fully exited (the `unshare ... enter.sh` above returned, which is
+        # what makes fakeroot flush its `-s` save-file), and BEFORE the
+        # epoch mtime-touch just below -- exactly the one vantage point that
+        # sees the completed raw file. Every tool here is a dynamically-
+        # linked ubuntu-base binary invoked through the loader wrapper
+        # (`ubxrun`), same BOOTSTRAP CAVEAT as everything else pre-chroot;
+        # scratch files go in the builder's cwd (a writable Nix build temp
+        # dir, NOT $out), so they never enter the registered store path.
+        #
+        # The rewrite: for every file in the tree, join its real inode to
+        # the raw record with that inode, and emit `<relative path>\t<the
+        # record's owner/mode tail>` -- i.e. drop the leading
+        # `dev=..,ino=..,` (the ONLY non-deterministic part) and keep
+        # fakeroot's OWN verbatim `mode=..,uid=..,gid=..,nlink=..,rdev=..`
+        # text (so we never have to re-serialize those fields ourselves).
+        # Sorted `LC_ALL=C` by path -> byte-identical across builds given
+        # the same (already pinned) tree. squashfsImage's pack.sh rebuilds
+        # a real (dev,inode)-keyed fakeroot save-file from this manifest
+        # against the store path's own actual inodes -- see its own comment.
+        ubxrun "$UBX_BASE/bin/cat" > ubx-fakeroot-normalize.awk <<'UBX_NORMALIZE_AWK'
+        # Args: <raw fakeroot save-file> <find "%i\t%P" output>. Emits
+        # `<path>\t<owner/mode tail>` for each tree file whose real inode
+        # has a raw record. Raw record shape (fakeroot-sysv, stable for
+        # 15+ years): dev=<hex>,ino=<dec>,mode=<oct>,uid=<dec>,gid=<dec>,
+        # nlink=<dec>,rdev=<hex> -- dev and ino are ALWAYS the first two
+        # fields, which is all this transform relies on (any extra trailing
+        # fields a future fakeroot adds are preserved verbatim in the tail).
+        BEGIN { FS = "\t" }
+        FNR == NR {
+          line = $0
+          if (line !~ /^dev=[^,]+,ino=[0-9]+,/) next
+          ino = line; sub(/^dev=[^,]+,ino=/, "", ino); sub(/,.*/, "", ino)
+          tail = line; sub(/^dev=[^,]+,ino=[^,]+,/, "", tail)
+          rec[ino] = tail
+          next
+        }
+        { ino = $1; path = $2; if (path != "" && (ino in rec)) print path "\t" rec[ino] }
+        UBX_NORMALIZE_AWK
+
+        # Locate the CONCRETE awk binary, not the bare `/usr/bin/awk` name:
+        # that is an update-alternatives symlink to the ABSOLUTE path
+        # `/etc/alternatives/awk`, which -- exactly like the `fakeroot`/
+        # `faked` alternatives symlinks this file's own fakeroot-discovery
+        # block documents -- does NOT resolve out here PRE-chroot (there is
+        # no real `/etc/alternatives` root yet; that only works once chroot
+        # repoints `/`). `find`/`sort`/`wc`/`touch` used here are ordinary
+        # coreutils/findutils REGULAR files, so they need no such discovery;
+        # only awk does. `read` is a bash builtin (no child exec), so no
+        # loader wrapping and no pipe (which would fork a bare-name child).
+        ubxrun "$UBX_BASE/usr/bin/find" "$UBX_BASE" -path '*/bin/*' -type f \( -name mawk -o -name gawk -o -name original-awk \) > ubx-awk-path
+        read -r ubx_awk < ubx-awk-path || true
+        [ -n "$ubx_awk" ] || {
+          echo "composeRootfs: could not locate a concrete awk (mawk/gawk) under $UBX_BASE to normalize the fakeroot save-file" >&2
+          exit 1
+        }
+
+        # `%P` = path relative to the start point (no leading slash), so the
+        # manifest's keys match pack.sh's own `find /mnt/rootfs -printf %P`.
+        # Prune the save-file itself (its own inode is never in the db --
+        # fakeroot writes `-s` at session exit, after all stats -- but prune
+        # keeps the intent explicit and the manifest self-consistent).
+        ubxrun "$UBX_BASE/usr/bin/find" "$out" -path "$out/.ubx-fakeroot-state" -prune -o -printf '%i\t%P\n' > ubx-fakeroot-inos
+        ubxrun "$ubx_awk" -f ubx-fakeroot-normalize.awk "$out/.ubx-fakeroot-state" ubx-fakeroot-inos > ubx-fakeroot-manifest
+        # Export (not a var-prefix on the ubxrun function -- that would not
+        # reliably reach `sort`'s own environment) so the byte-exact record
+        # ordering is locale-independent; C collation is what makes the
+        # sorted manifest reproducible across machines/runners.
+        export LC_ALL=C
+        ubxrun "$UBX_BASE/usr/bin/sort" ubx-fakeroot-manifest > "$out/.ubx-fakeroot-state"
+
+        # Loud guard: a real dpkg unpack chmod/chown-touches (hence records)
+        # hundreds of files, so an EMPTY manifest here means the find/awk
+        # join silently produced nothing (a bug worth catching now rather
+        # than as a silently-wrong squashfs later -- compose-image-proof
+        # only checks the image's magic, not its ownership fidelity).
+        ubx_manifest_n="$(ubxrun "$UBX_BASE/usr/bin/wc" -l < "$out/.ubx-fakeroot-state")"
+        [ "$ubx_manifest_n" -gt 0 ] || {
+          echo "composeRootfs: normalized fakeroot manifest is empty -- the inode/path join produced no records (raw save-file present but nothing correlated)" >&2
+          exit 1
+        }
+        ubxrun "$UBX_BASE/bin/rm" -f ubx-fakeroot-normalize.awk ubx-fakeroot-inos ubx-fakeroot-manifest ubx-awk-path
+
         ubxrun "$UBX_BASE/usr/bin/touch" -h -d @0 "$out/.ubx-fakeroot-state"
 
         # R1 mtime normalization (reset every mtime to the Unix epoch so
@@ -904,13 +1012,20 @@ let
   # (archive.lock.json's `squashfs-tools` + `liblzo2-2` entries -- see that
   # file's own comments for why exactly these two and not more).
   #
-  # GitHub issue #48: mksquashfs must run as a CLIENT of the SAME fakeroot
-  # session composeRootfs's own build saved to `rootfs`'s own
-  # "/.ubx-fakeroot-state" (see this file's header "GitHub issue #48"
-  # section) -- loading that state back via `-i` is what lets mksquashfs's
+  # GitHub issue #48: mksquashfs runs under fakeroot with the owner/mode
+  # database composeRootfs's own build produced at `rootfs`'s own
+  # "/.ubx-fakeroot-state" -- loading it via `-i` is what lets mksquashfs's
   # own stat(2) calls transparently see each path's TRUE owner/mode, with
-  # NO manifest, pseudo-file pass, or scan step at all (fully retiring the
-  # `-pf`/`-e` mechanism the previous scan-based interim needed).
+  # no pseudo-file (mksquashfs -pf) pass or scan step at all (fully
+  # retiring the scan-based interim's mechanism). NB (issue #22 R1
+  # determinism): that
+  # state file is no longer a raw fakeroot save-file but a deterministic,
+  # inode-INDEPENDENT path-keyed manifest (fakeroot's raw (dev,inode)-keyed
+  # form is inherently non-reproducible across builds -- see this file's
+  # header note); pack.sh reconstructs a real (dev,inode)-keyed save-file
+  # from it against /mnt/rootfs's actual inodes right before the `-i` load
+  # (see its own comment for exactly how and why that is also MORE robust
+  # than loading composeRootfs's build-time inodes ever was).
   #
   # fakeroot's own frontend is a shell script that execs further child
   # processes (faked, then the wrapped command) by bare/absolute path, so
@@ -1020,15 +1135,55 @@ let
           exit 1
         fi
 
-        # `-i`: load composeRootfs's saved fake ownership/mode database,
-        # so mksquashfs's OWN stat(2) calls against every path under
+        # GitHub issue #48 / issue #22 R1 determinism -- cross-derivation
+        # (dev,inode) reconstruction. `/mnt/rootfs/.ubx-fakeroot-state` is
+        # NOT a raw fakeroot save-file anymore: composeRootfs normalized it
+        # into a deterministic, inode-INDEPENDENT manifest
+        # (`<path>\t<mode=..,uid=..,gid=..,nlink=..,rdev=..>`, one line per
+        # composed file that fakeroot recorded, sorted LC_ALL=C -- see that
+        # builder's own "normalize the fakeroot save-file" block for why the
+        # raw inode-keyed form could never be made reproducible).
+        #
+        # fakeroot's `-i` load matches a record to a file STRICTLY by the
+        # real (st_dev, st_ino) the caller's own lstat(2) returns; the
+        # save-file format carries no path. So we rebuild a genuine
+        # (dev,inode)-keyed save-file HERE, against the inodes /mnt/rootfs
+        # ACTUALLY has at pack time: `find` reports each file's device
+        # (%D, decimal) and inode (%i) and path (%P), and awk re-prepends
+        # `dev=<hex>,ino=<dec>,` (the exact fakeroot-sysv key syntax) onto
+        # the manifest's verbatim owner/mode tail. This is strictly more
+        # robust than loading composeRootfs's own build-time inodes would
+        # have been: it depends on NOTHING about whether Nix preserved those
+        # inodes into the registered store path (store optimise/hardlinking,
+        # or any copy, would have silently broken a raw-save-file `-i` here).
+        find /mnt/rootfs -path /mnt/rootfs/.ubx-fakeroot-state -prune -o -printf '%D\t%i\t%P\n' > /mnt/out/.ubx-fakeroot-inos
+        awk -F'\t' '
+          FNR == NR { rec[$1] = $2; next }
+          { dev = $1; ino = $2; path = $3; if (path in rec) printf "dev=%x,ino=%s,%s\n", dev, ino, rec[path] }
+        ' /mnt/rootfs/.ubx-fakeroot-state /mnt/out/.ubx-fakeroot-inos > /mnt/out/.ubx-fakeroot-realdb
+
+        # Loud guard: every manifest path came FROM this very store tree at
+        # compose time, so all of them must still resolve here -- a mismatch
+        # means the reconstruction dropped records (a silently-wrong image
+        # otherwise, since compose-image-proof checks only the squashfs
+        # magic, not ownership).
+        manifest_n=$(wc -l < /mnt/rootfs/.ubx-fakeroot-state)
+        realdb_n=$(wc -l < /mnt/out/.ubx-fakeroot-realdb)
+        [ "$manifest_n" = "$realdb_n" ] || {
+          echo "pack.sh: reconstructed $realdb_n of $manifest_n fakeroot records -- manifest path/inode mismatch against /mnt/rootfs" >&2
+          exit 1
+        }
+
+        # `-i`: load the reconstructed real (dev,inode)-keyed database, so
+        # mksquashfs's OWN stat(2) calls against every path under
         # /mnt/rootfs transparently see the TRUE owner/mode -- no -pf, no
-        # -e, no manifest at all. `.ubx-fakeroot-state` itself is excluded
-        # from the packed image's content (it is composeRootfs's own
-        # bookkeeping, not part of the real Ubuntu system /mnt/rootfs
-        # otherwise represents).
+        # pseudo-file manifest. `.ubx-fakeroot-state` (and the scratch
+        # `.ubx-fakeroot-{inos,realdb}` under /mnt/out, which never enter
+        # the image anyway) is excluded from the packed image's content --
+        # it is composeRootfs's own bookkeeping, not part of the real
+        # Ubuntu system /mnt/rootfs otherwise represents.
         "$ubx_fakeroot_bin" --lib "$ubx_libfakeroot" --faked "$ubx_faked_bin" \
-          -i /mnt/rootfs/.ubx-fakeroot-state -- \
+          -i /mnt/out/.ubx-fakeroot-realdb -- \
           /mnt/tools/usr/bin/mksquashfs /mnt/rootfs /mnt/out/rootfs.squashfs \
           -mkfs-time 0 -all-time 0 -no-progress -processors 1 \
           -e .ubx-fakeroot-state

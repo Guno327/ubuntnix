@@ -142,13 +142,97 @@ if [ -n "$unpack_line" ] && [ -n "$configure_a_line" ]; then
     fail "unpackLines (line $unpack_line) does not come BEFORE dpkg --configure -a (line $configure_a_line)"
 fi
 
-# -- squashfsImage loads the SAME state-file path back, and packs with no
-# manifest/pseudo-file mechanism left at all -----------------------------
-grep -qE -- '-i /mnt/rootfs/\.ubx-fakeroot-state' "$compose_nix" ||
-  fail "$compose_nix's squashfsImage does not load /mnt/rootfs/.ubx-fakeroot-state back via fakeroot's -i"
+# -- squashfsImage packs with no -pf/pseudo-file mechanism, and loads a
+# fakeroot database back via -i --------------------------------------------
+#
+# Issue #22 R1 determinism: the persisted /.ubx-fakeroot-state is no longer
+# a raw (dev,inode)-keyed fakeroot save-file (those inode keys are allocated
+# non-deterministically per build, so the raw file fails the strict
+# `--rebuild` reproducibility check). composeRootfs now normalizes it into a
+# deterministic, inode-INDEPENDENT path-keyed manifest, and pack.sh
+# RECONSTRUCTS a real (dev,inode)-keyed save-file from that manifest against
+# /mnt/rootfs's own actual inodes before the -i load. Assert pack loads the
+# reconstructed db, not the raw state file directly.
+grep -qE -- '-i /mnt/out/\.ubx-fakeroot-realdb' "$compose_nix" ||
+  fail "$compose_nix's squashfsImage does not load the reconstructed /mnt/out/.ubx-fakeroot-realdb via fakeroot's -i (issue #22 determinism reconstruction)"
+
+grep -qF 'printf "dev=%x,ino=%s,%s\n"' "$compose_nix" ||
+  fail "$compose_nix's pack.sh does not reconstruct real (dev,inode) fakeroot keys from the normalized manifest"
 
 if grep -qE -- '-pf ' "$compose_nix"; then
   fail "$compose_nix still passes mksquashfs a -pf pseudo-file manifest -- GitHub issue #48 retires that mechanism entirely once fakeroot is wired in"
+fi
+
+# -- composeRootfs normalizes the raw save-file into a deterministic,
+# inode-independent manifest (issue #22 R1) ------------------------------
+grep -qF 'UBX_NORMALIZE_AWK' "$compose_nix" ||
+  fail "$compose_nix no longer defines the fakeroot save-file normalization step (UBX_NORMALIZE_AWK) -- issue #22 R1 determinism"
+
+# The normalization must happen from OUTSIDE the chroot AFTER the fakeroot
+# session wrote its raw save-file and BEFORE the epoch mtime-touch that
+# stamps it -- otherwise the file it rewrites would still be the raw one, or
+# the rewrite would clobber the epoch mtime. Both anchors are the literal
+# `.ubx-fakeroot-state` sort-into and the `touch -h -d @0` of that same file.
+# The single-quoted patterns intentionally match the LITERAL `$out` text as
+# it appears in compose.nix (not a shell expansion), so SC2016 is expected.
+# shellcheck disable=SC2016
+norm_line=$(grep -n 'sort" ubx-fakeroot-manifest > "$out/\.ubx-fakeroot-state"' "$compose_nix" | head -1 | cut -d: -f1)
+# shellcheck disable=SC2016
+touch_line=$(grep -n 'touch" -h -d @0 "$out/\.ubx-fakeroot-state"' "$compose_nix" | head -1 | cut -d: -f1)
+if [ -n "$norm_line" ] && [ -n "$touch_line" ]; then
+  [ "$norm_line" -lt "$touch_line" ] ||
+    fail "the fakeroot save-file normalization (line $norm_line) does not come BEFORE its epoch mtime-touch (line $touch_line)"
+else
+  fail "could not locate the normalization sort and/or the epoch mtime-touch of .ubx-fakeroot-state in $compose_nix"
+fi
+
+# -- DETERMINISM PROPERTY of the normalization logic ----------------------
+#
+# This dev harness has no fakeroot to produce a real save-file, but the
+# normalization is a plain awk join we CAN exercise directly. Extract the
+# actual awk program from compose.nix (same heredoc-extraction idiom this
+# file already uses for UBX_INNER_EOF) and run it over two synthetic raw
+# save-files that describe the SAME tree with DIFFERENT (dev,inode) key
+# values -- exactly what two independent builds produce. The normalized,
+# LC_ALL=C-sorted manifests MUST come out byte-identical (inode-independent)
+# and path-keyed. If they don't, the fix does not actually fix R1.
+if command -v awk >/dev/null 2>&1; then
+  norm_awk="$(mktemp)"
+  trap 'rm -f "$configure_sh" "$norm_awk"' EXIT
+  sed -n "/<<'UBX_NORMALIZE_AWK'\$/,/UBX_NORMALIZE_AWK\$/p" "$compose_nix" | sed '1d;$d' > "$norm_awk"
+  [ -s "$norm_awk" ] || fail "could not extract the UBX_NORMALIZE_AWK program from $compose_nix"
+
+  if [ -s "$norm_awk" ]; then
+    run_norm() { # <raw-db-file> <inos-file>
+      awk -f "$norm_awk" "$1" "$2" | LC_ALL=C sort
+    }
+    # Build 1: some plausible inode/dev allocation.
+    raw1="$(mktemp)"; ino1="$(mktemp)"
+    printf 'dev=801,ino=100,mode=104755,uid=0,gid=0,nlink=1,rdev=0\n' >  "$raw1"
+    printf 'dev=801,ino=200,mode=100640,uid=101,gid=102,nlink=1,rdev=0\n' >> "$raw1"
+    printf '100\tusr/bin/setuidtool\n' >  "$ino1"
+    printf '200\tetc/gshadow\n'        >> "$ino1"
+    # Build 2: SAME two paths, DIFFERENT dev and inode key values.
+    raw2="$(mktemp)"; ino2="$(mktemp)"
+    printf 'dev=fe02,ino=987654,mode=104755,uid=0,gid=0,nlink=1,rdev=0\n' >  "$raw2"
+    printf 'dev=fe02,ino=123,mode=100640,uid=101,gid=102,nlink=1,rdev=0\n' >> "$raw2"
+    printf '987654\tusr/bin/setuidtool\n' >  "$ino2"
+    printf '123\tetc/gshadow\n'           >> "$ino2"
+
+    m1="$(run_norm "$raw1" "$ino1")"
+    m2="$(run_norm "$raw2" "$ino2")"
+
+    [ "$m1" = "$m2" ] ||
+      fail "normalized fakeroot manifest is NOT inode-independent: differing (dev,inode) key values produced differing manifests (R1 would still fail)"
+
+    # The manifest must be path-keyed with the (dev,inode) key stripped and
+    # the owner/mode tail preserved verbatim, sorted by path.
+    expected="$(printf 'etc/gshadow\tmode=100640,uid=101,gid=102,nlink=1,rdev=0\nusr/bin/setuidtool\tmode=104755,uid=0,gid=0,nlink=1,rdev=0')"
+    [ "$m1" = "$expected" ] ||
+      fail "normalized manifest is not the expected path-keyed, (dev,inode)-stripped, sorted form; got: $m1"
+
+    rm -f "$raw1" "$ino1" "$raw2" "$ino2"
+  fi
 fi
 
 grep -qE 'packages = \[ "squashfs-tools" "liblzo2-2" "fakeroot" "libfakeroot" \]' "$compose_nix" ||

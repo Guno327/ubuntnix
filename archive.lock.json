@@ -1547,7 +1547,7 @@
     ]
   },
   "esm": {
-    "_comment": "Empty until M4 (SPEC.md §4.4, R4): esm.ubuntu.com has no snapshot service, so this tier is pinned directly by (name, version, arch, component, path, sha256, size) once M4 wires up fetching against a Pro token. esm content is subscription-gated and never redistributed publicly.",
+    "_comment": "Still empty (GitHub issue #81, milestone M4): esm.ubuntu.com has no snapshot service, so this tier is pinned directly by (name, version, sha256, path, source: \"esm\"). The fetching/resolution plumbing (nix/archive.nix's fetchEsmDeb/esmDebs, bin/ubx-resolve-esm) is wired up as of M4, but populating this list for real needs a real Ubuntu Pro token/subscription -- a needs-owner item; see bin/ubx-resolve-esm's header and docs/archive.md. esm content is subscription-gated and never redistributed publicly -- bin/ubx-archive-public-manifest excludes this tier by construction.",
     "packages": []
   }
 }

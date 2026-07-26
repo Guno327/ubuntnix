@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# bin/ubx-archive-public-manifest — builds the manifest of packages
+# eligible for the PUBLIC project cache / public ISOs/images from an
+# archive lockfile (SPEC.md §4.4 "esm content is subscription-gated and is
+# never redistributed", §10 "Public artifacts never include esm content";
+# GitHub issue #81, milestone M4).
+#
+# -- The boundary this enforces ----------------------------------------------
+#
+# esm-pocket packages (archive.lock.json's 'esm' tier) require the
+# consuming machine's own Ubuntu Pro token to even fetch (nix/archive.nix's
+# fetchEsmDeb) — mirroring upstream, where esm content only becomes
+# available to a machine after `pro attach`. SPEC.md is explicit that this
+# must never leak into anything served to the public: the R2-hosted
+# project binary cache and the Desktop/Server ISOs/prebuilt images must
+# contain public-pocket packages ONLY. This script is the one place that
+# boundary gets enforced mechanically rather than left to convention: it
+# reads an archive lockfile and emits a manifest containing ONLY the
+# 'public' tier, BY CONSTRUCTION — the script's own source never parses,
+# iterates, or even opens the 'esm' key of the input at all (see the
+# Python body below: `data.get("esm")` never appears anywhere in it), so
+# there is no code path through which an esm entry could accidentally end
+# up in the output, however the input lockfile is shaped. Whatever
+# eventually populates the R2 cache / ISO build (a later milestone) is
+# expected to consume THIS script's output, not archive.lock.json
+# directly, precisely so that boundary can't be bypassed by a future
+# caller reaching past this script into the full lockfile.
+#
+# A defensive belt-and-suspenders cross-check runs anyway (see "safety net"
+# below): even though the emission logic structurally cannot read the esm
+# tier, this script additionally verifies after the fact that no emitted
+# public entry's sha256 collides with any INPUT esm entry's sha256 --
+# catching, e.g., a future refactor that accidentally merges the two lists
+# upstream of this script, before that refactor ever reaches this file.
+#
+# Usage: ubx-archive-public-manifest [--lockfile FILE] [--out FILE]
+#   --lockfile FILE   archive lockfile to read (default: archive.lock.json)
+#   --out FILE        where to write the manifest (default: stdout)
+set -euo pipefail
+
+prog_name="ubx-archive-public-manifest"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<USAGE
+usage: ubx-archive-public-manifest [--lockfile FILE] [--out FILE]
+
+Reads an archive lockfile (default: archive.lock.json) and emits the
+public-cache manifest: the lockfile's 'public' tier only. The 'esm' tier
+is never read by this script's emission logic, by construction -- esm
+content is subscription-gated and must never reach the public project
+cache or public ISOs/images (SPEC.md §4.4, §10).
+
+options:
+  --lockfile FILE   archive lockfile to read (default: archive.lock.json)
+  --out FILE        manifest output file (default: stdout)
+  -h, --help        show this message
+USAGE
+}
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+lockfile="$script_dir/../archive.lock.json"
+out_file="-"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lockfile)
+      [ $# -ge 2 ] || die "--lockfile requires an argument"
+      lockfile="$2"
+      shift 2
+      ;;
+    --out)
+      [ $# -ge 2 ] || die "--out requires an argument"
+      out_file="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "$prog_name: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[ -f "$lockfile" ] || die "lockfile does not exist: $lockfile"
+
+python3 - "$lockfile" "$out_file" <<'PYEOF'
+import json
+import sys
+
+lockfile, out_file = sys.argv[1:3]
+
+with open(lockfile, encoding="utf-8") as f:
+    data = json.load(f)
+
+if not isinstance(data, dict) or "public" not in data:
+    print(f"error: {lockfile} does not look like an archive lockfile (no 'public' key)", file=sys.stderr)
+    sys.exit(1)
+
+public = data["public"]
+packages = public.get("packages", [])
+if not isinstance(packages, list):
+    print(f"error: {lockfile}'s public.packages is not a list", file=sys.stderr)
+    sys.exit(1)
+
+# -- the manifest itself: public tier only, nothing else read from `data`. --
+manifest = {
+    "version": 1,
+    "snapshot": public.get("snapshot"),
+    "series": public.get("series"),
+    "packages": packages,
+}
+
+# -- safety net: cross-check against the INPUT's esm tier (read here, ONLY
+# for this defensive assertion -- never merged into `manifest` above). If
+# any public-tier sha256 collides with an esm-tier one, something upstream
+# already blurred the two tiers together before this script ever ran; fail
+# loudly rather than silently ship whatever that produced.
+esm_entries = data.get("esm", {}).get("packages", []) if isinstance(data.get("esm"), dict) else []
+esm_hashes = {p.get("sha256") for p in esm_entries if isinstance(p, dict)}
+public_hashes = {p.get("sha256") for p in packages if isinstance(p, dict)}
+overlap = esm_hashes & public_hashes
+if overlap:
+    print(
+        f"error: {len(overlap)} sha256(s) appear in BOTH the esm and public "
+        f"tiers of {lockfile} -- esm content must never overlap with the "
+        "public-cache manifest (SPEC.md §4.4/§10): "
+        f"{sorted(overlap)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+text = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+if out_file == "-":
+    sys.stdout.write(text)
+else:
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"wrote public-cache manifest ({len(packages)} package(s)) to {out_file}", file=sys.stderr)
+PYEOF

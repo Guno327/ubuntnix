@@ -1,14 +1,18 @@
 # The archive lockfile
 
-```{admonition} Implemented (M1); esm tier lands at M4
+```{admonition} Implemented: public tier (M1), esm tier (M4)
 :class: note
 
 `archive.lock.json` and `nix/archive.nix` exist in the repository as of
 milestone **M1** (`SPEC.md` §4.4, issue #7): the schema below is real and
 the fetch mechanics described here actually run in CI (`.#archive-fetch-
-proof`). The `esm` tier's *shape* is part of the schema today but is
-intentionally left empty until milestone **M4** wires up fetching against
-an Ubuntu Pro token (`SPEC.md` §8.2). Rootfs composition — turning fetched
+proof`). Milestone **M4** (issue #81) wires up the `esm` tier's fetching
+against an Ubuntu Pro token (`SPEC.md` §8.2) — `bin/ubx-resolve-esm` and
+`nix/archive.nix`'s `fetchEsmDeb`/`esmDebs`. The committed lockfile's
+`esm.packages` remains `[]` today: populating it for real needs a real
+Ubuntu Pro token and subscription, which is a **needs-owner item** (see
+"CI Pro token" below) — the plumbing itself is real and tested against
+fixtures (`tests/unit/055`–`059`). Rootfs composition — turning fetched
 `.deb`s into a bootable image — is separate, later M1 work, not described
 here.
 ```
@@ -33,13 +37,16 @@ differently:
   **hash** is the durable trust root; the timestamp only drives
   *resolution* against the snapshot service the first time a package is
   fetched.
-- **`esm`** — the identical per-package shape, pinned directly by
-  `(name, version, sha256, ...)` with no snapshot timestamp (none exists
-  for esm), fetched at build/rebuild time using the machine's or CI's own
-  Ubuntu Pro token. This tier is present in the schema but **empty until
-  M4** (`SPEC.md` §8.2); esm content is never redistributed publicly, so a
-  populated `esm` tier could not ship in the public project cache or ISOs
-  even once M4 lands.
+- **`esm`** — pinned directly by `(name, version, sha256)` plus `path` and
+  a `source: "esm"` marker, with no snapshot timestamp (none exists for
+  esm), fetched at build/rebuild time using the machine's or CI's own
+  Ubuntu Pro token. Fetching is wired up as of **M4** (`SPEC.md` §8.2,
+  GitHub issue #81) but the committed lockfile's `esm.packages` is still
+  `[]` — populating it needs a real Pro token/subscription (a needs-owner
+  item). esm content is never redistributed publicly: `bin/ubx-archive-
+  public-manifest` builds the public project cache / ISO manifest from the
+  `public` tier only, and never reads `esm` at all — so a populated `esm`
+  tier still can't leak into anything served to the public.
 
 ## Resolving the public tier: three suites, one snapshot
 
@@ -93,6 +100,19 @@ scripts, this documentation). Its shape:
 }
 ```
 
+A populated `esm.packages[]` entry (once a real Pro token/subscription
+exists, GitHub issue #81) looks like:
+
+```json
+{
+  "name": "some-universe-pkg",
+  "version": "1.2.3-1ubuntu1~esm1",
+  "sha256": "…64 hex chars…",
+  "path": "pool/esm-infra/main/s/some-universe-pkg/some-universe-pkg_1.2.3-1ubuntu1~esm1_amd64.deb",
+  "source": "esm"
+}
+```
+
 - **`version`** — the lockfile format's own schema version (an integer;
   `1` today), bumped by hand if the shape above ever needs to change
   incompatibly.
@@ -106,7 +126,13 @@ scripts, this documentation). Its shape:
   `path` (the pool-relative path exactly as the archive's own `Packages`
   index gives it, e.g. `pool/main/h/htop/...`), `sha256` (64 lowercase
   hex characters), and `size` in bytes.
-- **`esm.packages[]`** — the same per-package shape; empty until M4.
+- **`esm.packages[]`** — `name`, `version`, `sha256`, `path` (the
+  esm.ubuntu.com pool-relative path), and `source` (always the literal
+  string `"esm"` — the marker that lets a consumer working from a
+  flattened package list, e.g. `bin/ubx-archive-public-manifest`'s
+  exclusion guard, tell an esm-tier entry apart from a public-tier one).
+  Empty (`[]`) in the committed lockfile until a real Pro token/
+  subscription populates it (needs-owner item, GitHub issue #81).
 
 Every `sha256` committed to the lockfile is independently verified before
 being pinned: the archive's own `Packages` index is corroborating
@@ -137,12 +163,75 @@ the actual trust root, a fetch remains reproducible for as long as
 Canonical retains the referenced snapshot content — which upstream commits
 to for "at least 2 years" (`SPEC.md` §4.4, R4).
 
+## esm-tier fetching and the Pro token (M4)
+
+`nix/archive.nix`'s `fetchEsmDeb` turns each `esm.packages[]` entry into a
+fixed-output derivation, exactly like `fetchDeb` does for the public tier
+— except esm.ubuntu.com requires HTTP Basic auth (the Pro token as the
+username, the literal password `bearer`, mirroring Canonical's own `pro
+attach`-written apt credentials), which Nix's own internal fetchurl
+expression can't express. `fetchEsmDeb` instead reads the token from the
+**one** environment variable this project ever consumes a Pro token from,
+`UBUNTNIX_CI_PRO_TOKEN`, via Nix's `impureEnvVars` mechanism — the same
+documented pattern real-world Nix fetchers use for proxy/credential
+variables: the sandboxed builder may read the named variable from the
+calling process's real environment, but the value never becomes part of
+the derivation's hashed inputs or its `.drv` file. Only the fetched
+**output** is pinned (`outputHash`, verified against the entry's `sha256`
+exactly like the public tier's hash-mismatch guarantee) — the token itself
+is never printed, logged, or committed anywhere.
+
+`bin/ubx-resolve-esm` is the resolver/emitter half: given already-resolved
+`(name, version, path)` pins (esm has no apt-solvable index the way the
+public tier does — see that script's header for why), it fetches each
+with the same token, hashes the result locally, and emits `esm.packages[]`
+entries with the `source: "esm"` marker, merging into an existing lockfile
+without touching its `public` section. Its `--emit-lockfile` flag is a
+pure, fixture-driven testing hook — `tests/unit/057-ubx-resolve-esm-emit.sh`
+exercises the whole hash-pinned emission path with **no real network
+access and no real token**, per the project's "unit tests require no
+network" rule.
+
+**CI Pro token — needs-owner item.** SPEC.md §8.2 says "CI holds a Pro
+token"; `.github/workflows/ci.yml`'s "flake" job passes a repository
+secret named exactly **`UBUNTNIX_CI_PRO_TOKEN`** into the environment of
+its `archive-esm-fetch-proof` build step. That secret does not exist yet —
+obtaining a real Ubuntu Pro token is an owner action (a Canonical
+account), not something this plumbing can do for itself. Until it's
+added, the proof step degrades to a deterministic, network-free **skip**
+(because `archive.lock.json`'s `esm.packages` is also still empty) rather
+than failing the build; `bin/ubx-resolve-esm --check-token` and
+`nix/archive.nix`'s own missing-token error path are exercised directly by
+`tests/unit/058-ubx-resolve-esm-token-handling.sh`, which also asserts the
+token's value is never echoed by any code path, set or unset.
+
+## The public-cache boundary
+
+esm content is subscription-gated and must **never** reach the public
+project binary cache or the public ISOs/prebuilt images (`SPEC.md` §4.4,
+§10) — mirroring how upstream Ubuntu only exposes esm-patched packages to
+a machine after `pro attach`. `bin/ubx-archive-public-manifest` is the one
+place this boundary is enforced mechanically: it reads an archive lockfile
+and emits a manifest containing the `public` tier **only** — its own
+source never parses or opens the `esm` key at all, so there is no code
+path through which an esm entry could end up in its output regardless of
+how the input lockfile is shaped. It additionally cross-checks that no
+public-tier sha256 collides with an esm-tier one, failing loudly if it
+ever finds one (a defensive check against a future refactor blurring the
+two lists together upstream of this script). Whatever eventually
+populates the R2-hosted cache / builds the ISOs (a later milestone) is
+expected to consume this script's output, not `archive.lock.json`
+directly — `tests/unit/059-archive-public-cache-manifest.sh` pins the
+exclusion guarantee against a fixture carrying both tiers.
+
 ## Where to track progress
 
 The archive lockfile and public-tier fetching land at milestone **M1**
 (`SPEC.md` §11, issue #7); turning fetched `.deb`s into a composed rootfs
 image is separate M1 work tracked elsewhere. The `esm` tier's fetching
-logic, backed by a declarative Ubuntu Pro attachment, lands at milestone
-**M4** alongside secrets (`SPEC.md` §8.2). `ubx update`'s archive-pin
-refresh flow — re-resolving `public.snapshot` and rewriting the pinned
-tuples — is described in {doc}`workflows`.
+logic lands at milestone **M4** (`SPEC.md` §8.2, GitHub issue #81),
+independent of the declarative Ubuntu Pro *attachment* flow (also M4,
+tracked separately) — this issue is the archive-resolver/CI-token-
+handling half only. `ubx update`'s archive-pin refresh flow — re-resolving
+`public.snapshot` and rewriting the pinned tuples — is described in
+{doc}`workflows`.

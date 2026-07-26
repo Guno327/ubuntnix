@@ -10,11 +10,14 @@
 #   - **esm pockets** (esm.ubuntu.com): no snapshot service exists for
 #     these (research outcome, R4), so they're pinned directly by (package,
 #     version, sha256) and fetched at build/rebuild time with the machine's
-#     or CI's own Ubuntu Pro token — that lands at milestone M4. This file
-#     declares the tier's shape now (so the lockfile format doesn't need to
-#     change shape later) but the `esm` tier is INTENTIONALLY EMPTY: there
-#     is no fetching logic for it here, on purpose. Do not "helpfully" wire
-#     it up before M4 lands the Pro-token plumbing (SPEC.md §8.2).
+#     or CI's own Ubuntu Pro token. As of milestone M4 (GitHub issue #81),
+#     this file wires up that fetching for real: `fetchEsmDeb`/`esmDebs`
+#     below are the esm-tier counterparts of `fetchDeb`/`debs`. esm content
+#     is subscription-gated and NEVER redistributed (SPEC.md §4.4, §10):
+#     the public project cache / public ISOs/images must contain only
+#     public-pocket packages — see bin/ubx-archive-public-manifest, which
+#     builds that public-only manifest and, BY CONSTRUCTION, never reads
+#     `lockfile.esm` at all.
 #
 # -- The lockfile -------------------------------------------------------
 #
@@ -130,7 +133,14 @@ let
       sha256Re = "[0-9a-f]{64}";
       snapshotRe = "[0-9]{8}T[0-9]{6}Z";
       requiredPublicFields = [ "name" "version" "arch" "component" "path" "sha256" "size" ];
-      requiredEsmFields = [ "name" "version" "sha256" ];
+      # esm entries (SPEC.md §4.4 second bullet; GitHub issue #81, M4):
+      # pinned by (package, version, sha256) plus `path` (needed to build
+      # the esm.ubuntu.com fetch URL — see fetchEsmDeb below) and a
+      # `source` marker, which MUST read exactly "esm" — this is what
+      # distinguishes an esm-tier entry from a public-tier one for any
+      # consumer that only sees a flattened package list (e.g. bin/ubx-
+      # archive-public-manifest's exclusion guard, tests/unit/059).
+      requiredEsmFields = [ "name" "version" "sha256" "path" "source" ];
 
       hasPublicPackages = lf ? public && lf.public ? packages && builtins.isList lf.public.packages;
       hasEsmPackages = lf ? esm && lf.esm ? packages && builtins.isList lf.esm.packages;
@@ -142,11 +152,13 @@ let
           sha256Ok = !hasAll || (builtins.isString pkg.sha256 && builtins.match sha256Re pkg.sha256 != null);
           sizeOk = !(pkg ? size) || (builtins.isInt pkg.size && pkg.size > 0);
           pathOk = !(pkg ? path) || (builtins.isString pkg.path && builtins.match ".*[.]deb" pkg.path != null);
+          sourceOk = !(pkg ? source) || pkg.source == "esm";
         in
         (if hasAll then [ ] else [ "${label} missing required field(s): ${builtins.concatStringsSep ", " missing}" ])
         ++ (if hasAll && !sha256Ok then [ "${label} has a malformed sha256 (want 64 lowercase hex chars): ${toString pkg.sha256}" ] else [ ])
         ++ (if sizeOk then [ ] else [ "${label} has an invalid size (want a positive integer): ${toString (pkg.size or null)}" ])
-        ++ (if pathOk then [ ] else [ "${label} path does not end in .deb: ${toString (pkg.path or null)}" ]);
+        ++ (if pathOk then [ ] else [ "${label} path does not end in .deb: ${toString (pkg.path or null)}" ])
+        ++ (if sourceOk then [ ] else [ "${label} has a 'source' field that is not \"esm\": ${toString pkg.source}" ]);
 
       errors =
         (if lf ? version && lf.version == 1 then [ ] else [ "version must be 1, got ${toString (lf.version or null)}" ])
@@ -202,21 +214,118 @@ let
     };
 
   # name -> fetched-deb derivation, for every PUBLIC-tier lockfile entry.
-  # (Not the esm tier — see this file's header; there is nothing to fetch
-  # there yet, by design, until M4.)
   debs = builtins.listToAttrs (map
     (entry: {
       name = entry.name;
       value = fetchDeb entry;
     })
     lockfile.public.packages);
+
+  # -- esm-tier fetching (SPEC.md §4.4 second bullet, §8.2; GitHub issue
+  # #81, milestone M4) ---------------------------------------------------
+  #
+  # esm.ubuntu.com requires HTTP Basic auth (the machine's/CI's own Ubuntu
+  # Pro token as the username; Canonical's own `pro attach`-written apt
+  # auth.conf entries use the literal password "bearer" — this is the
+  # documented convention this project follows too) — `<nix/fetchurl.nix>`
+  # (used by fetchDeb above) has no way to express that, and embedding the
+  # token into this derivation's eval-time attributes would leak it into
+  # the Nix store's `.drv` database, which is unacceptable for a secret
+  # that must stay env-only (this issue's constraint; never printed, never
+  # committed).
+  #
+  # `esmProTokenVar` names the ONE environment variable this whole project
+  # ever reads the Pro token from. `impureEnvVars` is Nix's own documented
+  # mechanism for exactly this shape of problem (nixpkgs' own URL fetcher
+  # uses it identically for proxy/credential env vars, though we source no
+  # such fetcher ourselves — SPEC.md §1.3/§3): it lets the
+  # sandboxed builder read a named variable from the CALLING process's real
+  # environment, without that value ever becoming part of the derivation's
+  # hashed inputs or its `.drv` — only the resulting OUTPUT is pinned
+  # (`outputHash` below), exactly like fetchDeb's fixed-output verification.
+  # If the variable is unset when this actually builds, the script below
+  # fails loudly with a clear message BEFORE ever invoking curl — no
+  # network attempt, no token to leak, and no ambiguous curl error either.
+  #
+  # Builder is `/bin/sh` with `__noChroot = true` — the identical
+  # "contained crossing point" nix/stdenv.nix's `unpacked` derivation
+  # already documents and uses for the one other case in this project
+  # needing a real host tool the Nix sandbox doesn't provide (there: `tar`,
+  # to unpack the ubuntu-base trust root; here: `curl`, to speak esm's
+  # authenticated HTTPS — never a nixpkgs curl, per SPEC.md §1.3/§3). Every
+  # host this ever builds on (the CI ubuntu-24.04 runner; a future
+  # on-device Ubuntu machine) ships `curl` from the Ubuntu archive same as
+  # everything else here, so this is not a new trust root, just the same
+  # documented escape hatch used again for the same reason. Fixed-output
+  # (`outputHashMode = "flat"`), so the result is verified byte-for-byte
+  # against the pinned sha256 regardless of how it got fetched — a
+  # tampered/wrong response fails the build exactly like fetchDeb's
+  # hash-mismatch proof does for the public tier.
+  #
+  # PM ACTION REQUIRED (needs-owner, non-blocking): the CI repository
+  # secret named by `esmProTokenVar` (UBUNTNIX_CI_PRO_TOKEN) does not exist
+  # yet — SPEC.md §8.2 says "CI holds a Pro token" but obtaining one is an
+  # owner action (a Canonical account), not something this plumbing can do
+  # for itself. Until it's added, any real esm fetch fails with the clear,
+  # non-leaking message below rather than hanging or silently skipping;
+  # `.github/workflows/ci.yml`'s "archive-esm-fetch-proof" step degrades to
+  # a no-op skip in that case (see its own comment) rather than failing the
+  # build.
+  esmProTokenVar = "UBUNTNIX_CI_PRO_TOKEN";
+
+  fetchEsmDeb = entry:
+    builtins.derivation {
+      name = sanitizeStoreName (baseNameOf entry.path);
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      # NOTE: the shell variable name below is hardcoded to the literal
+      # value of `esmProTokenVar` (not Nix-interpolated) — deliberately, to
+      # keep this script a plain, auditable literal rather than relying on
+      # a double-interpolation escape trick; tests/unit/056 greps for this
+      # exact literal to keep the two in lockstep if `esmProTokenVar` above
+      # is ever renamed.
+      args = [
+        "-c"
+        ''
+          set -eu
+          if [ -z "''${UBUNTNIX_CI_PRO_TOKEN:-}" ]; then
+            echo "fetchEsmDeb: UBUNTNIX_CI_PRO_TOKEN is not set -- esm-pocket fetches need the CI/machine Ubuntu Pro token (SPEC.md sec8.2); see nix/archive.nix's 'esm-tier fetching' comment for the required repo secret name" >&2
+            exit 1
+          fi
+          exec curl --fail --silent --show-error --location \
+            --user "$UBUNTNIX_CI_PRO_TOKEN:bearer" \
+            -o "$out" "https://esm.ubuntu.com/${entry.path}"
+        ''
+      ];
+      __noChroot = true;
+      impureEnvVars = [ esmProTokenVar ];
+      outputHashMode = "flat";
+      outputHashAlgo = "sha256";
+      outputHash = entry.sha256;
+    };
+
+  # name -> fetched-esm-deb derivation, for every ESM-tier lockfile entry.
+  # Empty today (the committed lockfile's esm.packages is []; see this
+  # file's header) — populated once the owner runs bin/ubx-resolve-esm with
+  # a real Pro token against a real esm-pocket declaration and commits the
+  # result, exactly mirroring how `debs` above is populated from
+  # bin/ubx-resolve's output.
+  esmDebs = builtins.listToAttrs (map
+    (entry: {
+      name = entry.name;
+      value = fetchEsmDeb entry;
+    })
+    lockfile.esm.packages);
 in
 {
   # Exposed under flake.lib (option declared once, in nix/lib.nix; every
   # dendritic file just contributes its own named attribute — same pattern
   # nix/stdenv.nix uses for flake.lib.stdenv and nix/ubx.nix for
   # flake.lib.ubx).
-  flake.lib.archive = { inherit lockfile validate snapshotUrl fetchDeb debs; };
+  flake.lib.archive = {
+    inherit lockfile validate snapshotUrl fetchDeb debs;
+    inherit fetchEsmDeb esmDebs esmProTokenVar;
+  };
 
   systems = [ "x86_64-linux" ];
 
@@ -376,5 +485,77 @@ in
         sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
         name = "archive-hash-mismatch-proof-deliberately-wrong-hash";
       };
+
+    # archive-esm-fetch-proof (GitHub issue #81, milestone M4): the esm-tier
+    # counterpart of archive-fetch-proof above, EXCEPT it degrades to a
+    # deterministic, network-free, token-free SKIP whenever
+    # lockfile.esm.packages is empty — which it is today, on purpose (see
+    # this file's header): there is no real esm-pocket pin in the committed
+    # lockfile yet (needs a real Ubuntu Pro token + subscription to
+    # produce), so there is nothing to fetch-and-verify. This lets CI build
+    # `.#archive-esm-fetch-proof` unconditionally (same as every other
+    # proof package) without ever failing on a missing secret — the whole
+    # point of "absence produces a clear skip, not a failure" for this
+    # needs-owner item.
+    #
+    # Once the owner runs bin/ubx-resolve-esm with a real token against a
+    # real esm-pocket declaration and commits the result, this same
+    # derivation starts exercising the real path: for each esm.packages
+    # entry it forces `esmDebs.<name>` (fetchEsmDeb, above — the one place
+    # UBUNTNIX_CI_PRO_TOKEN is actually consumed) and re-derives a
+    # sha256sum/control-file proof inside the ubuntu-native stdenv sandbox,
+    # exactly like archive-fetch-proof does for the public tier.
+    packages.archive-esm-fetch-proof =
+      if lockfile.esm.packages == [ ] then
+        builtins.derivation {
+          name = "archive-esm-fetch-proof-skip";
+          inherit system;
+          builder = "/bin/sh";
+          args = [
+            "-c"
+            ''
+              echo "SKIP=ubuntnix-archive-esm-fetch-proof-v1: esm.packages is empty (SPEC.md sec4.4/sec8.2, GitHub issue #81) -- nothing to fetch/verify yet. Populate archive.lock.json's esm tier via bin/ubx-resolve-esm once a real Ubuntu Pro token and esm-pocket pin exist." > "$out"
+            ''
+          ];
+          __noChroot = true;
+        }
+      else
+        let
+          entries = lockfile.esm.packages;
+          n = builtins.length entries;
+          indices = builtins.genList (i: i) n;
+          entryAt = i: builtins.elemAt entries i;
+          envName = i: "ESM_DEB_${toString i}";
+
+          env = builtins.listToAttrs (map
+            (i: { name = envName i; value = esmDebs.${(entryAt i).name}; })
+            indices);
+
+          proofLines = builtins.concatStringsSep "\n" (map
+            (i:
+              let
+                entry = entryAt i;
+                varRef = "$" + envName i;
+              in
+              ''
+                {
+                  debpath="${varRef}"
+                  echo "esm deb name=${entry.name} version=${entry.version} source=${entry.source} store=${varRef}"
+                  sumline=$("$UBX_LD" --library-path "$UBX_LIBRARY_PATH" \
+                    "$UBX_BASE/usr/bin/sha256sum" "${varRef}")
+                  echo "esm deb sha256sum=''${sumline%% *}"
+                } >> "$out"'')
+            indices);
+        in
+        runInUbuntuBase {
+          inherit system env;
+          name = "archive-esm-fetch-proof";
+          script = ''
+            {
+              echo "MARKER=ubuntnix-archive-esm-fetch-proof-v1"
+            } > "$out"
+            ${proofLines}
+          '';
+        };
   };
 }

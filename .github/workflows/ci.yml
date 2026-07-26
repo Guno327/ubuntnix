@@ -131,6 +131,43 @@ jobs:
             cat mismatch.log
             exit 1
           }
+      # esm-pocket fetch proof (SPEC.md §4.4/§8.2; GitHub issue #81,
+      # milestone M4). nix/archive.nix's `fetchEsmDeb` is the ONE place
+      # this project reads a Pro token from, via the env var named by
+      # `esmProTokenVar` (UBUNTNIX_CI_PRO_TOKEN) -- passed here from the
+      # PM ACTION REQUIRED (needs-owner, non-blocking): a repo secret named
+      # exactly `UBUNTNIX_CI_PRO_TOKEN` does not exist yet -- SPEC.md §8.2
+      # ("CI holds a Pro token") needs a real Ubuntu Pro token from the
+      # owner's Canonical account, which this plumbing cannot obtain for
+      # itself. Until both that secret AND a real esm-pocket entry exist in
+      # archive.lock.json's (currently empty) esm tier, `env.
+      # UBUNTNIX_CI_PRO_TOKEN` below is simply an empty string --
+      # `${{ secrets.UBUNTNIX_CI_PRO_TOKEN }}` evaluates to "" when the
+      # secret is undefined, exactly like any other unset GitHub Actions
+      # secret -- and nix/archive.nix's `archive-esm-fetch-proof` package
+      # degrades to a deterministic, network-free SKIP output whenever
+      # lockfile.esm.packages is empty, which is unconditionally true right
+      # now. This step therefore always builds cleanly today; it only
+      # starts actually exercising the token once the owner populates both
+      # the secret and a real esm-tier pin (bin/ubx-resolve-esm). The
+      # token is passed via `env:` (GitHub Actions' own secret-masking
+      # applies) and NEVER echoed by any step here.
+      - name: Build archive-esm-fetch-proof (skips cleanly without a Pro token or esm pins)
+        env:
+          UBUNTNIX_CI_PRO_TOKEN: ${{ secrets.UBUNTNIX_CI_PRO_TOKEN }}
+        run: |
+          sudo --preserve-env=UBUNTNIX_CI_PRO_TOKEN \
+            nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed \
+            build .#archive-esm-fetch-proof -L
+          sudo chown "$USER" result
+      - name: Assert archive-esm-fetch-proof output
+        run: |
+          if grep -q '^SKIP=ubuntnix-archive-esm-fetch-proof-v1' result; then
+            echo "archive-esm-fetch-proof: skipped (no esm-pocket pins in archive.lock.json yet -- expected until the owner adds one, GitHub issue #81)"
+          else
+            grep -q 'MARKER=ubuntnix-archive-esm-fetch-proof-v1' result
+            grep -q 'source=esm' result
+          fi
       # Declared snap surface + snap lockfile + vendoring proof (SPEC.md
       # §4.3, §4.4, §4.5, §6; issue #60, M3): nix/snap.nix's compileManifest
       # + renderManifest evaluated end to end against a small fixture

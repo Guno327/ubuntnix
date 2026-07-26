@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # literal $6$...$ crypt hashes are intentionally single-quoted (must NOT shell-expand)
 # tests/unit/108-ubx-users-apply-passwords.sh — bin/ubx-users'
 # `apply-passwords`: the REAL password-hash executor (SPEC.md §8.1; GitHub
 # issue #80, milestone M4). Reads a secret's materialized bytes from a

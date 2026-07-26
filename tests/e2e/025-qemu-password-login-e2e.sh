@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317  # main()'s tail is intentionally unreachable
+# today: an unconditional load-bearing skip (see main()) sits above the
+# real qemu-launch/marker-grep body, which is kept verbatim as the shape a
+# future nix/boot.nix login-marker driver fills in (GitHub issue #80 e2e
+# follow-up). shellcheck's reachability analysis correctly flags it; the
+# code is deliberate, so SC2317 is disabled file-wide here.
 # tests/e2e/025-qemu-password-login-e2e.sh — QEMU end-to-end proof that a
 # user declared with `hashedPasswordSecret` can log in with the
 # corresponding password after `ubx rebuild switch` (SPEC.md §6, §8.1,
@@ -40,7 +46,7 @@
 # run that image against in the first place, so nothing here could be
 # validated even if the wiring existed — see tests/README.md's e2e
 # contract, and tests/unit/106-ubx-users-password-secret.sh /
-# tests/unit/16[678]-*.sh for the REAL, currently-exercised unit coverage
+# tests/unit/10[789]-*.sh for the REAL, currently-exercised unit coverage
 # of every piece this e2e proof would eventually assemble: manifest/plan
 # purity, apply-passwords' real shadow convergence from a fixture
 # `/run/secrets/<name>` file, the missing/unreferenced-secret error, and
@@ -144,7 +150,7 @@ main() {
   # come first for) so a caller sees the REAL blocker (no image/marker
   # wiring exists yet) rather than a misleading "qemu not found" message
   # on a machine that actually has qemu installed.
-  skip "nix/boot.nix has no hashedPasswordSecret-declaring, UBX-M4-PW-PASS-emitting image target yet (GitHub issue #80's own e2e half is tracked, documented follow-up -- see this script's header; tests/unit/106-ubx-users-password-secret.sh and tests/unit/16[678]-*.sh already exercise every piece this proof would assemble, at the unit level, in this same change)"
+  skip "nix/boot.nix has no hashedPasswordSecret-declaring, UBX-M4-PW-PASS-emitting image target yet (GitHub issue #80's own e2e half is tracked, documented follow-up -- see this script's header; tests/unit/106-ubx-users-password-secret.sh and tests/unit/10[789]-*.sh already exercise every piece this proof would assemble, at the unit level, in this same change)"
 
   # -- unreachable today (see the unconditional skip above), kept as the
   # real shape a future implementation fills in -- mirrors

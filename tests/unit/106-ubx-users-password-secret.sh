@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # literal $6$...$ crypt hashes are intentionally single-quoted (must NOT shell-expand)
 # tests/unit/106-ubx-users-password-secret.sh — bin/ubx-users' M4
 # `hashedPasswordSecret` support (SPEC.md §4.3 "Users", §8.1; GitHub issue
 # #80, milestone M4, "password login from a secret-sourced hash"). Mirrors

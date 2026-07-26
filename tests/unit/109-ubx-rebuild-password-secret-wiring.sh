@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # literal $6$...$ crypt hashes are intentionally single-quoted (must NOT shell-expand)
 # tests/unit/109-ubx-rebuild-password-secret-wiring.sh — `ubx rebuild
 # switch` wiring hashedPasswordSecret end to end: the secrets domain is
 # planned/applied BEFORE the users domain, `ubx-users plan` cross-checks

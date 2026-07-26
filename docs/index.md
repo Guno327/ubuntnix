@@ -57,6 +57,10 @@ plan.
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands
   later).
+- {doc}`secrets` — the git-crypt encryption boundary for `secrets/`,
+  per-machine and per-user GPG identity onboarding, and the revocation path
+  (mechanism implemented and unit-tested in M4; real installer-flow wiring
+  is M7).
 - {doc}`boot` — kernel selection, GRUB generation machinery, and the
   bootable disk image (implemented in M1).
 - {doc}`systemd` — systemd units/services: declaration, the refuse-restart
@@ -85,6 +89,7 @@ guards
 generations
 users
 etc
+secrets
 boot
 systemd
 ubx

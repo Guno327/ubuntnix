@@ -14,6 +14,79 @@
 # root (`/bin`, `/usr`, `/etc`, `/proc`, `/dev`, absolute shebangs like
 # `/usr/share/debconf/confmodule`, and exec-by-bare-name everywhere).
 #
+# -- GitHub issue #48: fakeroot replaces the scan/restore interim ---------
+#
+# PR #36 (see this file's git history / the "PR #36" section that used to
+# live here) introduced an INTERIM workaround for two independent, real
+# dpkg unpack-time failures under this file's single-id-mapped user
+# namespace: chown(2) to a non-root owner fails EINVAL, and chmod(2)
+# setting a setuid/setgid/sticky bit fails EPERM, both unconditionally
+# attempted by dpkg's own tarobject() with no force flag to suppress them
+# (see https://lists.debian.org/debian-dpkg/2007/12/msg00031.html). That
+# interim (bin/ubx-scan-deb-ownership, now DELETED) pre-scanned every
+# .deb's data.tar for the affected paths, `--path-exclude`d them from
+# dpkg's own extraction, restored their real content unprivileged and
+# separately, and recorded owner+mode in an mksquashfs pseudo-file
+# manifest applied at pack time -- three separate, hand-rolled mechanisms
+# for one root cause.
+#
+# fakeroot is the GENERAL fix that same interim's own header always
+# pointed at: an LD_PRELOAD library that intercepts chown(2)/chmod(2)/
+# stat(2) and friends, fakes success for the calling process while
+# recording the INTENDED owner/mode in an in-memory (or save-file-backed)
+# database, and transparently returns that faked data to any later
+# stat(2) call made by a process sharing the same fakeroot session. This
+# lets `dpkg --unpack`/`--configure` run with NO --path-exclude dance at
+# all -- every path extracts normally, dpkg's own chown/chmod calls all
+# "succeed" (faked), and the composed tree's TRUE ownership/mode data
+# lives in fakeroot's own database for as long as something reads it back
+# through the same faked session.
+#
+# Two consequences that shape the design below:
+#   (1) fakeroot's fake data is NOT written to the real on-disk inode --
+#       real chown to a non-root id, or a real chmod setting a special
+#       bit, remains just as impossible here as it always was; only
+#       PROCESSES SHARING THE FAKED SESSION see the faked values via
+#       their own stat(2) calls. Nix's own post-build store-path
+#       canonicalization (0444 files / 0555 dirs, unconditional -- see
+#       the "Nix canonicalizes every registered store path read-only"
+#       comment further down) therefore still applies to composeRootfs's
+#       raw $out regardless of fakeroot -- exactly as before fakeroot,
+#       $out's own on-disk permission bits are NOT where the true
+#       ownership/mode record lives.
+#   (2) The true record must therefore survive PAST this derivation's own
+#       build, for squashfsImage (a separate derivation, run later) to
+#       pack correct inode metadata. fakeroot's `-s`/`-i` save/load-file
+#       flags exist for exactly this cross-invocation handoff (the same
+#       mechanism Debian's own dh_fixperms -> dh_builddeb pipeline uses):
+#       composeRootfs's fakeroot session ends with `-s /.ubx-fakeroot-state`
+#       (written at $out's TOP level, so it survives `rm -rf
+#       /.ubx-compose` and is exposed to squashfsImage as part of
+#       $rootfs); squashfsImage loads it back with `-i` and runs
+#       mksquashfs itself AS A CLIENT OF THAT SAME FAKED SESSION, so
+#       mksquashfs's own stat(2) calls see the true owner/mode directly --
+#       no manifest, no pseudo-file pass, no scan script.
+#
+# fakeroot is fetched from the locked Ubuntu archive like any other
+# package (archive.packages.json declares it; see that file's own comment
+# for the exact `bin/ubx-resolve` regeneration this issue still owes the
+# lockfile) and used purely as a BUILD TOOL here (via `toolsFHS`, exactly
+# like squashfs-tools/liblzo2-2 already are) -- it is never added to a
+# composed rootfs's OWN `packages` list, since nothing about the target
+# system needs fakeroot installed at runtime.
+#
+# CI VERIFICATION NOTE (mirrors this file's own existing note on
+# `unshare --user`): this dev harness has no `nix`, no `fakeroot`, and no
+# `dpkg` binary to exercise ANY of this against a real build (see the
+# `which fakeroot faked dpkg` checks that came back empty during this
+# issue's own implementation). The exact absolute paths fakeroot's Ubuntu
+# package installs `fakeroot`/`faked`/`libfakeroot-*.so` under are
+# therefore discovered at BUILD time (a `find` over the extracted
+# `toolsFHS` tree, both here and in squashfsImage below) rather than
+# hardcoded from an unverifiable guess -- if CI's first real build can't
+# locate one of the three, that `find` failing loudly with a clear message
+# is the signal to go fix, not a wrong hardcoded path silently no-op'ing.
+#
 # -- What this file builds -----------------------------------------------
 #
 # `composeRootfs` (below): given a list of already-locked package names
@@ -124,6 +197,22 @@
 #       diff artifact keeps naming /etc/ld.so.cache after this change,
 #       switch to deleting it here instead (that one-line follow-up is the
 #       documented fallback, not a mystery to re-derive).
+#     - (GitHub issue #48) /.ubx-fakeroot-state — the saved fakeroot
+#       ownership/mode database (see this file's own "GitHub issue #48"
+#       header section). Its content should likewise be a deterministic
+#       function of the packages unpacked (same dev/inode-keyed records
+#       every time, given an identical unpack order — already pinned by
+#       `unpackLines` above), but this file has NOT independently verified
+#       byte-for-byte stability of fakeroot's own on-disk save-file
+#       serialization across two independent builds (record order keyed
+#       by internal (dev, inode) pairs, which are themselves a function of
+#       allocation order on this build's own filesystem — plausibly, but
+#       not provably, deterministic given a fixed unpack sequence). The
+#       two-run CI comparison is what actually proves or disproves this,
+#       exactly like the debconf .dat note above; if it flags this file,
+#       the follow-up is sorting/normalizing the save-file's own record
+#       order before squashfsImage reads it back, not re-deriving this
+#       comment.
 #     - any maintainer script that embeds genuinely random or
 #       machine-specific data into a file it manages (SSH host keys,
 #       D-Bus/systemd machine-id generation, ...) is categorically outside
@@ -282,178 +371,19 @@ let
         (i: ''dpkg --unpack --force-depends "/.ubx-compose/debs/${toString i}.deb"'')
         indices);
 
-      # scanLines / restoreLines (PR #36; see this file's header section
-      # "PR #36 -- the full-closure ownership problem" and
-      # bin/ubx-scan-deb-ownership's own header for the full design):
-      # work around TWO independent, unconditional, unpatchable dpkg
-      # unpack-time operations that this chroot's single-id-mapped user
-      # namespace cannot always perform, PLUS a third, unrelated problem
-      # that shows up only after unpack succeeds:
-      #   - chown(2)-ing every extracted file to the archive's own
-      #     recorded owner (verified against dpkg upstream -- see that
-      #     script's header for the citation), which fails EINVAL for any
-      #     file/dir a .deb ships owned by something other than root:root;
-      #   - (CI run 29955725327, this issue's mode follow-up) chmod(2)-ing
-      #     a setuid/setgid/sticky bit onto an extracted file, which fails
-      #     EPERM regardless of who owns it -- the concrete case that
-      #     surfaced this was dpkg's own unpack of /usr/bin/mount
-      #     (root:root, mode 4755): "error setting permissions of
-      #     './usr/bin/mount': Operation not permitted";
-      #   - (GitHub issue #45, the canonicalization follow-up) this
-      #     derivation's own $out being canonicalized read-only by Nix at
-      #     registration time (see the "Nix canonicalizes every registered
-      #     store path read-only" comment below), which silently LOOSENS
-      #     a root:root file shipped more restrictive than the canonical
-      #     mode (e.g. 0600/0640 on something secrets-adjacent) up to
-      #     0444 -- turning on a read bit the package deliberately
-      #     withheld. Unlike the first two, dpkg's own unpack of such a
-      #     file never fails at all; the loss happens later, entirely
-      #     outside dpkg.
-      # bin/ubx-scan-deb-ownership's scan trigger is therefore three-fold
-      # (non-root owner, OR a set*id/sticky mode bit, OR real permission
-      # bits tighter than the canonical mode for that path's type -- see
-      # that script's own "MODE follow-up" and "CANONICALIZATION
-      # follow-up" header sections) but all three properties are deferred
-      # by exactly the same mechanism below: OWNER, MODE's special bits,
-      # and now also a too-tight plain mode, are never relied upon to
-      # survive as on-disk metadata inside this chroot/this derivation's
-      # $out -- all three instead travel, via the SAME manifest line, to
-      # squashfsImage's mksquashfs pseudo-file pass (PACK time), which
-      # writes final inode metadata directly with no chown(2)/chmod(2)
-      # syscall of any kind, and -- crucially for the third case -- runs
-      # on an INPUT store path, but produces its OWN, separate output
-      # image, so nothing about squashfsImage's own inode writes is
-      # itself subject to a second round of Nix store-path
-      # canonicalization the way composeRootfs's in-chroot chmod was.
-      #
-      # Both are ONE-BLOCK-PER-PACKAGE, generated over the SAME `indices`
-      # or `checked`-derived order as debCopyLines/unpackLines above, for
-      # the identical R1 determinism reason those already document: a
-      # shell loop over `/.ubx-compose/debs/*.deb` (or `scan-*.tsv`) ties
-      # iteration to filesystem/locale glob behavior for something Nix
-      # already knows the fixed order of. The inner `while read` loop
-      # each block contains does NOT have that problem (it walks one
-      # already-named, already-ordered file's lines, not a directory
-      # listing), so it stays a plain shell loop rather than being
-      # Nix-unrolled a second time.
-      #
-      # scanLines runs BEFORE `${unpackLines}` (spliced below), for every
-      # package, in the SAME pass:
-      #   1. bin/ubx-scan-deb-ownership lists that package's selected
-      #      (non-root-owned, and/or set*id/sticky, and/or -- GitHub issue
-      #      #45 -- real permission bits tighter than the canonical mode
-      #      this store path's own file/directory would otherwise be
-      #      canonicalized to) entries (empty output, the common case, for
-      #      every package in this project's proof sets today --
-      #      htop/hello/libnl/tzdata ship nothing but plain root:root
-      #      files).
-      #   2. each entry's path becomes a `path-exclude=` line in a dpkg
-      #      config fragment (/etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes,
-      #      read automatically by every dpkg invocation below, per
-      #      dpkg.cfg(5)) -- dpkg's own, real, long-supported path-filter
-      #      mechanism (dpkg(1) "--path-exclude"), which skips extracting
-      #      (and therefore chown/chmod-ing) a matched path ENTIRELY,
-      #      rather than attempting and failing.
-      #   3. a DIRECTORY entry is created (mkdir -p + chmod'd to `ubx_safe_mode`,
-      #      NOT `ubx_mode` -- see that variable's own comment below for
-      #      why) immediately, right here -- BEFORE any package's unpack
-      #      runs -- because a later, non-excluded file from ANY package
-      #      might need that directory to already exist as a mkdir
-      #      target; a FILE/symlink/hardlink entry is deliberately NOT
-      #      restored yet (see restoreLines below for why the ordering
-      #      differs).
-      #   4. every entry, directory or not, gets one line in
-      #      /.ubx-ownership-pseudo.txt: an mksquashfs pseudo-file "modify"
-      #      definition (`<path> m <mode> <uid> <gid>` -- squashfs-tools'
-      #      own USAGE-MKSQUASHFS.md syntax, verified against the
-      #      squashfs-tools 4.6.1 this project's archive.lock.json pins)
-      #      recording the TRUE intended owner AND mode (special bits
-      #      included -- `ubx_mode`, unmodified, not `ubx_safe_mode`),
-      #      applied by squashfsImage (nix/compose.nix, below) at PACK
-      #      time -- mksquashfs writes final squashfs inode metadata
-      #      directly, no chown(2)/chmod(2) syscall at all, so it is not
-      #      subject to this sandbox's id-mapping/set*id limits in the
-      #      first place. This is the concrete mechanism behind this
-      #      file's own long-standing comment (composeRootfs's
-      #      "Deliberately drop ownership on copy" note, above) that
-      #      on-disk ownership/mode inside this sandbox was never meant to
-      #      be a meaningful, complete record of the real system -- PR #36
-      #      is simply the first time a real owner (and now mode) needed
-      #      to travel all the way to the FINAL packed image despite that.
-      #
-      # restoreLines runs AFTER `${unpackLines}` but BEFORE debconf/
-      # `dpkg --configure -a` (spliced below): for every FILE/symlink/
-      # hardlink entry scanLines found (directories were already created
-      # above), extract that ONE archive member's real content straight
-      # from the already-staged .deb (`tar -x --no-same-owner
-      # --no-same-permissions` -- content restoration needs no
-      # id-mapping/capability at all; the OWNER and the mode's special
-      # bits are BOTH deferred to pack time, so tar must not attempt to
-      # apply either: `--no-same-owner` for the former exactly as before,
-      # `--no-same-permissions` (new) so tar does NOT try to chmod() the
-      # archive's own recorded mode -- including its set*id/sticky bits --
-      # onto the extracted file, which is exactly the operation that fails
-      # EPERM (see this block's own header above)), then chmod's it to
-      # `ubx_safe_mode` explicitly (deterministic regardless of umask,
-      # unlike relying on tar's --no-same-permissions default) into its
-      # real place, so maintainer postinst scripts (which run during
-      # `dpkg --configure -a`, right after) see the same tree a real,
-      # unrestricted install would have produced -- just not yet
-      # correctly-OWNED/-MODED, which squashfsImage's pseudo-file pass
-      # fixes.
-      #
-      # ubx_safe_mode -- `ubx_mode` with its leading (special) digit
-      # forced to 0 (dropped via `${ubx_mode#?}`, a plain POSIX one-char
-      # parameter-removal dash already supports, then re-prefixed with
-      # "0"): the same permission bits (read/write/execute for owner/
-      # group/other) MINUS the setuid/setgid/sticky bit, e.g. "4755" ->
-      # "0755", "1777" -> "0777", and a no-op for an entry that never had
-      # a special bit at all (a plain non-root-owned file, "0644" ->
-      # "0644"). This is applied by mkdir+chmod (scanLines, directories)
-      # and by the explicit chmod after tar -x (restoreLines, everything
-      # else) so that NEITHER of this block's own in-chroot mode-setting
-      # operations ever attempts the one chmod() class this sandbox
-      # cannot perform -- exactly like `ubx_mode`'s OWNER fields were
-      # already never chown(2)'d in-chroot even for the original
-      # (ownership-only) trigger. `ubx_mode` itself, unstripped, still
-      # goes to the pseudo-file manifest (step 4 above) -- ONLY the two
-      # in-chroot mode-setting call sites use the stripped form.
-      #
-      # ubx_tab (defined once, near configure.sh's own top, alongside the
-      # existing PERL_HASH_SEED export) is a literal tab character: dash
-      # (configure.sh's own `/bin/sh`) has no `$'\t'` ANSI-C quoting, so
-      # `IFS="$(printf '\t')"` is the portable way to split
-      # bin/ubx-scan-deb-ownership's TAB-separated records on tabs alone
-      # (not dash's default IFS, which would also split on any literal
-      # space inside a field -- none are expected in a real archive path,
-      # but the field boundary should not depend on that).
-      scanLines = builtins.concatStringsSep "\n" (map
-        (i: ''
-          /.ubx-compose/ubx-scan-deb-ownership "/.ubx-compose/debs/${toString i}.deb" > "/.ubx-compose/scan-${toString i}.tsv"
-          while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
-            [ -n "$ubx_path" ] || continue
-            ubx_safe_mode="0''${ubx_mode#?}"
-            echo "path-exclude=$ubx_path" >> /etc/dpkg/dpkg.cfg.d/ubx-ownership-excludes
-            if [ "$ubx_type" = d ]; then
-              mkdir -p "$ubx_path"
-              chmod "$ubx_safe_mode" "$ubx_path"
-            fi
-            printf '%s m %s %s %s\n' "''${ubx_path#/}" "$ubx_mode" "$ubx_uid" "$ubx_gid" >> /.ubx-ownership-pseudo.txt
-          done < "/.ubx-compose/scan-${toString i}.tsv"
-        '')
-        indices);
-
-      restoreLines = builtins.concatStringsSep "\n" (map
-        (i: ''
-          while IFS="$ubx_tab" read -r ubx_path ubx_type ubx_mode ubx_uid ubx_gid; do
-            [ -n "$ubx_path" ] || continue
-            [ "$ubx_type" = d ] && continue
-            ubx_safe_mode="0''${ubx_mode#?}"
-            dpkg-deb --fsys-tarfile "/.ubx-compose/debs/${toString i}.deb" | tar -x --no-same-owner --no-same-permissions -C / ".$ubx_path"
-            chmod "$ubx_safe_mode" "$ubx_path"
-          done < "/.ubx-compose/scan-${toString i}.tsv"
-        '')
-        indices);
+      # fakerootTools (GitHub issue #48; see this file's header "GitHub
+      # issue #48" section for the full design) -- fakeroot fetched from
+      # the locked archive and extracted as a plain build tool via
+      # `toolsFHS` (defined below in this same `let`; Nix's laziness makes
+      # the forward reference fine), exactly like squashfsImage's own
+      # `squashfs-tools`/`liblzo2-2` tools already are. Never added to
+      # this rootfs's own `packages` -- nothing about the composed SYSTEM
+      # needs fakeroot installed at runtime, only THIS BUILD does.
+      fakerootTools = toolsFHS {
+        inherit system;
+        name = "fakeroot-${name}";
+        packages = [ "fakeroot" ];
+      };
 
       preseedText = renderPreseed preseed;
     in
@@ -461,14 +391,15 @@ let
       inherit system;
       name = "rootfs-${name}";
       env = debEnv // {
-        # scanScript — bin/ubx-scan-deb-ownership itself, staged into the
-        # sandbox the same way bin/ubx-gen-grub-cfg's `genScript` is
-        # (nix/boot.nix's grubCfg): a plain source-path env attr, copied
-        # into $out/.ubx-compose below and invoked BY PATH from inside the
-        # chroot (scanLines above), never sourced -- unlike genScript, this
-        # script shells out to dpkg-deb/tar, so it needs a real FHS root
-        # (chroot) around it, not the raw-loader trick.
-        scanScript = ../bin/ubx-scan-deb-ownership;
+        # fakerootTools (GitHub issue #48) -- a derivation-output env attr
+        # (never spliced directly into `script`, for the same
+        # derivation-output-context reason `debEnv` above documents),
+        # copied into $out/.ubx-compose below and invoked BY PATH from
+        # inside the chroot (see configure.sh's own fakeroot re-exec block
+        # further down) -- it needs a real FHS root (chroot) around it,
+        # not the raw-loader trick, since fakeroot's own frontend is a
+        # shell script that execs further child processes by bare path.
+        inherit fakerootTools;
       };
       script = ''
         # ubxrun BIN ARGS... — invoke a dynamically-linked ubuntu-base
@@ -525,13 +456,15 @@ let
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-compose/debs"
         ${debCopyLines}
 
-        # Stage bin/ubx-scan-deb-ownership itself (see the `scanScript` env
-        # attr comment above) -- scanLines/restoreLines (spliced into
-        # configure.sh below) invoke it BY PATH from inside the chroot as
-        # "/.ubx-compose/ubx-scan-deb-ownership", so it must exist there,
-        # executable, before enter.sh's chroot(2) happens.
-        ubxrun "$UBX_BASE/bin/cp" "$scanScript" "$out/.ubx-compose/ubx-scan-deb-ownership"
-        ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-compose/ubx-scan-deb-ownership"
+        # Stage fakeroot itself (GitHub issue #48; see the `fakerootTools`
+        # env attr comment above) -- configure.sh's own fakeroot re-exec
+        # block (below) locates `fakeroot`/`faked`/`libfakeroot-*.so`
+        # under "/.ubx-compose/fakeroot-tools" from inside the chroot, so
+        # the whole tree must exist there before enter.sh's chroot(2)
+        # happens.
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-compose/fakeroot-tools"
+        ubxrun "$UBX_BASE/bin/cp" -r --preserve=mode,timestamps,links --no-preserve=ownership \
+          "$fakerootTools/." "$out/.ubx-compose/fakeroot-tools/"
 
         # Stage the rendered preseed data (see renderPreseed above):
         # tab-separated "pkg<TAB>question<TAB>value" records. This heredoc
@@ -578,15 +511,6 @@ let
         # order-insensitive data (hash keys) comes out.
         export PERL_HASH_SEED=0 PERL_PERTURB_KEYS=0
 
-        # ubx_tab — a literal tab character, used by scanLines/restoreLines
-        # (spliced below) to split bin/ubx-scan-deb-ownership's TAB-
-        # separated records. dash (this script's own /bin/sh) has no
-        # `$'\t'` ANSI-C quoting, so `IFS="$(printf '\t')"` is the portable
-        # way to split on a literal tab alone -- see this file's own
-        # scanLines/restoreLines comment above for why plain default IFS
-        # (which also splits on spaces) is not good enough here.
-        ubx_tab="$(printf '\t')"
-
         # /dev was prepared BEFORE this chroot, by enter.sh (see below):
         # bind mounts of the outer build sandbox's own device nodes onto
         # plain-file mountpoints under $out/dev. mknod is NOT an option
@@ -599,6 +523,44 @@ let
         # bind mounts cover for the duration of this mount namespace, and
         # a real system's devtmpfs covers at boot) are storable in $out.
         [ -e /dev/null ] || { echo "enter.sh failed to prepare /dev" >&2; exit 1; }
+
+        # GitHub issue #48: re-exec THIS SAME script under fakeroot, once,
+        # before dpkg touches anything. `FAKEROOTKEY` is the env var
+        # fakeroot's own frontend sets for every process it wraps (and
+        # every child THEY fork/exec, since it's inherited normally) -- so
+        # checking it here is the standard "have I already been re-exec'd
+        # under fakeroot?" idiom, and avoids nesting a second fakeroot
+        # session inside the first if this script were ever re-entered.
+        # `exec`, not a subshell: replaces this process outright, so
+        # everything from here to the end of this script (dpkg --unpack,
+        # --configure, and even the ldconfig/cleanup/mtime-reset steps
+        # below) runs as ONE continuous fakeroot session -- exactly the
+        # single shared session mksquashfs (nix/compose.nix's
+        # squashfsImage, below) later needs to load back via `-i` for its
+        # own pack-time stat(2) calls to see the same faked owner/mode.
+        # `fakeroot`/`faked`/`libfakeroot-*.so`'s exact absolute paths
+        # inside the Ubuntu fakeroot package are DISCOVERED here via
+        # `find` rather than hardcoded (see this file's header "CI
+        # VERIFICATION NOTE" for why: this dev harness has no `fakeroot`
+        # binary to inspect directly).
+        if [ -z "''${FAKEROOTKEY:-}" ]; then
+          ubx_fakeroot_bin="$(find /.ubx-compose/fakeroot-tools -type f -name fakeroot | head -n1)"
+          ubx_faked_bin="$(find /.ubx-compose/fakeroot-tools -type f \( -name faked -o -name 'faked-*' \) | head -n1)"
+          ubx_libfakeroot="$(find /.ubx-compose/fakeroot-tools -type f -name 'libfakeroot-*.so' | head -n1)"
+          if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
+            echo "configure.sh: could not locate fakeroot/faked/libfakeroot under /.ubx-compose/fakeroot-tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
+            exit 1
+          fi
+          # `-s`: save the final faked ownership/mode database to
+          # /.ubx-fakeroot-state -- deliberately OUTSIDE /.ubx-compose (a
+          # later step in this same script `rm -rf`s that directory) and
+          # at $out's own TOP level, so squashfsImage's `rootfs` input
+          # still carries it. Excluded from the packed squashfs's actual
+          # CONTENT by squashfsImage itself (mirrors how
+          # /.ubx-ownership-pseudo.txt used to be excluded).
+          exec "$ubx_fakeroot_bin" --lib "$ubx_libfakeroot" --faked "$ubx_faked_bin" \
+            -s /.ubx-fakeroot-state -- /bin/sh /.ubx-compose/configure.sh
+        fi
 
         # A fresh /proc for THIS pid namespace -- several maintainer
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
@@ -622,54 +584,17 @@ let
         # whatever filesystem/locale glob-matching behavior would
         # otherwise apply.
         #
-        # scanLines (PR #36; see this file's header "PR #36" section and
-        # bin/ubx-scan-deb-ownership's own header for the full design) runs
-        # BEFORE unpack, per package, in the same pass: it discovers every
-        # non-root-owned path AND every path carrying a setuid/setgid/
-        # sticky bit that package's data.tar carries (which `dpkg
-        # --unpack` would otherwise hard-fail chown()-ing/chmod()-ing --
-        # EINVAL for the former, EPERM for the latter (CI run
-        # 29955725327: "error setting permissions of './usr/bin/mount':
-        # Operation not permitted") -- under this chroot's single-id-mapped
-        # user namespace), path-excludes it from dpkg's own extraction,
-        # pre-creates any such DIRECTORY now with its safe (non-special)
-        # mode (a later package's file may need it as a mkdir target), and
-        # records its true intended owner AND mode (special bits included)
-        # as an mksquashfs pseudo-file "modify" line in
-        # /.ubx-ownership-pseudo.txt, applied at IMAGE-PACK time by
-        # squashfsImage (nix/compose.nix, below) instead of by chown(2)/
-        # chmod(2) here. `mkdir -p`/`touch` first: a bare Ubuntu-base
-        # chroot is not guaranteed to already carry /etc/dpkg/dpkg.cfg.d
-        # (dpkg.cfg(5) reads every file under it automatically), and the
-        # pseudo-file manifest must exist -- even empty -- for
-        # squashfsImage to always find it, independent of whether any
-        # package in this run actually ships a selected entry.
-        mkdir -p /etc/dpkg/dpkg.cfg.d
-        touch /.ubx-ownership-pseudo.txt
-        ${scanLines}
-
+        # GitHub issue #48: dpkg unpacks every declared package NORMALLY
+        # now -- no scan, no --path-exclude, no separate content-restore
+        # pass. Every chown(2)/chmod(2) dpkg's own tarobject() attempts
+        # (including a non-root owner, EINVAL under this chroot's
+        # single-id-mapped user namespace; and a setuid/setgid/sticky bit,
+        # EPERM -- see this file's header for the concrete CI failures
+        # that used to require the retired scan/restore interim) is
+        # transparently faked-successful by the fakeroot session this
+        # script re-exec'd itself into above -- dpkg itself neither knows
+        # nor cares that it isn't really running as a privileged root.
         ${unpackLines}
-
-        # restoreLines (PR #36; see scanLines above and
-        # bin/ubx-scan-deb-ownership's own header): for every FILE/symlink/
-        # hardlink entry scanLines found (directories were already created
-        # above), extract that ONE archive member's real content straight
-        # from its already-staged .deb into its real place, then chmod it
-        # to its SAFE mode (special bits stripped) explicitly -- content
-        # restoration needs no id-mapping/capability at all, and the safe
-        # (non-special) permission bits need none either; only the OWNER
-        # and the mode's setuid/setgid/sticky bit are deferred to
-        # squashfsImage's pack-time pseudo-file pass. Runs AFTER unpack
-        # (the target directory tree, including any OTHER package's
-        # contribution, must already exist) but BEFORE
-        # `dpkg --configure -a` below, so maintainer postinst scripts see
-        # the same tree a real, unrestricted install would have produced
-        # -- just not yet carrying its real owner/special mode bit, which
-        # is fine: no maintainer script in this project's locked set is
-        # known to depend on a setuid/setgid bit being effective DURING
-        # its own postinst run (see this file's PR #36 header section for
-        # the residual-risk discussion this assumption rests on).
-        ${restoreLines}
 
         # Expand the 3-field preseed records into debconf-set-selections'
         # required 4-field form ("owner question type value") by looking
@@ -876,6 +801,25 @@ let
         # in case that step was ever skipped/failed partway).
         ubxrun "$UBX_BASE/bin/rm" -rf "$out/.ubx-compose"
 
+        # GitHub issue #48: /.ubx-fakeroot-state (the saved fakeroot
+        # ownership/mode database configure.sh's fakeroot re-exec wrote
+        # via `-s`) is only WRITTEN at that fakeroot session's own final
+        # process exit -- which happens when the `unshare ... enter.sh`
+        # invocation above returns, i.e. AFTER configure.sh's own in-chroot
+        # epoch mtime-reset pass (`find / -exec touch -h -d @0 {} +`) has
+        # already run. It would otherwise be the one file under $out whose
+        # mtime still carries this build's real wall-clock time --
+        # asserted to actually exist (a missing state file means the
+        # fakeroot session never completed, a real build failure worth
+        # catching loudly here rather than downstream in squashfsImage)
+        # and explicitly epoch-touched here, from OUTSIDE the chroot, to
+        # close that one gap.
+        [ -f "$out/.ubx-fakeroot-state" ] || {
+          echo "composeRootfs: $out/.ubx-fakeroot-state is missing -- the fakeroot session never saved its state" >&2
+          exit 1
+        }
+        ubxrun "$UBX_BASE/usr/bin/touch" -h -d @0 "$out/.ubx-fakeroot-state"
+
         # R1 mtime normalization (reset every mtime to the Unix epoch so
         # two independent builds are directly comparable with `diff -r`)
         # happens at the END of configure.sh, inside the chroot -- see the
@@ -935,14 +879,43 @@ let
   # { name, rootfs, system } -> $out/rootfs.squashfs, a read-only squashfs
   # image of an already-composed rootfs tree (typically a `composeRootfs`
   # output), built with `mksquashfs` sourced from the locked Ubuntu archive
-  # (archive.lock.json's `squashfs-tools` + `liblzo2-2` entries, added by
-  # this issue -- see that file's own comments for why exactly these two
-  # and not more). No maintainer scripts run here, so no chroot is needed
-  # for this step -- mksquashfs just reads `rootfs` as a plain input tree.
+  # (archive.lock.json's `squashfs-tools` + `liblzo2-2` entries -- see that
+  # file's own comments for why exactly these two and not more).
+  #
+  # GitHub issue #48: mksquashfs must run as a CLIENT of the SAME fakeroot
+  # session composeRootfs's own build saved to `rootfs`'s own
+  # "/.ubx-fakeroot-state" (see this file's header "GitHub issue #48"
+  # section) -- loading that state back via `-i` is what lets mksquashfs's
+  # own stat(2) calls transparently see each path's TRUE owner/mode, with
+  # NO manifest, pseudo-file pass, or scan step at all (fully retiring the
+  # `-pf`/`-e` mechanism the previous scan-based interim needed).
+  #
+  # fakeroot's own frontend is a shell script that execs further child
+  # processes (faked, then the wrapped command) by bare/absolute path, so
+  # -- exactly like composeRootfs's maintainer scripts -- it needs a REAL
+  # FHS root (chroot), not the raw-loader trick every OTHER step in this
+  # file uses. `rootfs` and `tools` (mksquashfs's own store path) are both
+  # read-only Nix inputs by the time this derivation runs, so neither can
+  # be chrooted into directly (no writable mountpoint could be created
+  # inside either) -- a fresh, writable copy of $UBX_BASE is used as the
+  # chroot root instead, mirroring composeRootfs's OWN "cp $UBX_BASE,
+  # chmod u+w, chroot" pattern exactly, with `rootfs`/`tools` bind-mounted
+  # in read-only and the produced image copied back out afterward.
+  #
+  # CI VERIFICATION NOTE (mirrors composeRootfs's own note on `unshare
+  # --user`): this is a NEW use of that same hardening pattern, one level
+  # further removed from what issue #9's original CI runs actually
+  # exercised -- if CI's first real build of this surfaces a mount/chroot
+  # permission error here, that is this exact extension failing in
+  # practice and needs a follow-up fix, not a mystery.
   squashfsImage =
     { name, rootfs, system ? "x86_64-linux" }:
     let
-      tools = toolsFHS { inherit system; name = "squashfs-${name}"; packages = [ "squashfs-tools" "liblzo2-2" ]; };
+      tools = toolsFHS {
+        inherit system;
+        name = "squashfs-${name}";
+        packages = [ "squashfs-tools" "liblzo2-2" "fakeroot" ];
+      };
     in
     runInUbuntuBase {
       inherit system;
@@ -951,43 +924,99 @@ let
       script = ''
         ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
         ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
+
+        # A fresh, writable FHS scratch tree to chroot into -- see this
+        # binding's own header comment above for why $rootfs/$tools
+        # (both read-only store paths by now) cannot be chrooted into
+        # directly. Ownership dropped on copy for the identical reason
+        # composeRootfs's own copy of $UBX_BASE does (see that
+        # derivation's "Deliberately drop ownership on copy" comment).
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-pack"
+        ubxrun "$UBX_BASE/bin/cp" -r --preserve=mode,timestamps,links --no-preserve=ownership \
+          "$UBX_BASE/." "$out/.ubx-pack/"
+        ubxrun "$UBX_BASE/bin/chmod" u+w "$out/.ubx-pack"
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/.ubx-pack/mnt/rootfs" "$out/.ubx-pack/mnt/tools" "$out/.ubx-pack/mnt/out"
+
+        # pack.sh -- runs INSIDE the chroot, same "write to a file, not a
+        # quoted argument" reasoning composeRootfs's own configure.sh
+        # comment documents (nested quoting from find's own `\(...\)`
+        # test expression, here).
+        ubxrun "$UBX_BASE/bin/cat" > "$out/.ubx-pack/pack.sh" <<'UBX_PACK_EOF'
+        set -eu
         # squashfs-tools' own runtime deps (liblz4-1, liblzma5, libzstd1,
-        # zlib1g) are already inside ubuntu-base (see archive.lock.json's
-        # comment on the squashfs-tools entry); only liblzo2-2 lives in
-        # `tools` instead -- both directories are on one combined
-        # --library-path. BOTH $tools lib dirs must be listed: a deb's
+        # zlib1g) are already inside ubuntu-base; only liblzo2-2 (and
+        # fakeroot's own small dep set) live under /mnt/tools instead --
+        # both its lib dirs go on LD_LIBRARY_PATH, which a REAL chroot's
+        # dynamic linker honors normally (no --library-path CLI trick
+        # needed here, unlike the raw pre-chroot ubxrun steps elsewhere in
+        # this file -- see nix/stdenv.nix's BOOTSTRAP CAVEAT for why that
+        # trick exists at all). BOTH $tools lib dirs are listed: a deb's
         # data tar may address the merged-/usr layout from either side
-        # (liblzo2-2 ships './lib/x86_64-linux-gnu/liblzo2.so.2',
-        # counting on the usrmerge symlink a real root has -- toolsFHS's
-        # flat extraction has no such symlink, proven by CI run
-        # 29786592587: mksquashfs failed to load liblzo2.so.2 with only
-        # the usr/lib path on the search path).
-        # -pf/-e (PR #36; see composeRootfs's scanLines/restoreLines
-        # comment above and bin/ubx-scan-deb-ownership's own header for the
-        # full design): $rootfs/.ubx-ownership-pseudo.txt is composeRootfs's
-        # own manifest of every selected (non-root-owned and/or set*id/
-        # sticky) path some package's data.tar carried, which `dpkg
-        # --unpack`'s in-chroot chown()/chmod() could not apply directly
-        # (EINVAL for a non-root owner, EPERM for a special mode bit --
-        # see CI run 29955725327 -- both under that chroot's
-        # single-id-mapped user namespace). `-pf` (squashfs-tools 4.6.1's
-        # "m"/modify pseudo-file syntax, matching what scanLines already
-        # writes: "<path relative, no leading slash> m <mode> <uid>
-        # <gid>") applies each such path's TRUE owner AND mode (special
-        # bits included) directly to the squashfs inode metadata at PACK
-        # time here -- no chown(2)/chmod(2) syscall at all, so this
-        # sandbox's id-mapping/set*id limits never apply to it. The
-        # manifest file itself
-        # is composeRootfs's own bookkeeping, not part of the real Ubuntu
-        # system `$rootfs` otherwise represents -- always present (even
-        # empty: composeRootfs unconditionally `touch`es it) but excluded
-        # from the image's actual CONTENT via `-e`, the same bare
-        # rootfs-relative path convention `-pf`'s own entries and
-        # composeRootfs's `path-exclude=` lines already use.
-        "$UBX_LD" --library-path "$UBX_LIBRARY_PATH:$tools/usr/lib/x86_64-linux-gnu:$tools/lib/x86_64-linux-gnu" \
-          "$tools/usr/bin/mksquashfs" "$rootfs" "$out/rootfs.squashfs" \
+        # (liblzo2-2 ships './lib/x86_64-linux-gnu/liblzo2.so.2', counting
+        # on a usrmerge symlink toolsFHS's flat extraction doesn't have --
+        # see composeRootfs's sibling comment, CI run 29786592587, for the
+        # original proof of this).
+        export LD_LIBRARY_PATH="/mnt/tools/usr/lib/x86_64-linux-gnu:/mnt/tools/lib/x86_64-linux-gnu"
+
+        [ -f /mnt/rootfs/.ubx-fakeroot-state ] || {
+          echo "pack.sh: /mnt/rootfs/.ubx-fakeroot-state is missing -- composeRootfs did not save fakeroot state for this rootfs" >&2
+          exit 1
+        }
+
+        # Same "discover, don't hardcode" reasoning as composeRootfs's own
+        # fakeroot re-exec block -- see this file's header "CI
+        # VERIFICATION NOTE".
+        ubx_fakeroot_bin="$(find /mnt/tools -type f -name fakeroot | head -n1)"
+        ubx_faked_bin="$(find /mnt/tools -type f \( -name faked -o -name 'faked-*' \) | head -n1)"
+        ubx_libfakeroot="$(find /mnt/tools -type f -name 'libfakeroot-*.so' | head -n1)"
+        if [ -z "$ubx_fakeroot_bin" ] || [ -z "$ubx_faked_bin" ] || [ -z "$ubx_libfakeroot" ]; then
+          echo "pack.sh: could not locate fakeroot/faked/libfakeroot under /mnt/tools (found fakeroot='$ubx_fakeroot_bin' faked='$ubx_faked_bin' libfakeroot='$ubx_libfakeroot')" >&2
+          exit 1
+        fi
+
+        # `-i`: load composeRootfs's saved fake ownership/mode database,
+        # so mksquashfs's OWN stat(2) calls against every path under
+        # /mnt/rootfs transparently see the TRUE owner/mode -- no -pf, no
+        # -e, no manifest at all. `.ubx-fakeroot-state` itself is excluded
+        # from the packed image's content (it is composeRootfs's own
+        # bookkeeping, not part of the real Ubuntu system /mnt/rootfs
+        # otherwise represents).
+        "$ubx_fakeroot_bin" --lib "$ubx_libfakeroot" --faked "$ubx_faked_bin" \
+          -i /mnt/rootfs/.ubx-fakeroot-state -- \
+          /mnt/tools/usr/bin/mksquashfs /mnt/rootfs /mnt/out/rootfs.squashfs \
           -mkfs-time 0 -all-time 0 -no-progress -processors 1 \
-          -pf "$rootfs/.ubx-ownership-pseudo.txt" -e .ubx-ownership-pseudo.txt
+          -e .ubx-fakeroot-state
+        UBX_PACK_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-pack/pack.sh"
+
+        # enter.sh -- bind-mounts rootfs/tools into the scratch tree, then
+        # chroots and runs pack.sh. Mirrors composeRootfs's OWN enter.sh
+        # exactly (same unshare/map-root-user/chroot pattern). No explicit
+        # `-o ro` on the bind mounts (a plain `mount --bind` does not
+        # honor `-o ro` in one step -- it needs a second `mount -o
+        # remount,ro,bind`, which is unverified to succeed inside this
+        # nested user+mount namespace): $rootfs/$tools are already
+        # read-only Nix store paths in practice regardless of the bind
+        # mount's own flag, and nothing pack.sh runs writes to either
+        # mountpoint. /mnt/out needs no bind mount at all -- it is already
+        # a plain writable directory inside this same copied, writable
+        # scratch tree.
+        ubxrun "$UBX_BASE/bin/cat" > "$out/.ubx-pack/enter.sh" <<'UBX_PACK_ENTER_EOF'
+        set -eu
+        ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
+        ubxrun "$UBX_BASE/usr/bin/mount" --bind "$rootfs" "$out/.ubx-pack/mnt/rootfs"
+        ubxrun "$UBX_BASE/usr/bin/mount" --bind "$tools" "$out/.ubx-pack/mnt/tools"
+        exec "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$UBX_BASE/usr/sbin/chroot" "$out/.ubx-pack" \
+          /bin/sh /pack.sh
+        UBX_PACK_ENTER_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/.ubx-pack/enter.sh"
+
+        ubxrun "$UBX_BASE/usr/bin/unshare" --user --map-root-user --mount --pid --fork -- \
+          "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$UBX_BASE/bin/bash" \
+          "$out/.ubx-pack/enter.sh"
+
+        ubxrun "$UBX_BASE/bin/cp" "$out/.ubx-pack/mnt/out/rootfs.squashfs" "$out/rootfs.squashfs"
+        ubxrun "$UBX_BASE/bin/rm" -rf "$out/.ubx-pack"
       '';
     };
 in

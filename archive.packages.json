@@ -6,6 +6,7 @@
     "dosfstools",
     "e2fsprogs",
     "ed",
+    "fakeroot",
     "grub-common",
     "grub-pc-bin",
     "grub2-common",

@@ -1,24 +1,27 @@
 # Snaps: declared surface, lockfile, and vendoring
 
-```{admonition} Contracts implemented (M3); real on-device convergence is later work
+```{admonition} Contracts implemented (M3); a few wiring gaps remain
 :class: note
 
-`snaps.packages.json`, `snaps.lock.json`, `bin/ubx-snap-resolve`, and
-`nix/snap.nix` exist in the repository as of milestone **M3** (`SPEC.md`
-§4.3, §4.4, §4.5, §5, §6; issue #60): the declared-surface validation,
-lockfile schema, resolver, and fixed-output vendoring described below are
-real. What is **not** implemented yet: a real `ubuntnix.snaps.<name>`
-module option (`nix/snap.nix`'s `validate`/`compileManifest` are ready for
-one to call once real module evaluation exists — the same "no `modules/`
-tree yet" caveat `nix/etc.nix`'s and `nix/systemd.nix`'s own docs describe),
-converging a running system's snapd against the compiled manifest (a future
-on-device planner/executor, by analogy with `bin/ubx-etc`/
-`bin/ubx-etc-apply`), and wiring `bin/ubx-snap-resolve` into `ubx update`
-(SPEC.md §4.5's three pin sources — flake inputs, archive, snap — are
-expected to be wired together in one later issue; see
-`bin/ubx-snap-resolve`'s own header for why `ubx update` deliberately stays
-a stub until then, mirroring the identical precedent
-`bin/ubx-resolve` already set for the archive-pins portion).
+`snaps.packages.json`, `snaps.lock.json`, `bin/ubx-snap-resolve`,
+`nix/snap.nix`, `bin/ubx-snap`, and `bin/ubx-snap-apply` all exist in the
+repository as of milestone **M3** (`SPEC.md` §4.3, §4.4, §4.5, §5, §6;
+issues #60, #61, #62): the declared-surface validation, lockfile schema,
+resolver, fixed-output vendoring, convergence planner, and convergence
+executor described below are all real. What is **not** implemented yet: a
+real `ubuntnix.snaps.<name>` module option (`nix/snap.nix`'s
+`validate`/`compileManifest` are ready for one to call once real module
+evaluation exists — the same "no `modules/` tree yet" caveat
+`nix/etc.nix`'s and `nix/systemd.nix`'s own docs describe), wiring
+`bin/ubx-snap`/`bin/ubx-snap-apply` into `ubx rebuild switch` itself (by
+analogy with `bin/ubx-etc`/`bin/ubx-etc-apply`'s own wiring — currently
+both are standalone, independently-testable scripts, not yet invoked from
+`bin/ubx`), and wiring `bin/ubx-snap-resolve` into `ubx update` (SPEC.md
+§4.5's three pin sources — flake inputs, archive, snap — are expected to
+be wired together in one later issue; see `bin/ubx-snap-resolve`'s own
+header for why `ubx update` deliberately stays a stub until then,
+mirroring the identical precedent `bin/ubx-resolve` already set for the
+archive-pins portion).
 ```
 
 ubuntnix prefers snaps over debs where a good one exists (`SPEC.md` §5:
@@ -272,11 +275,103 @@ on-device snap-domain planner (`bin/ubx-snap`, by analogy with
 `snap connections` state — `bin/ubx-generations`' `GEN_SNAP_MANIFEST` field
 is already reserved for exactly this.
 
+## Converging a running system: `bin/ubx-snap` + `bin/ubx-snap-apply`
+
+Real on-device snap convergence is a planner/executor pair, exactly the
+split `bin/ubx-etc`/`bin/ubx-etc-apply` and `bin/ubx-systemd`/
+`bin/ubx-systemd-apply` already establish for the `/etc` and systemd
+domains: `bin/ubx-snap` computes what SHOULD change; `bin/ubx-snap-apply`
+is the only one of the two that ever actually touches snapd.
+
+### `bin/ubx-snap`: the planner
+
+`bin/ubx-snap plan --old-manifest OLD --new-manifest NEW
+--observed-manifest OBSERVED [--out FILE|-]` diffs a per-generation snap
+manifest (`renderManifest`'s output, above) against what snapd actually
+reports right now, and emits a deterministic, ordered action plan:
+
+```json
+{ "version": 1, "actions": [ { "op": "...", "...": "..." }, ... ] }
+```
+
+Per-op action-object schema:
+
+- `{"op": "ack", "name", "revision"}`
+- `{"op": "install", "name", "revision", "channel", "classic"}`
+- `{"op": "refresh", "name", "fromRevision", "toRevision", "channel"}`
+- `{"op": "revert", "name", "fromRevision", "toRevision"}`
+- `{"op": "remove", "name"}`
+- `{"op": "connect", "name", "interface"}`
+- `{"op": "disconnect", "name", "interface"}`
+- `{"op": "set", "name", "key", "value"}`
+- `{"op": "unset", "name", "key"}`
+- `{"op": "hold", "mode": "forever"}`
+
+Ordering is fixed and safe: ack/install → ack/refresh → revert → remove →
+connect → disconnect → set → unset → hold (at most once, system-wide) —
+ack always precedes its own install/refresh, and install/refresh always
+precedes connect/disconnect/set/unset for the same snap, since a snap must
+exist before its interfaces/config can be touched. `bin/ubx-snap observe`
+separately queries live (or, for tests, stubbed) snapd state — via the
+injectable `UBX_SNAP_QUERY_CMD` seam — into the observed-manifest schema
+`plan` consumes; `bin/ubx-snap report` renders an already-computed plan as
+human-readable text. See `bin/ubx-snap`'s own header for the full
+algorithm.
+
+### `bin/ubx-snap-apply`: the executor
+
+`bin/ubx-snap-apply --plan FILE [--payload-dir DIR] [--assert-dir DIR]
+[--snap-cmd CMD]` consumes exactly the plan JSON above and issues the
+corresponding `snap` calls, in the plan's own order — it never recomputes,
+re-derives, or second-guesses a single decision the planner already made.
+
+Every snapd-mutating call is gated behind ONE injectable seam,
+`UBX_SNAP_CMD` (or `--snap-cmd`): an environment variable/option naming a
+command, invoked once per action as `"$UBX_SNAP_CMD" <subcommand>
+<args...>` — exactly the argv a human would type at the real `snap` CLI —
+defaulting to the literal command `snap` (the real host snapd client).
+Unit tests point this at a small recording-stub script instead, so the
+whole plan → ordered-snapd-calls pipeline is exercisable fully offline
+(tests/README.md's "no root, network, or KVM" unit rule); the real `snap`
+default is never exercised by `tests/unit/`.
+
+Per-op behavior:
+
+- **ack** → `snap ack <assert-dir>/<name>_<revision>.snap-declaration`
+- **install** → `snap install --dangerous [--classic]
+  <payload-dir>/<name>_<revision>.snap`
+- **refresh** → `snap refresh --dangerous
+  <payload-dir>/<name>_<toRevision>.snap`
+- **revert** → `snap revert <name> --revision=<toRevision>`
+- **remove** → `snap remove <name>`
+- **connect** → `snap connect <name>:<interface> :<interface>` (every
+  interface this project declares is a core-provided system slot)
+- **disconnect** → `snap disconnect <name>:<interface>`
+- **set** → `snap set <name> <key>=<value>` (booleans as bare
+  `true`/`false`; everything else as-is for strings, `json.dumps` otherwise)
+- **unset** → `snap unset <name> <key>`
+- **hold** → `snap refresh --hold=forever`
+
+`--dangerous` on `install`/`refresh` is a direct consequence of "A scoped
+simplification" above: only the snap-declaration assertion is vendored,
+never the full chain a fully-offline, non-`--dangerous` sideload would
+need to verify a payload's signature; `ack` still acks the vendored
+assertion for the provenance-binding this project's own policy needs.
+`--payload-dir`/`--assert-dir` resolve the plan's file-path-free
+`ack`/`install`/`refresh` actions to real vendored artifacts by the same
+`<name>_<revision>` naming convention `bin/ubx-snap-resolve`/
+`nix/snap.nix` already use for the committed
+`snaps/assertions/<name>_<revision>.snap-declaration` files — see
+`bin/ubx-snap-apply`'s own header for the full reasoning and the tracked
+gap (a real `ubx rebuild switch --apply` pointing both at wherever the new
+generation's snap-domain manifest build actually placed these files).
+
 ## Where to track progress
 
 The snap lockfile and resolver land at milestone **M3** (`SPEC.md` §11,
-issue #60). Real on-device snapd convergence (`snap ack` + signed
-sideload, interface connection, `snap set` config) and wiring
-`bin/ubx-snap-resolve` into `ubx update`'s snap-pins portion are separate,
-later work — see {doc}`workflows` for the planned `ubx update` flow across
-all three pin sources.
+issue #60); the convergence planner/executor pair lands in the same
+milestone (issues #61, #62). Wiring `bin/ubx-snap`/`bin/ubx-snap-apply`
+into `ubx rebuild switch` itself, and wiring `bin/ubx-snap-resolve` into
+`ubx update`'s snap-pins portion, are separate, later work — see
+{doc}`workflows` for the planned `ubx update` flow across all three pin
+sources.

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# bin/ubx-crypttab-apply — passphrase-LUKS groundwork's THIN convergence
+# EXECUTOR (SPEC.md §11 M4 "passphrase-LUKS groundwork (crypttab/
+# fileSystems)", §4.2 "generated /etc"; GitHub issue #83, milestone M4).
+# The crypttab-domain sibling of bin/ubx-etc-apply/bin/ubx-pro-apply:
+# consumes a plan produced by `bin/ubx-crypttab plan` (see that script's
+# header for the schema) and issues the corresponding filesystem calls, IN
+# THE PLAN'S OWN ORDER. All the intelligence lives in the planner; this
+# script never recomputes, re-derives, or second-guesses a single decision
+# the plan already made -- mirrors bin/ubx-etc-apply's/bin/ubx-pro-apply's
+# own deliberately dumb executor posture.
+#
+# -- Content source: the ORIGINAL manifest, not the plan ---------------------
+#
+# Exactly bin/ubx-etc-apply's own "the plan only carries a target sha256,
+# never raw bytes" convention (see that script's header): this executor
+# re-reads the real crypttab/unit-file BYTES off `--manifest` (the same
+# file `bin/ubx-crypttab plan` was given), keyed by the plan's own
+# `unitName`/the manifest's top-level `crypttabContent` -- never off the
+# plan file itself, which carries only a sha256 to verify against.
+#
+# -- Per-action behavior ------------------------------------------------
+#
+#   write-crypttab   atomically install the manifest's `crypttabContent`
+#                     to `--crypttab-file` (default /etc/crypttab), mode
+#                     0600 (crypttab(5) may carry a keyfile path in a real
+#                     deployment even though THIS issue's declared entries
+#                     never do -- 0600 is the correct default posture
+#                     regardless, and matches every real distro's own
+#                     packaged crypttab permissions).
+#   create-mount /
+#   update-mount      atomically install the matching volume's
+#                     `mountUnitContent` to `--units-dir/<unitName>`
+#                     (default /etc/systemd/system/<unitName>), mode 0644
+#                     (a mount unit is not secret material).
+#   remove-mount       `rm -f` the target unit file. Idempotent by
+#                      construction (bin/ubx-etc-apply's own "remove is
+#                      idempotent" precedent) -- removing an
+#                      already-gone unit file is the desired end state
+#                      holding, not a failure.
+#
+# This executor deliberately never runs `systemctl daemon-reload` or
+# `systemctl restart <mount-unit>` itself -- that belongs to whatever
+# orchestrates the whole rebuild/switch (bin/ubx-systemd-apply's own role
+# for the systemd domain), once a later issue wires this domain into that
+# orchestration; this issue is scoped to the generation + activation
+# MECHANISM only (this file's header, "Scope").
+#
+# -- Privilege / testability -------------------------------------------------
+#
+# Exactly bin/ubx-etc-apply's own posture: this script is fully exercisable
+# unprivileged against a temp `--crypttab-file`/`--units-dir` (tests/
+# README.md's "no root, no network" unit rule) -- writing there never needs
+# root. A real `/etc/crypttab`/`/etc/systemd/system` write in production
+# does need root, but that privilege requirement is the CALLER's problem
+# (this project's own `ubx rebuild switch --apply` already runs as root
+# end to end), not something this script checks or special-cases.
+set -euo pipefail
+
+prog_name="ubx-crypttab-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-crypttab-apply --plan FILE --manifest FILE [--crypttab-file FILE] [--units-dir DIR] [--apply | --dry-run]
+
+Consumes a plan produced by `bin/ubx-crypttab plan` and issues the
+corresponding install/rm calls, in the plan's own order.
+
+  --plan FILE           the plan JSON to apply (required)
+  --manifest FILE       the SAME manifest `bin/ubx-crypttab plan` was given
+                        -- real crypttabContent/mountUnitContent bytes are
+                        read from here, never from the plan (required)
+  --crypttab-file FILE  the real (or, for tests, temp) /etc/crypttab path a
+                        'write-crypttab' action targets (default
+                        /etc/crypttab)
+  --units-dir DIR       the real (or, for tests, temp) directory a
+                        create-mount/update-mount/remove-mount action
+                        targets, as DIR/<unitName> (default
+                        /etc/systemd/system)
+  --apply               actually run commands
+  --dry-run             print, don't run (default)
+  -h, --help            show this message
+USAGE
+}
+
+main() {
+  local plan="" manifest="" crypttab_file="/etc/crypttab" units_dir="/etc/systemd/system" mode="dry-run"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --manifest) [ $# -ge 2 ] || die "--manifest requires an argument"; manifest="$2"; shift 2 ;;
+      --crypttab-file) [ $# -ge 2 ] || die "--crypttab-file requires an argument"; crypttab_file="$2"; shift 2 ;;
+      --units-dir) [ $# -ge 2 ] || die "--units-dir requires an argument"; units_dir="$2"; shift 2 ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+  [ -n "$manifest" ] || die "--manifest is required"
+  [ -f "$manifest" ] || die "no such file: $manifest"
+
+  # -- compile the plan into TAGGED, base64-content lines (content may
+  # contain arbitrary whitespace/newlines -- crypttab lines and unit files
+  # both do -- so it is never spliced into a TSV/plain line directly; base64
+  # keeps every tag line single-line and shell-`read`-safe, mirroring this
+  # project's other executors' "one tag per line" compiled-plan convention,
+  # e.g. bin/ubx-pro-apply's own ATTACH/CMD tags).
+  local compiled
+  compiled="$(python3 - "$plan" "$manifest" "$crypttab_file" "$units_dir" <<'PYEOF'
+import base64
+import json
+import sys
+
+plan_path, manifest_path, crypttab_file, units_dir = sys.argv[1:5]
+
+with open(plan_path, encoding="utf-8") as f:
+    plan = json.load(f)
+with open(manifest_path, encoding="utf-8") as f:
+    manifest = json.load(f)
+
+unit_content_by_name = {
+    v["mountUnitName"]: v["mountUnitContent"]
+    for v in manifest.get("volumes", [])
+    if v.get("mountUnitName") is not None
+}
+
+for a in plan.get("actions", []):
+    op = a["op"]
+    if op == "write-crypttab":
+        b64 = base64.b64encode(manifest["crypttabContent"].encode("utf-8")).decode("ascii")
+        print(f"WRITE-CRYPTTAB {crypttab_file} {b64}")
+    elif op in ("create-mount", "update-mount"):
+        unit_name = a["unitName"]
+        content = unit_content_by_name.get(unit_name)
+        if content is None:
+            print(f"ubx-crypttab-apply: plan names unitName {unit_name!r} not found in --manifest", file=sys.stderr)
+            sys.exit(1)
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        print(f"WRITE-MOUNT {units_dir}/{unit_name} {b64}")
+    elif op == "remove-mount":
+        unit_name = a["unitName"]
+        print(f"REMOVE-MOUNT {units_dir}/{unit_name}")
+    else:  # pragma: no cover -- defensive; bin/ubx-crypttab never emits this
+        print(f"ubx-crypttab-apply: unknown plan action op: {op!r}", file=sys.stderr)
+        sys.exit(1)
+PYEOF
+  )"
+
+  if [ -z "$compiled" ]; then
+    exit 0
+  fi
+
+  if [ "$mode" = "dry-run" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "WRITE-CRYPTTAB "*)
+          # shellcheck disable=SC2086
+          set -- $line
+          printf 'install -D -m 0600 <crypttabContent> %s\n' "$2"
+          ;;
+        "WRITE-MOUNT "*)
+          # shellcheck disable=SC2086
+          set -- $line
+          printf 'install -D -m 0644 <mountUnitContent> %s\n' "$2"
+          ;;
+        "REMOVE-MOUNT "*)
+          # shellcheck disable=SC2086
+          set -- $line
+          printf 'rm -f %s\n' "$2"
+          ;;
+      esac
+    done <<< "$compiled"
+    exit 0
+  fi
+
+  # --apply: decode each line's base64 payload to a temp file, then
+  # `install -D`/`rm -f` it into place -- `install -D` builds the
+  # destination in a temp file in the SAME directory and renames it into
+  # place (bin/ubx-etc-apply's own reasoning for preferring it over a bare
+  # `cp`), so a reader never observes a partially-written crypttab or unit
+  # file.
+  local target="" payload="" tmp=""
+  while IFS= read -r line; do
+    case "$line" in
+      "WRITE-CRYPTTAB "*)
+        # shellcheck disable=SC2086
+        set -- $line
+        target="$2"
+        payload="${3:-}"
+        tmp="$(mktemp)"
+        printf '%s' "$payload" | base64 -d > "$tmp"
+        install -D -m 0600 "$tmp" "$target"
+        rm -f "$tmp"
+        ;;
+      "WRITE-MOUNT "*)
+        # shellcheck disable=SC2086
+        set -- $line
+        target="$2"
+        payload="${3:-}"
+        tmp="$(mktemp)"
+        printf '%s' "$payload" | base64 -d > "$tmp"
+        install -D -m 0644 "$tmp" "$target"
+        rm -f "$tmp"
+        ;;
+      "REMOVE-MOUNT "*)
+        # shellcheck disable=SC2086
+        set -- $line
+        target="$2"
+        rm -f "$target"
+        ;;
+    esac
+  done <<< "$compiled"
+}
+
+main "$@"

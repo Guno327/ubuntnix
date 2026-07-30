@@ -98,8 +98,49 @@
 # rootfs composition — unpacking debs, running maintainer scripts inside
 # the ubuntu-native stdenv sandbox (SPEC.md §4.1, issue #6) — belongs to a
 # different M1 issue, not this one.
-{ config, ... }:
+#
+# -- The restricted/multiverse component toggle (SPEC.md §5; GitHub issue
+# #106) -----------------------------------------------------------------
+#
+# This file's header ("The declared package set", above) used to note that
+# `archive.packages.json`'s `components` field had no per-machine toggle
+# expressing SPEC.md §5's "main+universe by default, restricted/multiverse
+# a per-machine opt-in" — main/universe/restricted/multiverse were all
+# SUPPORTED by bin/ubx-resolve, but nothing declarative decided which
+# subset a given machine actually wants. `componentToggleType`/
+# `effectiveComponents` below are that declarative surface:
+#
+#   ubuntnix.archive.components = {
+#     restricted = false;    # default false (SPEC.md §5's default posture)
+#     multiverse = false;    # default false
+#   };
+#
+# `effectiveComponents` turns a declared toggle into the exact flat
+# `components` list shape `archive.packages.json`/bin/ubx-resolve already
+# consume (main+universe always on, restricted/multiverse appended in
+# VALID_COMPONENTS' own canonical order when enabled) — the same
+# "interim, obvious, committed stand-in" archive.packages.json's own header
+# describes for `packages`: until a real `ubuntnix.debs`-style module wires
+# a whole machine's declared config straight through to a generated
+# archive.packages.json (M2+), a human/CI keeps `components` in sync with
+# this function's output by construction (tests/unit/189-archive-
+# components-flake-wiring.sh statically pins the two orderings together).
+# bin/ubx-resolve itself needs no change to respect an enabled restricted/
+# multiverse component: it already validates against and resolves/pins
+# against whatever subset of VALID_COMPONENTS the `components` list
+# carries (see that script's header) — this toggle is purely about WHICH
+# subset a machine declares, not how the resolver behaves once declared.
+#
+# CAVEAT (documented here and in docs/archive.md): esm-apps patch coverage
+# (nix/pro.nix's `esmApps`) does NOT extend to restricted/multiverse —
+# SPEC.md §5 scopes esm-apps coverage to universe; packages pulled from
+# restricted/multiverse (when this toggle enables them) follow upstream
+# Canonical's own patch cadence for those components, same as stock
+# Ubuntu.
+{ config, inputs, ... }:
 let
+  lib = inputs.nixpkgs.lib;
+
   # The Ubuntu-native stdenv's builder abstraction (nix/stdenv.nix), read
   # from the TOP-LEVEL module scope (this `{ config, ... }:` function head,
   # NOT `perSystem`'s own `config` argument, which is a different,
@@ -316,6 +357,58 @@ let
       value = fetchEsmDeb entry;
     })
     lockfile.esm.packages);
+
+  # -- componentToggleType / effectiveComponents -- see this file's header,
+  # "The restricted/multiverse component toggle".
+  componentToggleType = lib.types.submodule {
+    options = {
+      restricted = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether this machine opts in to the "restricted" archive
+          component (drivers/firmware under restricted licensing terms).
+          Default off (SPEC.md §5's "main+universe by default" posture).
+          NOTE: esm-apps patch coverage does not extend here -- see this
+          file's header, "The restricted/multiverse component toggle".
+        '';
+      };
+      multiverse = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether this machine opts in to the "multiverse" archive
+          component (software under non-free/patent-encumbered licensing
+          terms). Default off (SPEC.md §5). NOTE: esm-apps patch coverage
+          does not extend here -- see this file's header, "The
+          restricted/multiverse component toggle".
+        '';
+      };
+    };
+  };
+
+  # evalComponentToggle -- runs a declared `ubuntnix.archive.components`
+  # attrset through the real Nix module system, self-contained (mirrors
+  # nix/pro.nix's/nix/networking.nix's own `evalDeclared`).
+  evalComponentToggle = declared:
+    (lib.evalModules {
+      modules = [{
+        options.components = lib.mkOption { type = componentToggleType; default = { }; };
+        config = { components = declared; };
+      }];
+    }).config.components;
+
+  # effectiveComponents -- a declared `ubuntnix.archive.components` toggle
+  # (an attrset, e.g. `{ restricted = true; }`) -> the exact flat
+  # `components` list shape `archive.packages.json`/bin/ubx-resolve
+  # consume: main+universe always on, restricted/multiverse appended (in
+  # that fixed order, matching bin/ubx-resolve's own VALID_COMPONENTS
+  # listing order) only when the toggle enables them.
+  effectiveComponents = declared:
+    let toggle = evalComponentToggle declared; in
+    [ "main" "universe" ]
+    ++ lib.optional toggle.restricted "restricted"
+    ++ lib.optional toggle.multiverse "multiverse";
 in
 {
   # Exposed under flake.lib (option declared once, in nix/lib.nix; every
@@ -325,6 +418,7 @@ in
   flake.lib.archive = {
     inherit lockfile validate snapshotUrl fetchDeb debs;
     inherit fetchEsmDeb esmDebs esmProTokenVar;
+    inherit componentToggleType evalComponentToggle effectiveComponents;
   };
 
   systems = [ "x86_64-linux" ];
@@ -484,6 +578,37 @@ in
         url = "${snapshotUrl}/${entry.path}";
         sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
         name = "archive-hash-mismatch-proof-deliberately-wrong-hash";
+      };
+
+    # archive-components-proof (GitHub issue #106): forces
+    # evalComponentToggle/effectiveComponents against a couple of fixed
+    # declared toggles at EVAL time -- mirrors nix/pro.nix's own
+    # `pro-manifest-proof` role (constructing this derivation is enough,
+    # without a real `nix build`, for CI's "flake" job, `flake check
+    # --no-build`, to exercise this file's toggle validate/render logic for
+    # real). Deterministic: every input is a fixed, inline attrset, nothing
+    # timestamp- or host-dependent.
+    packages.archive-components-proof =
+      let
+        allOff = effectiveComponents { };
+        allOn = effectiveComponents { restricted = true; multiverse = true; };
+        restrictedOnly = effectiveComponents { restricted = true; };
+      in
+      builtins.derivation {
+        name = "archive-components-proof";
+        system = system;
+        builder = "/bin/sh";
+        args = [
+          "-c"
+          ''
+            {
+              echo "MARKER=ubuntnix-archive-components-proof-v1"
+              echo "default=${builtins.concatStringsSep " " allOff}"
+              echo "restricted-and-multiverse=${builtins.concatStringsSep " " allOn}"
+              echo "restricted-only=${builtins.concatStringsSep " " restrictedOnly}"
+            } > "$out"
+          ''
+        ];
       };
 
     # archive-esm-fetch-proof (GitHub issue #81, milestone M4): the esm-tier

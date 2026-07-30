@@ -49,12 +49,15 @@
 # -- Commit identity -----------------------------------------------------
 #
 # A freshly-initialized machine has no reason to already carry a global
-# `user.name`/`user.email` (and must not depend on one existing) — every
-# commit this script makes uses `git -c user.name=... -c user.email=...`
-# scoped to that one invocation, never `git config --global` and never a
-# bare `git commit` relying on ambient config. The identity is
-# deterministic (not e.g. timestamp-derived) so a rerun's would-be commit,
-# were the tree not already clean, is reproducible.
+# `user.name`/`user.email` (and must not depend on one existing), so this
+# script sets a deterministic identity via `git config` LOCAL to the flake
+# repo (never `--global`) right after `git init`. It is set repo-local, not
+# as a per-invocation `git -c ...`, precisely because it must be visible to
+# the `git commit` that `git-crypt add-gpg-user` runs INTERNALLY inside
+# step 5 as well as to step 4's own commit — a `-c` scoped to step 4 alone
+# would leave that git-crypt-internal commit to fail with "empty ident" on
+# any machine lacking an ambient git identity. The identity is deterministic
+# (not e.g. timestamp-derived) so reruns are reproducible.
 #
 # -- Where the compiled config lands --------------------------------------
 #
@@ -157,6 +160,19 @@ main() {
     echo "$prog_name: initialized git repository at $flake" >&2
   fi
 
+  # Persist a deterministic committer identity LOCAL to this repo (never
+  # global). A freshly-installed machine has no reason to already carry a
+  # global `user.name`/`user.email`, and this identity must be visible not
+  # only to step 4's own commit but to the `git commit` that `git-crypt
+  # add-gpg-user` runs INTERNALLY inside step 5 (recording the new
+  # collaborator's `.git-crypt/keys/...` file) -- a bare `git -c ...` scoped
+  # to step 4's invocation alone would leave that git-crypt-internal commit
+  # to fail with "empty ident"/"'git commit' failed" on any machine with no
+  # ambient git identity (e.g. a CI runner or a fresh install). Set
+  # idempotently on every run (a rerun just rewrites the same two values).
+  git -C "$flake" config user.name "ubuntnix installer"
+  git -C "$flake" config user.email "installer@ubuntnix.invalid"
+
   # -- step 2: materialize the compiled config + the secrets/ template -------
   copy_if_changed "$config" "$flake/configuration.nix"
   copy_if_changed "$repo_root/secrets/.gitattributes" "$flake/secrets/.gitattributes"
@@ -180,11 +196,10 @@ main() {
   if [ -z "$(cd -- "$flake" && git status --porcelain)" ]; then
     echo "$prog_name: $flake working tree is already clean -- skipping commit (idempotent)" >&2
   else
-    (
-      cd -- "$flake"
-      git -c user.name="ubuntnix installer" -c user.email="installer@ubuntnix.invalid" \
-        commit --quiet -m "ubx-flake-init: initialize /flake"
-    )
+    # Identity comes from the repo-local `git config` set right after init
+    # above (see that block's comment for why it must persist, not be a
+    # per-invocation `-c`).
+    ( cd -- "$flake" && git commit --quiet -m "ubx-flake-init: initialize /flake" )
     echo "$prog_name: committed /flake initialization in $flake" >&2
   fi
 

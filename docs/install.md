@@ -39,7 +39,12 @@ configuration:
 - the third-party-software checkbox becomes the restricted + multiverse
   per-machine opt-in toggle.
 
-Server installs keep cloud-init, as upstream does.
+Server installs keep cloud-init, as upstream does. It ships present-but-inert
+(the `/etc/cloud/cloud-init.disabled` marker, the same disabled-by-the-
+administrator marker a stock post-install Ubuntu Server system carries), so
+it never emits its own netplan config and ubuntnix's own
+`/etc/netplan/01-ubuntnix.yaml` stays the single source of truth (SPEC.md
+§12 R12).
 
 ### Planned installer steps
 

@@ -598,6 +598,12 @@ jobs:
       - name: Report KVM availability
         run: |
           if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and every
+            # e2e job silently falls back to TCG software emulation (10-20x
+            # slower) -- which is what pushed the #90 login-proof boot past its
+            # 600s ceiling. Grant world rw so acceleration is actually used.
+            sudo chmod 666 /dev/kvm || true
             ls -la /dev/kvm
           else
             echo "::warning::/dev/kvm not present on this runner -- the e2e boot below will fall back to TCG (slower, still correct; see tests/e2e/010-qemu-boot-e2e.sh's own KVM-detection logic)"
@@ -722,6 +728,12 @@ jobs:
       - name: Report KVM availability
         run: |
           if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and every
+            # e2e job silently falls back to TCG software emulation (10-20x
+            # slower) -- which is what pushed the #90 login-proof boot past its
+            # 600s ceiling. Grant world rw so acceleration is actually used.
+            sudo chmod 666 /dev/kvm || true
             ls -la /dev/kvm
           else
             echo "::warning::/dev/kvm not present on this runner -- the e2e switch loop below will fall back to TCG (slower, still correct; see tests/e2e/020-qemu-switch-e2e.sh's own KVM-detection logic)"
@@ -787,6 +799,12 @@ jobs:
       - name: Report KVM availability
         run: |
           if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and every
+            # e2e job silently falls back to TCG software emulation (10-20x
+            # slower) -- which is what pushed the #90 login-proof boot past its
+            # 600s ceiling. Grant world rw so acceleration is actually used.
+            sudo chmod 666 /dev/kvm || true
             ls -la /dev/kvm
           else
             echo "::warning::/dev/kvm not present on this runner -- the real soft-reboot re-exec below is expected to be declined via a clean UBX-SR-NOTE instead (see tests/e2e/040-qemu-soft-reboot-e2e.sh's/nix/boot.nix's soft-reboot-proof's own uptime heuristic)"
@@ -845,6 +863,12 @@ jobs:
       - name: Report KVM availability
         run: |
           if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and every
+            # e2e job silently falls back to TCG software emulation (10-20x
+            # slower) -- which is what pushed the #90 login-proof boot past its
+            # 600s ceiling. Grant world rw so acceleration is actually used.
+            sudo chmod 666 /dev/kvm || true
             ls -la /dev/kvm
           else
             echo "::warning::/dev/kvm not present on this runner -- the e2e snap-convergence test below will fall back to TCG (slower, still correct; see tests/e2e/030-qemu-snap-e2e.sh's own KVM-detection logic)"

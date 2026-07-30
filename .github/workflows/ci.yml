@@ -329,27 +329,7 @@ jobs:
           sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#home-proof -L -o result-home-proof
           sudo chown -R "$USER" result-home-proof
       - name: Assert home-proof output tree + manifest
-        run: |
-          [ -f result-home-proof/tree/gunnar/files/.bashrc ] || {
-            echo "no tree/gunnar/files/.bashrc in home-proof output"; exit 1;
-          }
-          grep -q 'EDITOR=vim' result-home-proof/tree/gunnar/files/.bashrc || {
-            echo "tree/gunnar/files/.bashrc does not contain the declared text"; exit 1;
-          }
-          [ -f result-home-proof/tree/gunnar/services/ubuntnix-home-example.service ] || {
-            echo "no tree/gunnar/services/ubuntnix-home-example.service in home-proof output"; exit 1;
-          }
-          [ -f result-home-proof/manifest.json ] || { echo "no manifest.json in home-proof output"; exit 1; }
-          python3 -c "
-import json
-m = json.load(open('result-home-proof/manifest.json'))
-assert m['version'] == 1
-users = {u['name']: u for u in m['users']}
-assert 'gunnar' in users
-assert {f['path'] for f in users['gunnar']['files']} == {'.bashrc', '.config/foo/config.toml'}
-assert {s['name'] for s in users['gunnar']['services']} == {'ubuntnix-home-example.service'}
-print('home-proof manifest OK')
-"
+        run: python3 tests/lib/check-home-proof.py result-home-proof
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

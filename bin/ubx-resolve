@@ -45,10 +45,21 @@
 # editing it by hand, not a format change. `components` is the enabled
 # subset of noble's archive components for THIS declared set: all four
 # (main/universe/restricted/multiverse) are SUPPORTED by this script (SPEC.md
-# §4.4's M1 line item: "all four components supported"), but SPEC.md §5
+# §4.4's M1 line item: "all four components supported"), and SPEC.md §5
 # defaults a machine to main+universe, with restricted/multiverse a
-# per-machine opt-in (real system config, M6 scope) this file doesn't yet
-# express a toggle for.
+# per-machine opt-in toggle -- GitHub issue #106 makes that toggle
+# expressible at the declarative layer: nix/archive.nix's
+# `componentToggleType`/`effectiveComponents` (see that file's header, "The
+# restricted/multiverse component toggle") compute exactly this
+# `components` list shape from a declared `ubuntnix.archive.components =
+# { restricted = ...; multiverse = ...; }` attrset, default OFF. This
+# script itself needed no change to honor an enabled restricted/multiverse
+# component -- it already validates against, and resolves/pins against,
+# whatever subset of VALID_COMPONENTS the `components` list below carries;
+# only WHICH subset a machine declares is new. `ubx update`'s archive-pins
+# portion remains the pre-M1 stub (tests/unit/020-ubx-cli.sh) -- this
+# script is still invoked directly until a later issue wires the three pin
+# sources together, per the note above.
 #
 # -- The isolated apt rootdir -----------------------------------------------
 #

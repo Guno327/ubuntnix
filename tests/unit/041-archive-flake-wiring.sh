@@ -104,7 +104,11 @@ fi
 # package/fetcher references at all, beyond the already-permitted
 # <nix/fetchurl.nix>/builtins.fetchurl spellings that 021 itself carves
 # out (checked above via running 021 in full).
-if grep -nE 'pkgs\.[a-zA-Z]|mkDerivation|buildInputs|fetchFromGitHub' "$archive_nix" >/dev/null 2>&1; then
+# Word-boundary \bpkgs\. (not bare pkgs\.[a-zA-Z], tests/unit/170's/180's
+# own corrected form) — GitHub issue #106 added a legitimate
+# `inputs.nixpkgs.lib` to this file, which the older bare pattern
+# false-matched on ("...nix" + "pkgs.l...").
+if grep -nE '\bpkgs\.|mkDerivation|buildInputs|fetchFromGitHub' "$archive_nix" >/dev/null 2>&1; then
   fail "$archive_nix references a forbidden nixpkgs-package-set pattern"
 fi
 

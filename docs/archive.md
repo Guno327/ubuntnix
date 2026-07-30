@@ -69,6 +69,68 @@ allowed to solve against, not which archive or timestamp is trusted; see
 `tests/unit/054-ubx-resolve-suites.sh` for the exact line shape/order this
 pins.
 
+## The restricted/multiverse component toggle
+
+```{admonition} Implemented: declarative layer (GitHub issue #106)
+:class: note
+
+`bin/ubx-resolve` has supported all four archive components
+(`main`/`universe`/`restricted`/`multiverse`) since milestone M1 — the gap
+was that nothing declarative decided which subset a given machine actually
+wants. `nix/archive.nix`'s `componentToggleType`/`effectiveComponents`
+close that gap. `archive.packages.json`'s committed `components` list
+stays `["main", "universe"]` — this feature adds the toggle, it does not
+flip the committed default.
+```
+
+`SPEC.md` §5's package policy defaults every machine to `main` and
+`universe` only; `restricted` and `multiverse` are a **per-machine
+opt-in**, off by default. `nix/archive.nix` declares that toggle:
+
+```nix
+ubuntnix.archive.components = {
+  restricted = false;   # default false
+  multiverse = false;   # default false
+};
+```
+
+`effectiveComponents` turns a declared toggle into the exact flat
+`components` list `archive.packages.json`/`bin/ubx-resolve` already
+consume: `main` and `universe` are always included, with `restricted`/
+`multiverse` appended (in that fixed order) only when enabled. A machine
+that wants, say, a restricted-only driver package sets
+`ubuntnix.archive.components.restricted = true`, which yields
+`["main", "universe", "restricted"]` — the same shape a human/CI would
+type by hand into `archive.packages.json`'s `components` field, since that
+file remains the interim, hand-maintained declaration `bin/ubx-resolve`
+resolves against pre-M2 (see that script's and that JSON file's own
+header comments). `bin/ubx-resolve` itself needed **no change** to honor
+an enabled component: it already validates against, and resolves/pins
+against, whatever subset of its `VALID_COMPONENTS` set a declaration's
+`components` list carries (`tests/unit/050-archive-declaration.sh` already
+covers all four components at that layer) — this toggle is purely about
+**which** subset a machine declares, default off, not how the resolver
+behaves once declared. With the toggle off, a restricted/multiverse-only
+package is structurally unresolvable: the scratch `sources.list`
+`bin/ubx-resolve` writes (see "Resolving the public tier" above) carries
+only the enabled components, so apt's solver never even sees that
+package's pool entries. `tests/unit/190-archive-components-toggle.sh`
+exercises both the sources.list-generation level (toggle off vs. on) and
+the lockfile-emission level (a resolved restricted/multiverse-component
+tuple still pins its full `name`/`version`/`arch`/`component`/`path`/
+`sha256`/`size` schema once resolved) — the two halves of "fails to
+resolve when off, resolves and pins when on" that a unit test can exercise
+without a live apt solve (`tests/README.md`'s "no network" rule).
+
+**esm-apps does not cover restricted/multiverse.** `nix/pro.nix`'s
+`esmApps` primitive (`SPEC.md` §5/§9) provides Canonical patch coverage
+for `universe` once Ubuntu Pro is attached — it does **not** extend to
+`restricted` or `multiverse`. Packages resolved from those two components,
+when this toggle enables them, follow **upstream Canonical's own patch
+cadence** for `restricted`/`multiverse`, exactly like a stock Ubuntu
+install with those components enabled — attaching Pro and turning on
+esm-apps changes nothing about how those packages get patched.
+
 ## Entry schema
 
 `archive.lock.json` lives at the repository root (not under `nix/`) as

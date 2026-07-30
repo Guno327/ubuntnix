@@ -1960,15 +1960,15 @@ let
         # against a value this driver already knows in advance.
         m4_login_rc=0
         UBX_M4_STORED_HASH="$shadow_hash" python3 <<'UBX_M4_LOGIN_PY_EOF' || m4_login_rc=$?
-import crypt
-import os
-import sys
+    import crypt
+    import os
+    import sys
 
-plaintext = "${switchLoopPwPlaintext}"
-stored_hash = os.environ["UBX_M4_STORED_HASH"]
-computed = crypt.crypt(plaintext, stored_hash)
-sys.exit(0 if computed == stored_hash else 1)
-UBX_M4_LOGIN_PY_EOF
+    plaintext = "${switchLoopPwPlaintext}"
+    stored_hash = os.environ["UBX_M4_STORED_HASH"]
+    computed = crypt.crypt(plaintext, stored_hash)
+    sys.exit(0 if computed == stored_hash else 1)
+    UBX_M4_LOGIN_PY_EOF
         [ "$m4_login_rc" -eq 0 ] \
           || mark_fail_pw "the known fixture plaintext does not authenticate (crypt(3)) against ${switchLoopPwUserName}'s shadow hash -- login would fail"
         echo "UBX-M4-PW-PASS"

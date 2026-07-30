@@ -31,6 +31,7 @@
         ./nix/secrets.nix
         ./nix/pro.nix
         ./nix/crypttab.nix
+        ./nix/filesystems.nix
       ];
     };
 }

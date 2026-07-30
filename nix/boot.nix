@@ -3134,6 +3134,603 @@ let
     ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-snap-converge-driver.service \
       "$out/etc/systemd/system/multi-user.target.wants/ubx-snap-converge-driver.service"
   '';
+
+  # ===========================================================================
+  # home-activation-proof — a LIVE QEMU end-to-end proof that
+  # `ubx rebuild switch --apply` really activates the per-user home domain
+  # (nix/home.nix's `render`, bin/ubx-home's planner, bin/ubx-home-apply's
+  # executor -- SPEC.md §9, §11 M5; GitHub issue #105, a follow-up to #98
+  # which landed the home surface itself with only a build-time,
+  # non-booting `.#home-proof` -- see nix/home.nix's own header). Structural
+  # sibling of this file's own switch-loop-proof section above (read that
+  # section's header first if you haven't -- this one reuses its two
+  # generic building blocks, `switchLoopVarImage` and `switchLoopDiskImage`,
+  # directly rather than duplicating them: neither is actually
+  # switch-loop-specific, both just assemble a THIRD, ext4, disk partition
+  # from an arbitrary populate-tree derivation, which this proof needs for
+  # its own reason -- see decision 1 below).
+  #
+  # -- Two crux design decisions -------------------------------------------
+  #
+  # 1. WHERE THE PERSISTENT `/home` COMES FROM. The acceptance criteria
+  #    need a real reboot (to prove an enabled user service auto-starts via
+  #    `loginctl enable-linger`), so home CONTENT and linger's own durable
+  #    state (systemd-logind's `/var/lib/systemd/linger/<user>` marker,
+  #    which this proof's writable-`/etc` bind-mount -- see decision 2 --
+  #    makes real and persistent for exactly this reason) must both survive
+  #    it. `bootRootfs`'s own M1 default already mounts `/home` -- but as
+  #    EMPTY, wiped-every-boot tmpfs (see that function's own
+  #    `writeUnitLines` comment). This proof overwrites that SAME unit file
+  #    (`/etc/systemd/system/home.mount` -- already correctly named and
+  #    already symlinked under `local-fs.target.wants` by `bootRootfs`
+  #    itself; `extraFilesScript` runs AFTER that machinery, so this is a
+  #    plain content overwrite, no new symlink needed) with a REAL ext4
+  #    mount of a third disk partition -- `switchLoopVarImage`'s own
+  #    `mke2fs -d` trick, `switchLoopDiskImage`'s own three-partition
+  #    layout, both reused verbatim, just mounted at `/home` this time
+  #    instead of `/ubx/var` (this proof's own generations root needs no
+  #    such persistence -- see decision 2).
+  #
+  # 2. NO PERSISTENT GENERATIONS ROOT NEEDED. Unlike the M2 switch-loop-
+  #    proof, this proof never asserts anything about `current`/
+  #    `grub-default`/rollback surviving a reboot -- only `/home` content
+  #    and linger state need to. Its `ubx rebuild switch --root` therefore
+  #    points at a plain `/run` (tmpfs) directory, recreated fresh every
+  #    boot -- one real generation-registration call per domain change is
+  #    still exactly what SPEC.md §4.3 requires end to end, it just never
+  #    needs to be READ BACK after this proof's one and only reboot. Every
+  #    `--rootfs-image`/`--kernel`/`--initrd` this driver passes is a
+  #    non-existent placeholder path -- `bin/ubx-generations create` never
+  #    checks these for existence (this file's own switch-loop-proof
+  #    section already relies on the identical fact for its own generation
+  #    3's rootfs image marker string), so nothing here needs a second,
+  #    real bootable image staged at build time.
+  #
+  #    `/etc` is bind-mounted onto a writable tmpfs copy first (identical
+  #    idiom to the switch-loop-proof driver's own phase-0 preamble --
+  #    `useradd -m`, `loginctl enable-linger`'s own on-disk marker, and
+  #    `ubx-users`' apply-passwords-adjacent /etc/{passwd,group,shadow}
+  #    writes all need a genuinely writable /etc DIRECTORY, not just
+  #    writable files) so the declared fixture user and its linger state
+  #    are real.
+  #
+  # -- The `systemctl --user` / linger question (documented, not silently
+  #    assumed) ---------------------------------------------------------
+  #
+  # `bin/ubx-home-apply --apply`'s own service actions run
+  # `runuser -u USER -- systemctl --user <verb> <unit>` (see that script's
+  # header) against the REAL per-user systemd instance `loginctl
+  # enable-linger` starts (`user@<uid>.service`) -- this project's locked
+  # archive (archive.lock.json) carries `systemd`/`systemd-sysv` but NO
+  # `dbus`/`dbus-user-session` package, so whether a minimal QEMU guest like
+  # this one can really reach `/run/user/<uid>/bus` this way was NOT
+  # provable by static reading alone (systemd >= ~246 is documented to act
+  # as its own bus broker for `systemctl`'s own point-to-point calls,
+  # without a separate `dbus-daemon`, but this repo has no existing proof
+  # of it actually working end to end in ITS OWN composed image -- see this
+  # section's own driver script, `homeActivationDriverScript`, for exactly
+  # where this gets exercised for real). Per this issue's own instruction
+  # ("if a user systemctl --user bus is not reachable, document the exact
+  # limitation ... and assert what you can"), the driver:
+  #   - creates the fixture user, then calls `loginctl enable-linger` and
+  #     POLLS (up to 30s) for `user@<uid>.service` to become active AND
+  #     `/run/user/<uid>/bus` to exist, before ever attempting a real
+  #     `systemctl --user` call;
+  #   - if that polling times out, prints `UBX-HOME-LINGER-NOTE` (never a
+  #     FAIL) and re-runs EVERY subsequent `ubx rebuild switch --apply`
+  #     home-manifest call with an explicit `--home-observed` override that
+  #     shows this run's SERVICES ALONE as already converged (see
+  #     `homeGen1ObservedSkipServices`/`homeGen2ObservedSkipServices`
+  #     below) -- this makes `bin/ubx-home plan` emit zero service actions
+  #     (no `runuser`/`systemctl --user` call is ever attempted), while
+  #     leaving the FILE side of the very same plan completely real and
+  #     unaffected (the acceptance criteria's file/mode/ownership and
+  #     gen1-file-not-rewritten diff proofs still run for real either way);
+  #   - the post-reboot phase mirrors this exactly: the enabled-service-
+  #     auto-starts assertion only runs if linger was actually confirmed
+  #     reachable pre-reboot (its own outcome, persisted across the reboot
+  #     at `$STATE/linger-ok` on the now-persistent `/home` partition,
+  #     since `/run` does not survive a real reboot); if it was not, the
+  #     driver still emits `UBX-HOME-REBOOT-PASS` (the file-persistence
+  #     half of that phase's own criteria, genuinely asserted) but ANNOTATES
+  #     it inline that the service auto-start half was skipped, never
+  #     silently treated as passing.
+  #
+  # -- Marker contract (tests/e2e/060-qemu-home-activation-e2e.sh's own host
+  #    side) -- printed in this order, on one single boot-then-reboot run:
+  #      UBX-HOME-USER-PASS      the declared fixture user exists for real
+  #                               (useradd -m, on the persistent /home)
+  #      UBX-HOME-LINGER-PASS or -- see "linger question" above; never
+  #      UBX-HOME-LINGER-NOTE       fatal either way
+  #      UBX-HOME-GEN1-PASS      first home apply: file content+mode+
+  #                               ownership, and (bus permitting) both
+  #                               services enabled+active
+  #      UBX-HOME-GEN2-PASS      second generation: .bashrc content changed,
+  #                               .profile's mtime+inode UNCHANGED (a real
+  #                               diff-driven "not rewritten" proof, not
+  #                               just a content-still-matches check), and
+  #                               (bus permitting) home-svc-b now disabled+
+  #                               inactive while home-svc-a is untouched
+  #      UBX-HOME-REBOOT-PASS    after a REAL reboot: gen2 content survived,
+  #                               and (bus permitting) home-svc-a auto-
+  #                               started with NO explicit start call this
+  #                               boot (the actual linger/auto-start proof)
+  #    `UBX-HOME-FAIL: <reason>` on any real failure -- see `mark_fail`,
+  #    below, same "trust only what the guest itself asserted to serial"
+  #    posture as this file's every other driver.
+  homeUserName = "ubxhome";
+
+  homeSha256 = builtins.hashString "sha256";
+
+  homeFileEntry = path: content: mode: {
+    inherit path mode;
+    sha256 = homeSha256 content;
+  };
+
+  homeServiceEntry = name: content: enable: {
+    inherit name enable;
+    class = "service";
+    mask = false;
+    sha256 = homeSha256 content;
+  };
+
+  # -- fixture byte content -- deliberately small and grep-friendly (see
+  #    homeActivationDriverScript's own assertions). `.profile`'s content
+  #    is IDENTICAL between generation 1 and 2 -- the whole point of the
+  #    "untouched file" proof is that its declared sha256/mode never
+  #    changes, so bin/ubx-home's own diff algorithm (nix/home.nix's
+  #    header) never even proposes touching it a second time.
+  homeBashrcV1 = "# ubuntnix home-activation e2e fixture: gen1 .bashrc\nexport EDITOR=vim\n";
+  homeBashrcV2 = "# ubuntnix home-activation e2e fixture: gen2 .bashrc (CHANGED)\nexport EDITOR=nano\n";
+  homeProfileContent = "# ubuntnix home-activation e2e fixture: .profile (UNCHANGED across generations)\numask 022\n";
+
+  homeSvcAContent = ''
+    [Unit]
+    Description=ubuntnix home-activation e2e fixture service A (declared enabled every generation -- this proof's own reboot/auto-start target)
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/sh -c 'mkdir -p %h/.local/state && date +%s > %h/.local/state/home-svc-a-ran'
+
+    [Install]
+    WantedBy=default.target
+  '';
+  homeSvcBContent = ''
+    [Unit]
+    Description=ubuntnix home-activation e2e fixture service B (enabled in gen1, DECLARED DISABLED in gen2)
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/bin/sh -c 'mkdir -p %h/.local/state && date +%s > %h/.local/state/home-svc-b-ran'
+
+    [Install]
+    WantedBy=default.target
+  '';
+
+  homeGen1FileEntries = [
+    (homeFileEntry ".bashrc" homeBashrcV1 "0644")
+    (homeFileEntry ".profile" homeProfileContent "0640")
+  ];
+  homeGen1ServiceEntries = [
+    (homeServiceEntry "home-svc-a.service" homeSvcAContent true)
+    (homeServiceEntry "home-svc-b.service" homeSvcBContent true)
+  ];
+  homeGen2FileEntries = [
+    (homeFileEntry ".bashrc" homeBashrcV2 "0644")
+    (homeFileEntry ".profile" homeProfileContent "0640")
+  ];
+  homeGen2ServiceEntries = [
+    (homeServiceEntry "home-svc-a.service" homeSvcAContent true)
+    (homeServiceEntry "home-svc-b.service" homeSvcBContent false)
+  ];
+
+  homeManifestFor = files: services: builtins.toJSON {
+    version = 1;
+    users = [{ name = homeUserName; inherit files services; }];
+  };
+  homeGen1Manifest = homeManifestFor homeGen1FileEntries homeGen1ServiceEntries;
+  homeGen2Manifest = homeManifestFor homeGen2FileEntries homeGen2ServiceEntries;
+
+  # -- `--home-observed` overrides used ONLY when linger could not be
+  #    confirmed reachable (see this section's own header) -- files carry
+  #    the TRUE prior declared state (so the file side of the plan is
+  #    completely unaffected: same "not rewritten" / "content changed"
+  #    outcomes either way), services are reported as already exactly at
+  #    THIS generation's own target (sha256/enabled/masked/active all
+  #    matching), so bin/ubx-home's plan algorithm computes zero service
+  #    actions and no `runuser`/`systemctl --user` call is ever attempted.
+  homeObservedServiceFromDecl = s: {
+    inherit (s) name sha256;
+    enabled = s.enable;
+    masked = s.mask;
+    active = s.enable && !s.mask;
+  };
+  homeObservedFilesFromDecl = files: map (f: { inherit (f) path sha256 mode; }) files;
+  homeObservedSkipServices = files: services: builtins.toJSON {
+    version = 1;
+    users = [{
+      name = homeUserName;
+      files = homeObservedFilesFromDecl files;
+      services = map homeObservedServiceFromDecl services;
+    }];
+  };
+  homeGen1ObservedSkipServices = homeObservedSkipServices [ ] homeGen1ServiceEntries;
+  homeGen2ObservedSkipServices = homeObservedSkipServices homeGen1FileEntries homeGen2ServiceEntries;
+
+  homeUsersManifest = builtins.toJSON {
+    version = 1;
+    users = [{
+      name = homeUserName;
+      uid = null;
+      system = false;
+      shell = "/usr/bin/bash";
+      home = null;
+      createHome = true;
+      groups = [ ];
+      authorizedKeys = [ ];
+    }];
+    groups = [ ];
+  };
+
+  # -- the extra-files script layered onto bootRootfs for the
+  #    home-activation-proof only (mirrors switchLoopExtraFilesScript's own
+  #    structure -- see this section's own header for what each numbered
+  #    block does). ----------------------------------------------------
+  homeActivationExtraFilesScript = ''
+    # -- (1) persistent /home: overwrite bootRootfs's own M1 default (tmpfs,
+    #    already correctly named+symlinked -- see this section's own
+    #    header, decision 1) with a real ext4 mount of this proof's third
+    #    disk partition. ----------------------------------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/home.mount" <<'UBX_HOME_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix home-activation e2e proof: persistent /home (ext4, GitHub issue #105)
+    DefaultDependencies=no
+    Before=local-fs.target
+
+    [Mount]
+    What=/dev/vda3
+    Where=/home
+    Type=ext4
+    Options=defaults
+
+    [Install]
+    WantedBy=local-fs.target
+    UBX_HOME_UNIT_EOF
+
+    # -- (2) per-generation fixture manifests + content trees -----------
+    ubxrun "$UBX_BASE/bin/mkdir" -p \
+      "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/files" \
+      "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/services" \
+      "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/files" \
+      "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/services"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/users-manifest.json" <<'UBX_HOME_JSON_EOF'
+    ${homeUsersManifest}
+    UBX_HOME_JSON_EOF
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-manifest.json" <<'UBX_HOME_JSON_EOF'
+    ${homeGen1Manifest}
+    UBX_HOME_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-observed-skip-services.json" <<'UBX_HOME_JSON_EOF'
+    ${homeGen1ObservedSkipServices}
+    UBX_HOME_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/files/.bashrc" <<'UBX_HOME_CONTENT_EOF'
+    ${homeBashrcV1}
+    UBX_HOME_CONTENT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/files/.profile" <<'UBX_HOME_CONTENT_EOF'
+    ${homeProfileContent}
+    UBX_HOME_CONTENT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/services/home-svc-a.service" <<'UBX_HOME_UNIT_EOF'
+    ${homeSvcAContent}
+    UBX_HOME_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen1/home-tree/${homeUserName}/services/home-svc-b.service" <<'UBX_HOME_UNIT_EOF'
+    ${homeSvcBContent}
+    UBX_HOME_UNIT_EOF
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-manifest.json" <<'UBX_HOME_JSON_EOF'
+    ${homeGen2Manifest}
+    UBX_HOME_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-observed-skip-services.json" <<'UBX_HOME_JSON_EOF'
+    ${homeGen2ObservedSkipServices}
+    UBX_HOME_JSON_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/files/.bashrc" <<'UBX_HOME_CONTENT_EOF'
+    ${homeBashrcV2}
+    UBX_HOME_CONTENT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/files/.profile" <<'UBX_HOME_CONTENT_EOF'
+    ${homeProfileContent}
+    UBX_HOME_CONTENT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/services/home-svc-a.service" <<'UBX_HOME_UNIT_EOF'
+    ${homeSvcAContent}
+    UBX_HOME_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/share/ubx-home-activation/gen2/home-tree/${homeUserName}/services/home-svc-b.service" <<'UBX_HOME_UNIT_EOF'
+    ${homeSvcBContent}
+    UBX_HOME_UNIT_EOF
+
+    # -- (3) the guest driver + its unit ---------------------------------
+    ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-home-activation-driver" <<'UBX_HOME_DRIVER_EOF'
+    ${homeActivationDriverScript}
+    UBX_HOME_DRIVER_EOF
+    ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-home-activation-driver"
+
+    ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-home-activation-driver.service" <<'UBX_HOME_UNIT_EOF'
+    [Unit]
+    Description=ubuntnix home-activation e2e proof driver (tests/e2e/060-qemu-home-activation-e2e.sh; GitHub issue #105)
+    After=home.mount multi-user.target
+    Requires=home.mount multi-user.target
+
+    [Service]
+    Type=oneshot
+    StandardOutput=journal+console
+    StandardError=journal+console
+    ExecStart=/usr/local/bin/ubx-home-activation-driver
+
+    [Install]
+    WantedBy=multi-user.target
+    UBX_HOME_UNIT_EOF
+    ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/multi-user.target.wants"
+    ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-home-activation-driver.service \
+      "$out/etc/systemd/system/multi-user.target.wants/ubx-home-activation-driver.service"
+  '';
+
+  # -- the guest driver script itself: a two-phase counter on the
+  #    persistent `/home/.ubx-home-state/phase` file (the ext4 partition is
+  #    the only thing this proof needs to survive its one real reboot --
+  #    see this section's own header, decision 2). ----------------------
+  homeActivationDriverScript = ''
+    #!/bin/bash
+    # /usr/local/bin/ubx-home-activation-driver -- see nix/boot.nix's
+    # home-activation-proof section (GitHub issue #105) for the full design.
+    set -u
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    # This proof converges $HOME LIVE; it deliberately does not exercise
+    # rootfs image-swaps. The first (from-<none>) generation nonetheless
+    # classifies as an "image" delta, which would make `ubx rebuild switch`
+    # really mount the fixture rootfs marker at /run/nextroot and then
+    # soft-reboot -- but that marker is intentionally NOT a real device, so
+    # the mount (and thus the whole switch) would fail. Stub both injectable
+    # commands to no-ops (invoked as `CMD IMAGE TARGET` / `CMD soft-reboot`;
+    # `true` ignores its args and succeeds), mirroring switchLoopDriverScript's
+    # own UBX_SOFT_REBOOT_CMD stub. Home file/service convergence is unaffected.
+    export UBX_NEXTROOT_STAGE_CMD=true
+    export UBX_SOFT_REBOOT_CMD=true
+
+    ASSETS=/usr/local/share/ubx-home-activation
+    ROOT=/run/ubx-home-activation/generations
+    STATE=/home/.ubx-home-state
+    UBX=/ubx/bin/ubx
+    USER_NAME=${homeUserName}
+
+    mkdir -p "$STATE" "$ROOT"
+    phase_file="$STATE/phase"
+    phase=0
+    [ -f "$phase_file" ] && phase="$(cat "$phase_file")"
+
+    mark_fail() { # REASON
+      echo "UBX-HOME-FAIL: $1"
+      echo "----- BEGIN mark_fail diagnostics -----"
+      referenced_log="$(printf '%s\n' "$1" | grep -o '[^ ]*\.log' | tail -n 1)"
+      if [ -n "$referenced_log" ] && [ -f "$referenced_log" ]; then
+        echo "----- BEGIN $referenced_log -----"
+        tail -n 200 "$referenced_log"
+        echo "----- END $referenced_log -----"
+      elif [ -n "$referenced_log" ]; then
+        echo "(referenced log $referenced_log not found)"
+      fi
+      echo "----- BEGIN ls -la $STATE -----"
+      ls -la "$STATE" 2> /dev/null
+      echo "----- END ls -la $STATE -----"
+      for f in "$STATE"/*.log; do
+        [ -f "$f" ] || continue
+        echo "----- BEGIN $f -----"
+        tail -n 200 "$f"
+        echo "----- END $f -----"
+      done
+      echo "----- END mark_fail diagnostics -----"
+      sync
+      systemctl poweroff
+      exit 0
+    }
+
+    advance() { # NEXT_PHASE
+      printf '%s' "$1" > "$phase_file"
+    }
+
+    # Writable /etc (see this section's own header, decision 2) -- guarded
+    # by a /run marker so it only happens once per boot.
+    if [ ! -e /run/ubx-home-etc-bound ]; then
+      mkdir -p /run/ubx-home-etc-writable
+      cp -a /etc/. /run/ubx-home-etc-writable/
+      mount --bind /run/ubx-home-etc-writable /etc
+      : > /run/ubx-home-etc-bound
+    fi
+
+    case "$phase" in
+      0)
+        # ============ create the declared fixture user for real =========
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$ASSETS/rootfs-marker" --kernel "$ASSETS/kernel-marker" --initrd "$ASSETS/initrd-marker" \
+          --root-device /dev/vda2 \
+          --users-manifest "$ASSETS/users-manifest.json" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --users-out "$STATE/gen1-users-activate.sh" \
+          > "$STATE/gen1-create.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail "generation 1 'ubx rebuild switch' (account creation) exited $rc -- see $STATE/gen1-create.log"
+        bash "$STATE/gen1-users-activate.sh" >> "$STATE/gen1-create.log" 2>&1
+        getent passwd "$USER_NAME" > /dev/null 2>&1 \
+          || mark_fail "declared user $USER_NAME is not present after running its activation script -- see $STATE/gen1-create.log"
+        user_uid="$(id -u "$USER_NAME")"
+        [ -d "/home/$USER_NAME" ] || mark_fail "useradd -m did not create /home/$USER_NAME on the persistent ext4 partition"
+        echo "UBX-HOME-USER-PASS"
+
+        # ============ loginctl enable-linger + poll for a reachable
+        # per-user systemctl --user bus (see this section's own header,
+        # "The systemctl --user / linger question") ======================
+        linger_ok=0
+        if command -v loginctl > /dev/null 2>&1; then
+          loginctl enable-linger "$USER_NAME" > "$STATE/linger.log" 2>&1 || true
+          i=0
+          while [ "$i" -lt 30 ]; do
+            if systemctl is-active --quiet "user@$user_uid.service" 2> /dev/null \
+              && [ -S "/run/user/$user_uid/bus" ]; then
+              linger_ok=1
+              break
+            fi
+            i=$((i + 1))
+            sleep 1
+          done
+        fi
+        if [ "$linger_ok" -eq 1 ]; then
+          echo "UBX-HOME-LINGER-PASS: user@$user_uid.service is active and /run/user/$user_uid/bus is reachable"
+        else
+          echo "UBX-HOME-LINGER-NOTE: could not reach a per-user systemctl --user bus for $USER_NAME within 30s after loginctl enable-linger (see $STATE/linger.log, and nix/boot.nix's home-activation-proof section header, 'The systemctl --user / linger question', for why this is a documented, non-fatal gap in this project's own locked archive -- no dbus/dbus-user-session package) -- every systemctl --user-dependent assertion below (service enable/active/auto-start) is SKIPPED this run; file content/mode/ownership and the gen1-file-not-rewritten diff proof still run for real"
+        fi
+        printf '%s' "$linger_ok" > "$STATE/linger-ok"
+
+        # ============ generation 2: apply gen1's home declaration ========
+        home_observed_args=()
+        [ "$linger_ok" -eq 1 ] || home_observed_args=(--home-observed "$ASSETS/gen1/home-observed-skip-services.json")
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$ASSETS/rootfs-marker" --kernel "$ASSETS/kernel-marker" --initrd "$ASSETS/initrd-marker" \
+          --root-device /dev/vda2 \
+          --users-manifest "$ASSETS/users-manifest.json" \
+          --home-manifest "$ASSETS/gen1/home-manifest.json" --home-content-dir "$ASSETS/gen1/home-tree" \
+          "''${home_observed_args[@]}" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --users-out "$STATE/gen1-home-users-activate.sh" \
+          > "$STATE/gen1-home.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail "generation 2 'ubx rebuild switch' (gen1 home apply) exited $rc -- see $STATE/gen1-home.log"
+        bash "$STATE/gen1-home-users-activate.sh" >> "$STATE/gen1-home.log" 2>&1
+
+        bashrc="/home/$USER_NAME/.bashrc"
+        profile="/home/$USER_NAME/.profile"
+        [ -f "$bashrc" ] || mark_fail "gen1: $bashrc was not created -- see $STATE/gen1-home.log"
+        grep -qF "EDITOR=vim" "$bashrc" || mark_fail "gen1: $bashrc does not contain the gen1 fixture content"
+        [ "$(stat -c '%U:%G %a' "$bashrc" 2> /dev/null)" = "$USER_NAME:$USER_NAME 644" ] \
+          || mark_fail "gen1: $bashrc has the wrong owner/group/mode: $(stat -c '%U:%G %a' "$bashrc" 2>&1)"
+        [ -f "$profile" ] || mark_fail "gen1: $profile was not created -- see $STATE/gen1-home.log"
+        grep -qF "UNCHANGED across generations" "$profile" || mark_fail "gen1: $profile does not contain the fixture content"
+        [ "$(stat -c '%U:%G %a' "$profile" 2> /dev/null)" = "$USER_NAME:$USER_NAME 640" ] \
+          || mark_fail "gen1: $profile has the wrong owner/group/mode: $(stat -c '%U:%G %a' "$profile" 2>&1)"
+        # Recorded so generation 2 below can prove -- via mtime+inode, not
+        # just "content still matches" -- that this exact file is NEVER
+        # rewritten when its declaration never changes (SPEC.md §9's own
+        # diff-driven activation contract).
+        stat -c '%Y %i' "$profile" > "$STATE/profile-stat-gen1"
+
+        if [ "$linger_ok" -eq 1 ]; then
+          runuser -u "$USER_NAME" -- systemctl --user is-enabled home-svc-a.service > "$STATE/gen1-svc.log" 2>&1 \
+            || mark_fail "gen1: home-svc-a.service is not enabled -- see $STATE/gen1-svc.log"
+          runuser -u "$USER_NAME" -- systemctl --user is-active home-svc-a.service >> "$STATE/gen1-svc.log" 2>&1 \
+            || mark_fail "gen1: home-svc-a.service is not active -- see $STATE/gen1-svc.log"
+          runuser -u "$USER_NAME" -- systemctl --user is-enabled home-svc-b.service >> "$STATE/gen1-svc.log" 2>&1 \
+            || mark_fail "gen1: home-svc-b.service is not enabled -- see $STATE/gen1-svc.log"
+          runuser -u "$USER_NAME" -- systemctl --user is-active home-svc-b.service >> "$STATE/gen1-svc.log" 2>&1 \
+            || mark_fail "gen1: home-svc-b.service is not active -- see $STATE/gen1-svc.log"
+        fi
+        echo "UBX-HOME-GEN1-PASS"
+
+        # ============ generation 3: apply gen2's home declaration ========
+        home_observed_args=()
+        [ "$linger_ok" -eq 1 ] || home_observed_args=(--home-observed "$ASSETS/gen2/home-observed-skip-services.json")
+        "$UBX" rebuild switch --root "$ROOT" \
+          --rootfs-image "$ASSETS/rootfs-marker" --kernel "$ASSETS/kernel-marker" --initrd "$ASSETS/initrd-marker" \
+          --root-device /dev/vda2 \
+          --users-manifest "$ASSETS/users-manifest.json" \
+          --home-manifest "$ASSETS/gen2/home-manifest.json" --home-content-dir "$ASSETS/gen2/home-tree" \
+          "''${home_observed_args[@]}" \
+          --apply --systemd-unit-dir /run/systemd/system \
+          --users-out "$STATE/gen2-home-users-activate.sh" \
+          > "$STATE/gen2-home.log" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || mark_fail "generation 3 'ubx rebuild switch' (gen2 home apply) exited $rc -- see $STATE/gen2-home.log"
+        bash "$STATE/gen2-home-users-activate.sh" >> "$STATE/gen2-home.log" 2>&1
+
+        grep -qF "EDITOR=nano" "$bashrc" || mark_fail "gen2: $bashrc's content did not update to the gen2 fixture -- see $STATE/gen2-home.log"
+        grep -qF "EDITOR=vim" "$bashrc" && mark_fail "gen2: $bashrc still contains gen1's content after a declared change"
+        profile_stat_gen1="$(cat "$STATE/profile-stat-gen1" 2> /dev/null)"
+        profile_stat_gen2="$(stat -c '%Y %i' "$profile" 2> /dev/null)"
+        [ "$profile_stat_gen2" = "$profile_stat_gen1" ] \
+          || mark_fail "gen2: $profile's mtime+inode changed even though its declared content never changed between gen1 and gen2 (it was rewritten when bin/ubx-home's own diff algorithm should have left it untouched) -- gen1=[$profile_stat_gen1] gen2=[$profile_stat_gen2]"
+
+        if [ "$linger_ok" -eq 1 ]; then
+          runuser -u "$USER_NAME" -- systemctl --user is-enabled home-svc-b.service > "$STATE/gen2-svc.log" 2>&1 \
+            && mark_fail "gen2: home-svc-b.service is still enabled after being declared disabled -- see $STATE/gen2-svc.log"
+          runuser -u "$USER_NAME" -- systemctl --user is-active home-svc-b.service >> "$STATE/gen2-svc.log" 2>&1 \
+            && mark_fail "gen2: home-svc-b.service is still active after being declared disabled -- see $STATE/gen2-svc.log"
+          runuser -u "$USER_NAME" -- systemctl --user is-enabled home-svc-a.service >> "$STATE/gen2-svc.log" 2>&1 \
+            || mark_fail "gen2: home-svc-a.service should still be enabled (its declaration never changed) -- see $STATE/gen2-svc.log"
+        fi
+        echo "UBX-HOME-GEN2-PASS"
+
+        advance 1
+        sync
+        systemctl reboot
+        ;;
+
+      1)
+        linger_ok=0
+        [ -f "$STATE/linger-ok" ] && linger_ok="$(cat "$STATE/linger-ok")"
+        # The user account lives in this e2e image's /etc, which is a
+        # per-boot tmpfs copy (exactly like the switch-loop proof's writable
+        # /etc) and so is reset by a real reboot -- an artifact of this
+        # harness, NOT ubx behaviour. The declared $HOME files, by contrast,
+        # live on the persistent ext4 /home partition this proof mounts, so
+        # file-persistence across the reboot is the invariant asserted in the
+        # file-only path below. The user account is only required when we
+        # actually exercise the (linger-gated) user-service auto-start, so
+        # its presence is asserted inside that branch rather than here.
+        user_uid="$(id -u "$USER_NAME" 2> /dev/null)"
+
+        bashrc="/home/$USER_NAME/.bashrc"
+        profile="/home/$USER_NAME/.profile"
+        [ -f "$bashrc" ] || mark_fail "post-reboot: $bashrc did not survive the reboot"
+        grep -qF "EDITOR=nano" "$bashrc" || mark_fail "post-reboot: $bashrc's gen2 content did not survive the reboot"
+        [ -f "$profile" ] || mark_fail "post-reboot: $profile did not survive the reboot"
+
+        if [ "$linger_ok" -eq 1 ]; then
+          [ -n "$user_uid" ] || mark_fail "post-reboot: user $USER_NAME is gone after a real reboot -- cannot verify the enabled-user-service auto-start (the account's /etc entry did not persist)"
+          # logind restarts user@<uid>.service for every lingering user at
+          # boot; that user manager's own default.target then starts every
+          # unit still enabled in its (persistent) unit-state directory --
+          # home-svc-a.service among them -- with NO explicit `systemctl
+          # --user start` call from this driver at all. That is the actual
+          # thing this whole proof exists to demonstrate; poll briefly
+          # since this races ordinary boot-up.
+          i=0
+          svc_ok=0
+          while [ "$i" -lt 30 ]; do
+            if systemctl is-active --quiet "user@$user_uid.service" 2> /dev/null \
+              && runuser -u "$USER_NAME" -- systemctl --user is-active --quiet home-svc-a.service 2> /dev/null; then
+              svc_ok=1
+              break
+            fi
+            i=$((i + 1))
+            sleep 1
+          done
+          [ "$svc_ok" -eq 1 ] \
+            || mark_fail "post-reboot: home-svc-a.service (declared enabled, never explicitly started this boot) did not auto-start within 30s of a real reboot despite 'loginctl enable-linger $USER_NAME' -- linger did not do what it should"
+          runuser -u "$USER_NAME" -- systemctl --user is-active --quiet home-svc-b.service 2> /dev/null \
+            && mark_fail "post-reboot: home-svc-b.service (declared disabled) auto-started after the reboot"
+          echo "UBX-HOME-REBOOT-PASS"
+        else
+          echo "UBX-HOME-REBOOT-PASS: linger/systemctl --user bus was not reachable earlier this run (see the UBX-HOME-LINGER-NOTE above) -- only file persistence across the real reboot was verified above; the enabled-user-service auto-start proof was SKIPPED, never silently assumed"
+        fi
+
+        sync
+        systemctl poweroff
+        ;;
+
+      *)
+        echo "UBX-HOME-FAIL: unknown phase '$phase'"
+        systemctl poweroff
+        ;;
+    esac
+  '';
 in
 {
   flake.lib.boot = {
@@ -3377,6 +3974,71 @@ in
         kernel = proofKernel;
         grubCfgDrv = softRebootGrubCfgDrv;
       };
+
+      # -- the home-activation-proof (GitHub issue #105; see nix/boot.nix's
+      #    own "home-activation-proof" section above for the full design).
+      #    Kernel reused from M1's proofKernel exactly like every other
+      #    proof above; this one DOES need `switchLoopDiskImage`'s three-
+      #    partition layout (a real, persistent /home, mounted from a third
+      #    ext4 partition, is the whole point -- see that section's own
+      #    header, decision 1), even though it never needs
+      #    `switchLoopVarStore`'s own gen1-bookkeeping content (this proof's
+      #    ext4 partition starts genuinely empty; `useradd -m` and the home
+      #    domain's own executor populate it for real at boot time). -------
+      homeActivationRootfs = bootRootfs {
+        inherit system bootSpec;
+        name = "home-activation-proof";
+        extraFilesScript = homeActivationExtraFilesScript;
+      };
+
+      homeActivationSquashfs = squashfsImage {
+        inherit system;
+        name = "home-activation-proof";
+        rootfs = homeActivationRootfs;
+      };
+
+      homeActivationVarStoreDrv = runInUbuntuBase {
+        inherit system;
+        name = "home-activation-var-store";
+        script = ''
+          ubxrun() { "$UBX_LD" --library-path "$UBX_LIBRARY_PATH" "$@"; }
+          ubxrun "$UBX_BASE/bin/mkdir" -p "$out"
+        '';
+      };
+
+      homeActivationVarImageDrv = switchLoopVarImage {
+        inherit system;
+        name = "home-activation-proof";
+        varStore = homeActivationVarStoreDrv;
+        sizeMiB = 64;
+      };
+
+      homeActivationGeneration = {
+        index = 1;
+        title = "ubuntnix home-activation-proof generation 1 (${bootSpec.kernel})";
+        kernelPath = "/vmlinuz-${flavor}";
+        initrdPath = "/initrd.img-${flavor}";
+        rootDevice = "/dev/vda2";
+        kernelParams = bootSpec.kernelParams ++ [
+          "rootfstype=squashfs"
+          "console=ttyS0"
+        ];
+      };
+
+      homeActivationGrubCfgDrv = grubCfg {
+        inherit system;
+        name = "home-activation-proof";
+        generations = [ homeActivationGeneration ];
+      };
+
+      homeActivationDiskImageDrv = switchLoopDiskImage {
+        inherit system flavor;
+        name = "home-activation-proof";
+        squashfs = homeActivationSquashfs;
+        kernel = proofKernel;
+        grubCfgDrv = homeActivationGrubCfgDrv;
+        varImage = homeActivationVarImageDrv;
+      };
     in
     {
       packages.boot-kernel-artifacts-proof = proofKernel;
@@ -3394,5 +4056,11 @@ in
       # soft-reboot` re-exec into a genuinely bootable /run/nextroot) --
       # tests/e2e/040-qemu-soft-reboot-e2e.sh boots this one.
       packages.soft-reboot-proof = softRebootDiskImageDrv;
+      # GitHub issue #105's own exit criterion (a real, booted
+      # `ubx rebuild switch --apply` home-domain activation: $HOME files +
+      # a per-user systemd --user service, across two generations and a
+      # real reboot) -- tests/e2e/060-qemu-home-activation-e2e.sh boots
+      # this one.
+      packages.home-activation-proof = homeActivationDiskImageDrv;
     };
 }

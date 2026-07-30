@@ -32,6 +32,7 @@
         ./nix/pro.nix
         ./nix/crypttab.nix
         ./nix/filesystems.nix
+        ./nix/networking.nix
       ];
     };
 }

@@ -553,7 +553,7 @@ reference regenerated in CI from the tree.
 | R9 | Desktop stack (debconf, triggers, sessions) stresses compose-time script handling | M6 gated on M1's script sandbox proving out; GNOME chosen for best archive support |
 | R10 | Third-party Nix tooling hardcodes `/nix/store` instead of respecting `NIX_STORE_DIR` | our own tools always honor the env; document the divergence; evaluate case-by-case whether affected tools matter to us |
 | R11 | Installer parity drifts as upstream installers/defaults evolve | parity configs are versioned per Ubuntu release; CI compares against upstream seed/manifest (M7 deliverable) |
-| R12 | cloud-init (kept for server parity) is a second config renderer and could fight ubuntnix-generated netplan/config | ship present-but-inert like a post-install stock system (status done / disabled marker); resolved at M7 |
+| R12 | cloud-init (kept for server parity) is a second config renderer and could fight ubuntnix-generated netplan/config | resolved: `profiles.server` ships cloud-init present-but-inert, writing the `/etc/cloud/cloud-init.disabled` marker (nix/profiles.nix, "cloud-init: present-but-inert" block) so it never emits a competing netplan config against ubuntnix's own authoritative `/etc/netplan/01-ubuntnix.yaml`; locked by tests/unit/204-cloudinit-coexistence-r12.sh (render-level) and the 050 server-parity e2e (boot-level, asserts both files) |
 
 ## 13. Open questions
 

@@ -3485,6 +3485,18 @@ let
     set -u
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+    # This proof converges $HOME LIVE; it deliberately does not exercise
+    # rootfs image-swaps. The first (from-<none>) generation nonetheless
+    # classifies as an "image" delta, which would make `ubx rebuild switch`
+    # really mount the fixture rootfs marker at /run/nextroot and then
+    # soft-reboot -- but that marker is intentionally NOT a real device, so
+    # the mount (and thus the whole switch) would fail. Stub both injectable
+    # commands to no-ops (invoked as `CMD IMAGE TARGET` / `CMD soft-reboot`;
+    # `true` ignores its args and succeeds), mirroring switchLoopDriverScript's
+    # own UBX_SOFT_REBOOT_CMD stub. Home file/service convergence is unaffected.
+    export UBX_NEXTROOT_STAGE_CMD=true
+    export UBX_SOFT_REBOOT_CMD=true
+
     ASSETS=/usr/local/share/ubx-home-activation
     ROOT=/run/ubx-home-activation/generations
     STATE=/home/.ubx-home-state

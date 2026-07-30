@@ -191,4 +191,9 @@ generations, all three rebuild verbs, `diff`/`list-generations`/`rollback`,
 and the apt/dpkg/snap guards land at **M2**; the snap lockfile and its
 `ubx update` integration land at **M3**; the full secrets workflow
 (`secrets/` + `index.nix` + git-crypt + per-machine keys) lands at **M4**.
-See `SPEC.md` §11 for exit criteria per milestone.
+The rebuild/generation machinery documented above is exercised
+end-to-end against both parity example configs — `examples/server.nix`
+(M5) and `examples/desktop.nix` (M6) — by
+`tests/e2e/050-qemu-server-parity-e2e.sh` and
+`tests/e2e/070-qemu-desktop-parity-e2e.sh` respectively. See `SPEC.md`
+§11 for exit criteria per milestone.

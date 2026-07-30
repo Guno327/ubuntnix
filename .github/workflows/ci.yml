@@ -693,6 +693,74 @@ jobs:
           path: server-parity-serial.log
           if-no-files-found: ignore
 
+  desktop-parity:
+    name: Desktop-parity QEMU e2e (SPEC.md §11 M6 exit criterion; issue #108)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # nix/profiles.nix's desktop-parity-image goes through the exact same
+      # bootRootfs -> squashfsImage -> kernelArtifacts -> grubCfg ->
+      # diskImage pipeline the "boot" job's own boot-image-proof does --
+      # same hardened-chroot / unprivileged-user-namespaces requirement.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: same reason as the "boot"/"compose" jobs
+      # above -- transitively depends on nix/stdenv.nix's one
+      # `__noChroot = true` derivation.
+      - name: Build desktop-parity-image
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#desktop-parity-image -L -o result-desktop-parity-image
+          sudo chown -R "$USER" result-desktop-parity-image
+      - name: Assert desktop-parity-image artifact
+        run: |
+          img="result-desktop-parity-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      # CI runners now grant /dev/kvm access to the runner user (unlike
+      # earlier jobs in this file, which only report availability and fall
+      # back to TCG); grant it explicitly here too as a defensive belt-and-
+      # suspenders step in case a given runner image's default group
+      # membership doesn't already cover it -- harmless (`|| true`) if the
+      # device node or the grant itself isn't needed/available.
+      - name: Grant /dev/kvm access
+        run: sudo chmod 666 /dev/kvm || true
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e boot below will fall back to TCG (slower, still correct; see tests/e2e/070-qemu-desktop-parity-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end desktop-parity boot test (SPEC.md §11's
+      # M6 exit criterion): boots the just-built disk image, headless,
+      # serial console captured, under a hard timeout, and asserts the
+      # UBX-DESKTOP-PARITY-PASS marker the image's own baked-in
+      # ubx-desktop-parity-assert.service emits once it has confirmed,
+      # INSIDE the guest, that the composed package set matches
+      # profiles.desktop's declared seed (minus the enumerated M1-fixture
+      # exceptions) and that cloud-init is present-but-inert (SPEC.md §12
+      # R12) -- see nix/profiles.nix's own header for the full list of
+      # assertions that service makes.
+      - name: QEMU e2e desktop-parity test
+        run: ./tests/e2e/070-qemu-desktop-parity-e2e.sh --image result-desktop-parity-image --timeout 240 --keep-log desktop-parity-serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-parity-e2e-serial-log
+          path: desktop-parity-serial.log
+          if-no-files-found: ignore
+
   switch-loop:
     name: Switch-loop QEMU e2e (SPEC.md §11 M2 exit criterion; issue #32)
     runs-on: ubuntu-24.04

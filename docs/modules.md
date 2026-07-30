@@ -165,10 +165,14 @@ owning base module's `render`/`validate` and bakes the result onto the
 M1 boot pipeline, exposed as `packages.server-parity-image` /
 `packages.desktop-parity-image` — real, `nix flake check`/build-forced
 targets so CI evaluates the whole pipeline even before a QEMU e2e boots
-either image. The **live graphical-boot QEMU e2e** for
-`desktop-parity-image` is tracked separately as GitHub issue #108 — issue
-#107's own scope stops at a build-time proof target structured so #108
-has something real to boot.
+either image. Both images now have a live QEMU e2e proof:
+`tests/e2e/050-qemu-server-parity-e2e.sh` (SPEC.md §11 M5 exit criterion,
+issue #99) and `tests/e2e/070-qemu-desktop-parity-e2e.sh` (SPEC.md §11 M6
+exit criterion, issue #108) each boot their image headless, capture the
+serial console, and assert the image's own baked-in
+`ubx-server-parity-assert.service` / `ubx-desktop-parity-assert.service`
+emitted its `-PASS` marker — see `.github/workflows/ci.yml`'s
+`server-parity` / `desktop-parity` jobs.
 
 ## Where to track progress
 

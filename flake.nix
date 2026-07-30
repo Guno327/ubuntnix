@@ -33,6 +33,7 @@
         ./nix/crypttab.nix
         ./nix/filesystems.nix
         ./nix/localization.nix
+        ./nix/networking.nix
       ];
     };
 }

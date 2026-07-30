@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# bin/ubx-home-apply — THIN per-user home activation EXECUTOR (SPEC.md §9
+# "Per-user configuration (home modules)", §4.3 switching-table row "Home
+# files, user services | home-module activation into writable `/home` |
+# none"; GitHub issue #98, milestone M5).
+#
+# Consumes a plan produced by `bin/ubx-home plan` (JSON — see that script's
+# header for the exact schema) and issues the exact filesystem/
+# `systemctl --user` calls it describes, IN THE PLAN'S OWN ORDER. Mirrors
+# bin/ubx-etc-apply's (file actions) and bin/ubx-systemd-apply's (service
+# actions) own executor pattern almost line for line — see either script's
+# header for the precedent this follows: a deliberately dumb, thin
+# executor, `--apply`-gated, dry-run by default, printing exactly the
+# commands it would run either way. This script never recomputes, never
+# re-derives, never second-guesses a single decision the plan already made.
+#
+# -- Content source: --content-dir/<user>/files|services/<name> -------------
+#
+# The plan itself only carries a target sha256, never raw bytes (same
+# reasoning as bin/ubx-etc-apply's/bin/ubx-systemd-apply's own
+# --content-dir option). Real content lives at
+# `--content-dir/<user>/files/<path>` or
+# `--content-dir/<user>/services/<name>` — exactly nix/home.nix's
+# `render`'s own `$out/tree/<user>/files|services/...` layout (see that
+# file's header, "Interface with bin/ubx-home / bin/ubx-home-apply").
+#
+# -- Ownership: always the declaring user, real chown only as root ----------
+#
+# Exactly bin/ubx-etc-apply's own "Privilege" posture (see that script's
+# header) applied to a fixed target instead of a declared one: nix/home.nix
+# never accepts an owner/group override (SPEC.md §9's activation contract
+# is "correct ownership" — always the user whose namespace declared the
+# entry, never anything else), so every install/chown call here targets
+# `<user>:<user>` unconditionally whenever the caller's effective uid is 0;
+# when not running as root, ownership flags/calls are simply never emitted
+# (not attempted-then-swallowed), so this script stays exercisable by this
+# project's own unpriviliged unit tests. `mode` (chmod) is always applied
+# regardless of privilege.
+#
+# -- Per-action behavior ------------------------------------------------
+#
+#   install-file (create/update-content)  atomically `install -D -m MODE
+#                                          [-o user -g user]` content into
+#                                          --homes-dir/<user>/<path>,
+#                                          creating parent directories —
+#                                          identical atomicity reasoning to
+#                                          bin/ubx-etc-apply's own
+#                                          create/update-content.
+#   update-file-metadata                  chmod (+ chown when root) an
+#                                          already-content-correct file;
+#                                          never rewrites its bytes.
+#   remove-file                           `rm -f` — idempotent by
+#                                          construction (bin/ubx-etc-apply's
+#                                          own "remove" reasoning applies
+#                                          verbatim).
+#   drift-file                            informational only, printed to
+#                                          stderr, never a filesystem call
+#                                          (bin/ubx-etc-apply's own "drift"
+#                                          reasoning applies verbatim).
+#   write-service-file (create/
+#   update-content)                       installs into
+#                                          --homes-dir/<user>/.config/
+#                                          systemd/user/<name>, same
+#                                          install -D + ownership posture as
+#                                          install-file above (a user's own
+#                                          $HOME/.config tree is exactly as
+#                                          much "this user's content" as
+#                                          any other home file).
+#   remove-service-file                   `rm -f`.
+#   daemon-reload                         `runuser -u USER --
+#                                          systemctl --user daemon-reload`
+#                                          — real per-user-session systemd,
+#                                          not the system manager
+#                                          bin/ubx-systemd-apply targets.
+#   stop / disable                        best-effort (`|| :`, mirrors
+#                                          bin/ubx-systemd-apply's own
+#                                          teardown-must-be-idempotent
+#                                          reasoning for a unit that may
+#                                          already be gone/not loaded).
+#   mask / unmask / enable / start /
+#   restart                               fatal-if-they-fail, run via
+#                                          `runuser -u USER --
+#                                          systemctl --user <verb> <unit>`.
+#
+# -- No-op / dry-run posture when systemd --user is unavailable -------------
+#
+# Mirrors bin/ubx-systemd-apply's own posture (see that script's header):
+# `--apply` with a service action present but no `runuser`/`systemctl` on
+# PATH refuses outright (a real "apply my home services" request with no
+# way to reach a user session is a hard misconfiguration, not silently
+# downgraded); `--dry-run` (the default) never touches either binary at
+# all, so a caller with neither installed can still preview a plan safely.
+set -euo pipefail
+
+prog_name="ubx-home-apply"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-home-apply --plan FILE [--content-dir DIR] [--homes-dir DIR] [--apply | --dry-run]
+
+Consumes a plan produced by `bin/ubx-home plan` and issues the
+corresponding install/chown/chmod/rm/runuser-systemctl calls, in the
+plan's own order.
+
+  --plan FILE       the plan JSON to apply (required)
+  --content-dir DIR where a file/service-file action's source bytes are
+                     read from, as --content-dir/<user>/files/<path> or
+                     --content-dir/<user>/services/<name> (default ".")
+  --homes-dir DIR    the real (or, for tests, temp) /home root every
+                      action targets (default: /home)
+  --apply            actually run commands (service actions require
+                     runuser+systemctl on PATH)
+  --dry-run          print, don't run (default)
+
+Owner/group are only ever applied when running as root (euid 0) — see this
+script's header, "Ownership". `drift-file` lines are always printed to
+stderr, in both modes, and never become a filesystem call.
+USAGE
+}
+
+main() {
+  local plan="" content_dir="." homes_dir="/home" mode="dry-run"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --content-dir) [ $# -ge 2 ] || die "--content-dir requires an argument"; content_dir="$2"; shift 2 ;;
+      --homes-dir) [ $# -ge 2 ] || die "--homes-dir requires an argument"; homes_dir="$2"; shift 2 ;;
+      --apply) mode="apply"; shift ;;
+      --dry-run) mode="dry-run"; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "--plan is required"
+  [ -f "$plan" ] || die "no such file: $plan"
+
+  local has_service_actions=0
+  if python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if any(a['op'] in ('write-service-file','remove-service-file','daemon-reload','stop','disable','mask','unmask','enable','start','restart') for a in d.get('actions', [])) else 1)" "$plan"; then
+    has_service_actions=1
+  fi
+
+  if [ "$mode" = "apply" ] && [ "$has_service_actions" = 1 ]; then
+    command -v runuser > /dev/null 2>&1 || die "--apply requires 'runuser' on PATH to converge user systemd services, but none was found (refusing -- see this script's header, 'No-op / dry-run posture')"
+    command -v systemctl > /dev/null 2>&1 || die "--apply requires 'systemctl' on PATH to converge user systemd services, but none was found (refusing -- see this script's header, 'No-op / dry-run posture')"
+  fi
+
+  local can_chown=0
+  [ "$(id -u)" != 0 ] || can_chown=1
+
+  local commands
+  commands="$(python3 - "$plan" "$content_dir" "$homes_dir" "$can_chown" <<'PYEOF'
+import shlex
+import sys
+
+plan_path, content_dir, homes_dir, can_chown = sys.argv[1:5]
+can_chown = can_chown == "1"
+
+lines = []
+
+
+def emit(argv):
+    lines.append(" ".join(shlex.quote(a) for a in argv))
+
+
+import json
+with open(plan_path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+for a in plan.get("actions", []):
+    op = a["op"]
+    user = a["user"]
+
+    if op == "install-file":
+        target = f"{homes_dir}/{user}/{a['path']}"
+        src = f"{content_dir}/{user}/files/{a['path']}"
+        argv = ["install", "-D", "-m", a["mode"]]
+        if can_chown:
+            argv += ["-o", user, "-g", user]
+        argv += [src, target]
+        emit(argv)
+    elif op == "update-file-metadata":
+        target = f"{homes_dir}/{user}/{a['path']}"
+        emit(["chmod", a["mode"], target])
+        if can_chown:
+            emit(["chown", f"{user}:{user}", target])
+    elif op == "remove-file":
+        target = f"{homes_dir}/{user}/{a['path']}"
+        emit(["rm", "-f", target])
+    elif op == "drift-file":
+        print(
+            f"ubx-home-apply: drift: {user}:{a['path']} (observed sha256={a['sha256']} mode={a['mode']}) -- no action taken",
+            file=sys.stderr,
+        )
+    elif op == "write-service-file":
+        target = f"{homes_dir}/{user}/.config/systemd/user/{a['service']}"
+        src = f"{content_dir}/{user}/services/{a['service']}"
+        argv = ["install", "-D", "-m", "0644"]
+        if can_chown:
+            argv += ["-o", user, "-g", user]
+        argv += [src, target]
+        emit(argv)
+    elif op == "remove-service-file":
+        target = f"{homes_dir}/{user}/.config/systemd/user/{a['service']}"
+        emit(["rm", "-f", target])
+    elif op == "daemon-reload":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "daemon-reload"])
+    elif op == "stop":
+        lines.append(f"runuser -u {shlex.quote(user)} -- systemctl --user stop {shlex.quote(a['service'])} || :")
+    elif op == "disable":
+        lines.append(f"runuser -u {shlex.quote(user)} -- systemctl --user disable {shlex.quote(a['service'])} || :")
+    elif op == "mask":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "mask", a["service"]])
+    elif op == "unmask":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "unmask", a["service"]])
+    elif op == "enable":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "enable", a["service"]])
+    elif op == "start":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "start", a["service"]])
+    elif op == "restart":
+        emit(["runuser", "-u", user, "--", "systemctl", "--user", "restart", a["service"]])
+    else:  # pragma: no cover -- defensive; bin/ubx-home never emits this
+        print(f"ubx-home-apply: unknown plan action op: {op!r}", file=sys.stderr)
+        sys.exit(1)
+
+print("\n".join(lines))
+PYEOF
+  )"
+
+  if [ "$mode" = "dry-run" ]; then
+    if [ -n "$commands" ]; then
+      printf '%s\n' "$commands"
+    fi
+    exit 0
+  fi
+
+  # --apply: run each command line via a temp script, same pattern
+  # bin/ubx-etc-apply's/bin/ubx-systemd-apply's own --apply branch uses.
+  local script
+  script="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $script NOW
+  trap "rm -f '$script'" EXIT
+  {
+    printf '#!/bin/sh\nset -e\n'
+    printf '%s\n' "$commands"
+  } > "$script"
+  chmod +x "$script"
+  "$script"
+}
+
+main "$@"

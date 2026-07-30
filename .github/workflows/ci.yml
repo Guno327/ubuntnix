@@ -889,6 +889,70 @@ jobs:
           path: snap-converge-serial.log
           if-no-files-found: ignore
 
+  home-activation:
+    name: Home-activation QEMU e2e (SPEC.md §9, §11 M5 exit criterion; issue #105)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # Same requirement as the "boot"/"switch-loop" jobs above --
+      # nix/boot.nix's home-activation-proof composes a rootfs tree
+      # through the same hardened `unshare --user --map-root-user` chroot.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: see the "boot" job's identical step for
+      # the full rationale (nix/stdenv.nix's `__noChroot = true` derivation).
+      - name: Build home-activation-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#home-activation-proof -L -o result-home-activation-image
+          sudo chown -R "$USER" result-home-activation-image
+      - name: Assert home-activation-proof artifact
+        run: |
+          img="result-home-activation-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and every
+            # e2e job silently falls back to TCG software emulation (10-20x
+            # slower) -- which is what pushed the #90 login-proof boot past its
+            # 600s ceiling. Grant world rw so acceleration is actually used.
+            sudo chmod 666 /dev/kvm || true
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e home-activation test below will fall back to TCG (slower, still correct; see tests/e2e/060-qemu-home-activation-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end home-activation test (SPEC.md §9's home
+      # domain, §11's M5 exit criterion): boots the just-built disk image
+      # across ONE real guest-initiated reboot (needed to prove an enabled
+      # user service auto-starts via `loginctl enable-linger`) and asserts
+      # every UBX-HOME-*-PASS marker the image's own baked-in driver
+      # (nix/boot.nix's homeActivationDriverScript) emits -- see that
+      # script's own header, and tests/e2e/060-qemu-home-activation-e2e.sh's,
+      # for the exact marker-by-marker design, including the documented,
+      # non-fatal UBX-HOME-LINGER-NOTE fallback if a per-user systemctl
+      # --user bus cannot be reached in this runner's minimal guest.
+      - name: QEMU e2e home-activation test
+        run: ./tests/e2e/060-qemu-home-activation-e2e.sh --image result-home-activation-image --timeout 300 --max-boots 3 --keep-log home-activation-serial.log
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: home-activation-e2e-serial-log
+          path: home-activation-serial.log
+          if-no-files-found: ignore
+
   resolve:
     name: Archive resolution (apt solver, end-to-end)
     runs-on: ubuntu-24.04

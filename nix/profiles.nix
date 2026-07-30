@@ -1,6 +1,8 @@
-# nix/profiles.nix — the `profiles.server` showcase module (SPEC.md §6's
-# `profiles.server.enable = true; # -> upstream server seed` surface, §10
-# "parity example configs", §11 M5 exit criterion; GitHub issue #99).
+# nix/profiles.nix — the `profiles.server` AND `profiles.desktop` showcase
+# modules (SPEC.md §6's `profiles.server.enable = true; # -> upstream
+# server seed` / `profiles.desktop.enable = true; # -> upstream desktop
+# seed` surfaces, §10 "parity example configs", §11 M5/M6 exit criteria;
+# GitHub issue #99 for server, GitHub issue #107 for desktop).
 #
 # -- What M5 needs -----------------------------------------------------------
 #
@@ -80,6 +82,67 @@
 # the booted image, and none of the enumerated exceptions leaked in — not
 # byte-for-byte equality against a live upstream manifest this environment
 # cannot fetch.
+#
+# -- Desktop (`profiles.desktop`; GitHub issue #107; SPEC.md §11 M6) --------
+#
+# `flake.lib.profiles.desktop` is `profiles.server`'s direct sibling —
+# identical `validateDecl`/`render`/`renderJSON` shape, identical
+# lockfile-derived-not-hand-curated posture for `desktopSeedPackages`/
+# `desktopSeedExceptions` (see "What 'the upstream Server seed' means in
+# this repo" above — read verbatim as "Desktop" for this section; not
+# re-explained a second time). The one real difference: a GNOME desktop
+# needs a display manager + graphical boot target, which a server install
+# does not — `graphicalTargetName`/`displayManagerServiceName`/
+# `displayManagerSymlinkPath` below are that DECLARATIVE data (what
+# `systemctl set-default graphical.target` and a display-manager package's
+# own postinst would each write), materialized into real symlinks only by
+# `packages.desktop-parity-image`'s own `extraFilesScript` below — there is
+# no symlink primitive in nix/etc.nix (see that file's own "does NOT decide
+# symlink-vs-copy" header note) to route this through instead, so this file
+# does the same manual `ln -sf` bootRootfs's own `extraFilesScript`
+# machinery already uses for `serverParityAssertUnit`'s own
+# `multi-user.target.wants` symlink, just for `default.target`/
+# `display-manager.service` instead.
+#
+# GitHub issue #107's own explicit scope boundary: booting this image to an
+# actual graphical GNOME session in QEMU is issue #108, NOT this file — see
+# that issue for the live e2e. What this file guarantees instead is that
+# the DECLARATION is real and wired: `packages.desktop-parity-image` below
+# forces evaluation of `profiles.desktop`'s full render pipeline (the same
+# "CI's flake-check/build forces evaluation" role
+# `profiles-server-manifest-proof`/`server-parity-image` already play for
+# `profiles.server`), so issue #108 has something real to boot once it
+# lands, without this issue needing a QEMU e2e of its own.
+#
+# PM ACTION REQUIRED (needs-owner, non-blocking, desktop-specific): unlike
+# `serverSeedPackages` above (whose upstream Server minimal/standard
+# task-set gap is a handful of names layered on an otherwise
+# already-boot-critical-heavy lockfile), NONE of `archive.lock.json`'s 171
+# currently-pinned packages are GNOME/desktop packages at all — every one
+# is a base/boot-critical package shared with the server seed. A real
+# `profiles.desktop` seed needs, at minimum, a display manager (`gdm3`),
+# the shell + session (`gnome-shell`, `gnome-session`, `gnome-session-bin`),
+# a display server (`xserver-xorg`, `xwayland`, `mutter`), core apps
+# (`gnome-control-center`, `gnome-terminal`, `nautilus`,
+# `gnome-settings-daemon`), the desktop meta-package (`ubuntu-desktop` or
+# `ubuntu-desktop-minimal`), NetworkManager (this repo currently manages
+# networking via netplan+systemd-networkd instead — a real desktop install
+# also carries `network-manager` for its GUI), PolicyKit (`policykit-1`),
+# `upower`, `gvfs`, an audio stack (`pipewire`/`pipewire-pulse` on 24.04),
+# `plymouth` (boot splash), and `fonts-ubuntu`. None of these are declared
+# in `archive.packages.json` nor pinned in `archive.lock.json` today, and
+# — exactly like `serverSeedPackages`'s own gap above — this file
+# deliberately does NOT hand-type lockfile entries for them (a fabricated
+# sha256 would be an undetectable lie about a real archive artifact) nor
+# add undeclared names to `archive.packages.json` (tests/unit/053's
+# declared ⊆ pinned invariant would fail immediately). Until the owner runs
+# `bin/ubx-resolve` against a live snapshot with real network + apt access
+# and commits the regenerated archive.packages.json/archive.lock.json pair
+# with these names, `desktopSeedPackages` below is — like
+# `serverSeedPackages` — the already-locked base closure (minus fixtures):
+# a real, if far narrower, stand-in that lets this module, its example, and
+# its parity-image target all evaluate and pass for real today, with the
+# actual GNOME package gap enumerated here for the owner to action.
 { config, inputs, ... }:
 let
   lib = inputs.nixpkgs.lib;
@@ -218,11 +281,116 @@ let
   # `profiles-server-manifest-proof` below, mirroring nix/filesystems.nix's/
   # nix/localization.nix's own `exampleEntries`/`exampleDeclaration` role.
   exampleDeclaration = { enable = true; };
+
+  # =========================================================================
+  # `profiles.desktop` (GitHub issue #107; SPEC.md §11 M6) -- see this
+  # file's header, "Desktop", for the full posture. Everything below
+  # mirrors the `profiles.server` bindings above field-for-field, except
+  # where desktop-specific (the display-manager/graphical-target wiring).
+  # =========================================================================
+
+  # -- desktopSeedPackages / desktopSeedExceptions -------------------------
+  #
+  # See header, "Desktop" / "What 'the upstream Server seed' means in this
+  # repo". Same four M1 stdenv/archive-fetch proof fixtures as
+  # `serverSeedExceptions` -- they share the one project-wide lockfile
+  # (archive.packages.json's own header) and are equally not real members
+  # of any upstream Desktop seed.
+  desktopSeedExceptions = [ "hello" "htop" "ed" "jq" ];
+
+  desktopSeedPackages =
+    builtins.sort (a: b: a < b)
+      (builtins.filter
+        (p: !(builtins.elem p desktopSeedExceptions))
+        (map (p: p.name) lockfile.public.packages));
+
+  # -- display manager / graphical-target wiring ---------------------------
+  #
+  # Declarative data only (see header, "Desktop") -- what a real
+  # `systemctl set-default graphical.target` plus a display-manager
+  # package's own postinst (e.g. gdm3's `dpkg-reconfigure gdm3`, which
+  # writes /etc/systemd/system/display-manager.service) would each
+  # produce. Materialized into real symlinks only by
+  # `packages.desktop-parity-image`'s own `extraFilesScript` below --
+  # `render`/`renderDeclaration` here stay pure data, exactly like every
+  # other primitive/module surface in this repo.
+  graphicalTargetName = "graphical.target";
+  graphicalTargetUnitPath = "/lib/systemd/system/graphical.target";
+  displayManagerServiceName = "gdm.service";
+  displayManagerUnitPath = "/lib/systemd/system/gdm.service";
+  defaultTargetSymlinkPath = "/etc/systemd/system/default.target";
+  displayManagerSymlinkPath = "/etc/systemd/system/display-manager.service";
+
+  # -- desktop validateDecl / render (the `profiles.desktop` primitive
+  #    surface) -- mirrors `checkExtraPackages`/`validateDecl` above
+  #    exactly, save for the option-path name in error text. -------------
+  checkDesktopExtraPackages = extraPackages:
+    let
+      missing = builtins.filter (p: !(debs ? ${p})) extraPackages;
+    in
+    if missing == [ ] then [ ]
+    else [ "profiles.desktop.extraPackages: package(s) not in the locked archive set (archive.lock.json): ${builtins.concatStringsSep ", " missing} -- add them to archive.lock.json (nix/archive.nix) first." ];
+
+  desktopValidateDecl = { enable ? false, extraPackages ? [ ] }:
+    let
+      errors =
+        (if builtins.isBool enable then [ ] else [ "profiles.desktop.enable must be a boolean, got ${builtins.typeOf enable}" ])
+        ++ (if builtins.isList extraPackages then [ ] else [ "profiles.desktop.extraPackages must be a list of package names, got ${builtins.typeOf extraPackages}" ])
+        ++ (if builtins.isList extraPackages then checkDesktopExtraPackages extraPackages else [ ]);
+    in
+    if errors == [ ]
+    then { inherit enable extraPackages; }
+    else
+      throw ''
+        profiles.desktop failed eval-boundary validation (SPEC.md §6, §11 M6; nix/profiles.nix):
+        ${builtins.concatStringsSep "\n" (map (e: "  - ${e}") errors)}'';
+
+  desktopRenderDeclaration = { enable, extraPackages }:
+    if !enable then
+      {
+        version = 1;
+        enable = false;
+        packages = [ ];
+        etc = [ ];
+      }
+    else
+      let
+        packages = builtins.sort (a: b: a < b) (lib.unique (desktopSeedPackages ++ extraPackages));
+      in
+      {
+        version = 1;
+        enable = true;
+        inherit packages;
+        etc = [ ];
+        graphicalSession = {
+          defaultTarget = graphicalTargetName;
+          displayManager = {
+            service = displayManagerServiceName;
+            symlinkPath = displayManagerSymlinkPath;
+          };
+        };
+      };
+
+  desktopRender = decl: desktopRenderDeclaration (desktopValidateDecl decl);
+
+  desktopRenderJSON = decl: builtins.toJSON (desktopRender decl) + "\n";
+
+  # exampleDesktopDeclaration -- forced through desktopRender/
+  # desktopRenderJSON at EVAL time by `profiles-desktop-manifest-proof`
+  # below, mirroring `exampleDeclaration` above.
+  exampleDesktopDeclaration = { enable = true; };
 in
 {
   flake.lib.profiles = {
     server = {
       inherit validateDecl render renderJSON serverSeedPackages serverSeedExceptions cloudInitDisabledPath;
+    };
+    desktop = {
+      validateDecl = desktopValidateDecl;
+      render = desktopRender;
+      renderJSON = desktopRenderJSON;
+      inherit desktopSeedPackages desktopSeedExceptions;
+      inherit graphicalTargetName displayManagerServiceName displayManagerSymlinkPath defaultTargetSymlinkPath;
     };
   };
 
@@ -478,6 +646,263 @@ in
         kernel = serverParityKernel;
         grubCfgDrv = serverParityGrubCfg;
       };
+
+      # =======================================================================
+      # `profiles.desktop` (GitHub issue #107; SPEC.md §11 M6) -- mirrors
+      # every server-parity binding above field-for-field. See this file's
+      # header, "Desktop", for the full posture and scope boundary (issue
+      # #108 owns the live QEMU graphical-boot e2e; this is a build-time
+      # proof target only).
+      # =======================================================================
+
+      # -- the desktop parity example config, compiled through the same
+      #    landed base modules as the server parity config -----------------
+      desktopExampleConfig = import ../examples/desktop.nix;
+
+      desktopNetworkingValidated = config.flake.lib.networking.validate desktopExampleConfig.networking;
+      desktopNetplanYaml = config.flake.lib.networking.renderNetplanYAML desktopNetworkingValidated;
+      desktopHostsContent = config.flake.lib.networking.renderHostsContent desktopNetworkingValidated;
+      desktopHostnameContent = config.flake.lib.networking.renderHostnameContent desktopNetworkingValidated;
+
+      desktopLocalizationRendered = config.flake.lib.localization.render {
+        inherit (desktopExampleConfig) i18n console time;
+      };
+      findDesktopLocalizationEtc = path:
+        (builtins.head (builtins.filter (e: e.path == path) desktopLocalizationRendered.etc)).text;
+      desktopLocaleText = findDesktopLocalizationEtc "default/locale";
+      desktopKeyboardText = findDesktopLocalizationEtc "default/keyboard";
+      desktopTimezoneText = findDesktopLocalizationEtc "timezone";
+      desktopTimesyncdText = findDesktopLocalizationEtc "systemd/timesyncd.conf";
+
+      desktopFilesystemsRendered = config.flake.lib.fileSystems.render {
+        inherit (desktopExampleConfig) fileSystems swapDevices;
+      };
+
+      desktopUsersManifest = config.flake.lib.users.mkManifest {
+        inherit (desktopExampleConfig) users groups;
+      };
+      desktopUsersManifestJSON = config.flake.lib.users.renderManifestJSON desktopUsersManifest;
+
+      desktopManifest = desktopRender { enable = desktopExampleConfig.profiles.desktop.enable; };
+      desktopPackagesText = builtins.concatStringsSep "\n" desktopManifest.packages + "\n";
+
+      # ubx-desktop-parity-assert.service -- mirrors
+      # ubx-server-parity-assert.service exactly (see above for the "one
+      # self-contained unit" reasoning), plus one desktop-specific check:
+      # the default.target/display-manager symlinks this profile's own
+      # extraFilesScript writes below are actually in place with the
+      # expected targets. Deliberately does NOT check that gdm/gnome-shell
+      # are dpkg-installed or that a graphical session actually starts --
+      # neither package is in today's locked archive set yet (see this
+      # file's header, "Desktop", PM ACTION REQUIRED) and booting to a real
+      # graphical session is issue #108's own scope, not this proof's.
+      desktopParityAssertScript = ''
+        #!/bin/sh
+        # /usr/local/bin/ubx-desktop-parity-assert -- baked in only by
+        # packages.desktop-parity-image below; never a real installer-
+        # produced system (SPEC.md §10; mirrors ubx-server-parity-assert).
+        set -e
+
+        current="$(cat /ubx/generations/current 2>/dev/null || true)"
+        if [ -z "$current" ] || [ ! -f "/ubx/generations/$current/marker" ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: generation marker file missing (current='$current')"
+          exit 1
+        fi
+
+        if [ ! -x /ubx/bin/ubx ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: /ubx/bin/ubx missing or not executable"
+          exit 1
+        fi
+
+        if ! /ubx/bin/ubx --help > /dev/null 2>&1; then
+          echo "UBX-DESKTOP-PARITY-FAIL: /ubx/bin/ubx --help did not exit 0"
+          exit 1
+        fi
+
+        if [ ! -f /etc/netplan/01-ubuntnix.yaml ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: /etc/netplan/01-ubuntnix.yaml missing"
+          exit 1
+        fi
+
+        if [ "$(cat /etc/hostname)" != "${desktopNetworkingValidated.hostname}" ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: /etc/hostname mismatch (got '$(cat /etc/hostname)', want '${desktopNetworkingValidated.hostname}')"
+          exit 1
+        fi
+
+        if [ "$(readlink '${defaultTargetSymlinkPath}')" != "${graphicalTargetUnitPath}" ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: ${defaultTargetSymlinkPath} does not point at ${graphicalTargetUnitPath}"
+          exit 1
+        fi
+
+        if [ "$(readlink '${displayManagerSymlinkPath}')" != "${displayManagerUnitPath}" ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: ${displayManagerSymlinkPath} does not point at ${displayManagerUnitPath}"
+          exit 1
+        fi
+
+        # See nix/profiles.nix's serverParityAssertScript for why awk/sed
+        # over dpkg -l is used instead of a dpkg-query format string.
+        installed="$(dpkg -l | awk '/^ii/ {print $2}' | sed 's/:.*$//' | sort -u)"
+
+        missing=""
+        for pkg in $(cat /ubx/generations/1/desktop-seed-packages.txt); do
+          if ! printf '%s\n' "$installed" | grep -qx "$pkg"; then
+            missing="$missing $pkg"
+          fi
+        done
+
+        unexpected=""
+        for pkg in ${builtins.concatStringsSep " " desktopSeedExceptions}; do
+          if printf '%s\n' "$installed" | grep -qx "$pkg"; then
+            unexpected="$unexpected $pkg"
+          fi
+        done
+
+        if [ -n "$missing" ] || [ -n "$unexpected" ]; then
+          echo "UBX-DESKTOP-PARITY-FAIL: missing-seed-packages=[$missing] unexpected-exception-packages=[$unexpected]"
+          exit 1
+        fi
+
+        echo "UBX-DESKTOP-PARITY-PASS"
+        sync
+        systemctl poweroff
+      '';
+
+      desktopParityAssertUnit = ''
+        [Unit]
+        Description=ubuntnix desktop-parity assertions (tests/e2e; desktop-parity-image only)
+        After=multi-user.target
+        Requires=multi-user.target
+
+        [Service]
+        Type=oneshot
+        StandardOutput=journal+console
+        StandardError=journal+console
+        ExecStart=/usr/local/bin/ubx-desktop-parity-assert
+
+        [Install]
+        WantedBy=multi-user.target
+      '';
+
+      desktopParityExtraFilesScript = ''
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/netplan" "$out/etc/default" "$out/etc/systemd/system"
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/hostname" <<'UBX_PROFILES_EOF'
+        ${desktopHostnameContent}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/hosts" <<'UBX_PROFILES_EOF'
+        ${desktopHostsContent}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/netplan/01-ubuntnix.yaml" <<'UBX_PROFILES_EOF'
+        ${desktopNetplanYaml}
+        UBX_PROFILES_EOF
+        ubxrun "$UBX_BASE/bin/chmod" 0600 "$out/etc/netplan/01-ubuntnix.yaml"
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/default/locale" <<'UBX_PROFILES_EOF'
+        ${desktopLocaleText}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/default/keyboard" <<'UBX_PROFILES_EOF'
+        ${desktopKeyboardText}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/timezone" <<'UBX_PROFILES_EOF'
+        ${desktopTimezoneText}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/timesyncd.conf" <<'UBX_PROFILES_EOF'
+        ${desktopTimesyncdText}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/fstab" <<'UBX_PROFILES_EOF'
+        ${desktopFilesystemsRendered.fstabContent}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/ubx/generations/1"
+        ubxrun "$UBX_BASE/bin/cat" > "$out/ubx/generations/1/users-manifest.json" <<'UBX_PROFILES_EOF'
+        ${desktopUsersManifestJSON}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/ubx/generations/1/desktop-seed-packages.txt" <<'UBX_PROFILES_EOF'
+        ${desktopPackagesText}
+        UBX_PROFILES_EOF
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/usr/local/bin/ubx-desktop-parity-assert" <<'UBX_PROFILES_SCRIPT_EOF'
+        ${desktopParityAssertScript}
+        UBX_PROFILES_SCRIPT_EOF
+        ubxrun "$UBX_BASE/bin/chmod" +x "$out/usr/local/bin/ubx-desktop-parity-assert"
+
+        ubxrun "$UBX_BASE/bin/cat" > "$out/etc/systemd/system/ubx-desktop-parity-assert.service" <<'UBX_PROFILES_UNIT_EOF'
+        ${desktopParityAssertUnit}
+        UBX_PROFILES_UNIT_EOF
+        ubxrun "$UBX_BASE/bin/mkdir" -p "$out/etc/systemd/system/multi-user.target.wants"
+        ubxrun "$UBX_BASE/bin/ln" -sf ../ubx-desktop-parity-assert.service \
+          "$out/etc/systemd/system/multi-user.target.wants/ubx-desktop-parity-assert.service"
+
+        # -- display-manager / graphical.target wiring (see this file's
+        #    header, "Desktop") -- the declarative data
+        #    `desktopManifest.graphicalSession` carries, materialized here
+        #    as real symlinks (mirrors what `systemctl set-default
+        #    graphical.target` / a display-manager package's own postinst
+        #    would each write on a real install). `graphical.target` itself
+        #    ships with the `systemd` package (already in today's locked
+        #    seed -- see `desktopSeedPackages` above), so the default.target
+        #    symlink below likely resolves for real; `gdm.service` does
+        #    NOT, since the `gdm3` package is outside today's locked
+        #    archive set (this file's header, PM ACTION REQUIRED) -- that
+        #    symlink is deliberately dangling until it lands. `ln -sf`
+        #    needs no target to exist either way, so both symlinks are
+        #    still real, inspectable artifacts of the intended wiring.
+        ubxrun "$UBX_BASE/bin/ln" -sf "${graphicalTargetUnitPath}" "$out${defaultTargetSymlinkPath}"
+        ubxrun "$UBX_BASE/bin/ln" -sf "${displayManagerUnitPath}" "$out${displayManagerSymlinkPath}"
+      '';
+
+      desktopParityRootfs = bootRootfs {
+        inherit system bootSpec;
+        name = "desktop-parity";
+        packages = desktopManifest.packages;
+        preseed = desktopLocalizationRendered.debconf;
+        extraFilesScript = desktopParityExtraFilesScript;
+      };
+
+      desktopParitySquashfs = squashfsImage {
+        inherit system;
+        name = "desktop-parity";
+        rootfs = desktopParityRootfs;
+      };
+
+      desktopParityKernel = kernelArtifacts {
+        inherit system flavor;
+        name = "desktop-parity";
+        rootfs = desktopParityRootfs;
+      };
+
+      desktopParityGeneration = {
+        index = 1;
+        title = "ubuntnix desktop-parity generation 1 (${bootSpec.kernel})";
+        kernelPath = "/vmlinuz-${flavor}";
+        initrdPath = "/initrd.img-${flavor}";
+        rootDevice = "/dev/vda2";
+        kernelParams = bootSpec.kernelParams ++ [
+          "rootfstype=squashfs"
+          "console=ttyS0"
+        ];
+      };
+
+      desktopParityGrubCfg = grubCfg {
+        inherit system;
+        name = "desktop-parity";
+        generations = [ desktopParityGeneration ];
+      };
+
+      desktopParityDiskImage = diskImage {
+        inherit system flavor;
+        name = "desktop-parity";
+        squashfs = desktopParitySquashfs;
+        kernel = desktopParityKernel;
+        grubCfgDrv = desktopParityGrubCfg;
+      };
     in
     {
       # profiles-server-manifest-proof: forces validateDecl/render/renderJSON
@@ -508,5 +933,34 @@ in
       # `profiles.server` itself, on the same M1 boot pipeline
       # `boot-image-proof` already proves works.
       packages.server-parity-image = serverParityDiskImage;
+
+      # profiles-desktop-manifest-proof: forces desktopValidateDecl/
+      # desktopRender/desktopRenderJSON against `exampleDesktopDeclaration`
+      # at EVAL time -- mirrors profiles-server-manifest-proof above
+      # exactly (GitHub issue #107).
+      packages.profiles-desktop-manifest-proof = runInUbuntuBase {
+        inherit system;
+        name = "profiles-desktop-manifest-proof";
+        script = ''
+          {
+            echo "MARKER=ubuntnix-profiles-desktop-manifest-proof-v1"
+            cat <<'UBX_MANIFEST_EOF'
+          ${desktopRenderJSON exampleDesktopDeclaration}
+          UBX_MANIFEST_EOF
+          } > "$out"
+        '';
+      };
+
+      # desktop-parity-image (GitHub issue #107, SPEC.md §11 M6): the
+      # BUILD-TIME parity/proof target this issue's own scope calls for --
+      # examples/desktop.nix compiled through every landed base module and
+      # `profiles.desktop` itself, on the same M1 boot pipeline
+      # `boot-image-proof`/`server-parity-image` already prove works, so
+      # CI's flake-check/build forces evaluation of the whole desktop
+      # render pipeline. The LIVE graphical-boot QEMU e2e (structured so
+      # this target is ready to be that e2e's subject) is GitHub issue
+      # #108, deliberately not built here -- see this file's header,
+      # "Desktop".
+      packages.desktop-parity-image = desktopParityDiskImage;
     };
 }

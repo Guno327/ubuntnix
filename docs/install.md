@@ -46,7 +46,8 @@ Server installs keep cloud-init, as upstream does.
 1. Partition the disk (accommodating `/ubx`, `/flake`, and the writable
    paths; optional full-disk encryption once M5 lands).
 2. Write the initial generation, built from the parity example
-   configuration matching the user's choices.
+   configuration matching the user's choices (`examples/server.nix` or
+   `examples/desktop.nix`, per the Desktop-vs-Server choice above).
 3. Initialize `/flake` as a git repository containing that example
    configuration, with git-crypt set up for the `secrets/` folder and a
    generated per-machine GPG identity added as a collaborator.
@@ -72,6 +73,10 @@ the parity target.
 ## Where to track progress
 
 Installer work is scoped to milestone **M7** in `SPEC.md` §11, after the
-base module set (M5) and desktop profile (M6) land. Full-disk encryption
-groundwork begins at M4/M5; TPM-backed auto-unlock is a post-v1 stretch
-goal.
+base module set (M5) and desktop profile (M6) land. The two parity example
+configurations the installer will hand off to — `examples/server.nix`
+(M5, proven end-to-end in QEMU by `tests/e2e/050-qemu-server-parity-e2e.sh`)
+and `examples/desktop.nix` (M6, proven by
+`tests/e2e/070-qemu-desktop-parity-e2e.sh`) — already land ahead of M7.
+Full-disk encryption groundwork begins at M4/M5; TPM-backed auto-unlock is
+a post-v1 stretch goal.

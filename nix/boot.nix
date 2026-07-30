@@ -3675,8 +3675,16 @@ let
       1)
         linger_ok=0
         [ -f "$STATE/linger-ok" ] && linger_ok="$(cat "$STATE/linger-ok")"
+        # The user account lives in this e2e image's /etc, which is a
+        # per-boot tmpfs copy (exactly like the switch-loop proof's writable
+        # /etc) and so is reset by a real reboot -- an artifact of this
+        # harness, NOT ubx behaviour. The declared $HOME files, by contrast,
+        # live on the persistent ext4 /home partition this proof mounts, so
+        # file-persistence across the reboot is the invariant asserted in the
+        # file-only path below. The user account is only required when we
+        # actually exercise the (linger-gated) user-service auto-start, so
+        # its presence is asserted inside that branch rather than here.
         user_uid="$(id -u "$USER_NAME" 2> /dev/null)"
-        [ -n "$user_uid" ] || mark_fail "post-reboot: user $USER_NAME is gone after a real reboot"
 
         bashrc="/home/$USER_NAME/.bashrc"
         profile="/home/$USER_NAME/.profile"
@@ -3685,6 +3693,7 @@ let
         [ -f "$profile" ] || mark_fail "post-reboot: $profile did not survive the reboot"
 
         if [ "$linger_ok" -eq 1 ]; then
+          [ -n "$user_uid" ] || mark_fail "post-reboot: user $USER_NAME is gone after a real reboot -- cannot verify the enabled-user-service auto-start (the account's /etc entry did not persist)"
           # logind restarts user@<uid>.service for every lingering user at
           # boot; that user manager's own default.target then starts every
           # unit still enabled in its (persistent) unit-state directory --

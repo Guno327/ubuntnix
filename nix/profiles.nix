@@ -326,8 +326,8 @@ in
 
         # dpkg -l/awk, not dpkg-query -W -f='${Package}\n': the latter's
         # format string's literal "${Package}" braces would need fragile
-        # Nix indented-string escaping (''${) to survive being spliced
-        # through this file's own ''...'' script text -- dpkg -l's plain
+        # fragile Nix indented-string escaping to survive being spliced
+        # through this file's own multi-line script text -- dpkg -l's plain
         # fixed-column output plus awk's own $2 (a bare, unbraced shell/awk
         # positional reference -- Nix's interpolation trigger is "${", not
         # a lone "$", so this needs no escaping at all) sidesteps that

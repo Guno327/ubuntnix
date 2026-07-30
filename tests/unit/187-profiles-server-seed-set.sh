@@ -49,7 +49,7 @@ done
 # -- serverSeedPackages = sort(lockfile names - exceptions) ---------------
 #
 # Hand-computed in python against the REAL committed archive.lock.json.
-python3 - "$profiles_nix" <<'PYEOF'
+if ! python3 - "$profiles_nix" <<'PYEOF'
 import json
 import sys
 
@@ -82,7 +82,9 @@ for required in ("systemd-sysv", "grub-common", "e2fsprogs", "dosfstools", "tzda
 
 print(f"OK: computed serverSeedPackages has {len(expected_seed)} entries (exceptions correctly excluded, expected seed packages retained)")
 PYEOF
-[ $? -eq 0 ] || fail "serverSeedPackages fixture computation against archive.lock.json failed (see above)"
+then
+  fail "serverSeedPackages fixture computation against archive.lock.json failed (see above)"
+fi
 
 # -- declared ⊆ pinned: profiles.server never invents a package not
 # already resolvable via nix/archive.nix's own debs/lockfile (this issue's

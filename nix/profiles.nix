@@ -324,15 +324,12 @@ in
           exit 1
         fi
 
-        # dpkg -l/awk, not dpkg-query -W -f='${Package}\n': the latter's
-        # format string's literal "${Package}" braces would need fragile
-        # fragile Nix indented-string escaping to survive being spliced
-        # through this file's own multi-line script text -- dpkg -l's plain
-        # fixed-column output plus awk's own $2 (a bare, unbraced shell/awk
-        # positional reference -- Nix's interpolation trigger is "${", not
-        # a lone "$", so this needs no escaping at all) sidesteps that
-        # entirely. "ii" lines are dpkg's own "installed" status marker;
-        # the trailing sed strips a possible ":<arch>" qualifier.
+        # Use dpkg -l piped through awk (column 2) rather than a dpkg-query
+        # format string, because a dpkg-query format string would contain
+        # brace-wrapped field names that Nix would try to interpolate out of
+        # this indented-string script -- awk's fixed-column output needs no
+        # such escaping. "ii" lines are dpkg's own "installed" status marker;
+        # the trailing sed strips a possible arch qualifier.
         installed="$(dpkg -l | awk '/^ii/ {print $2}' | sed 's/:.*$//' | sort -u)"
 
         missing=""

@@ -97,6 +97,79 @@ for arbitrarily complex compositions, anything richer than the base set —
 databases, HA services, and so on — can be authored as ordinary modules
 without needing new primitives.
 
+## `profiles.server` / `profiles.desktop` (landed)
+
+Both profiles live in `nix/profiles.nix` and share one shape:
+
+```nix
+profiles.server.enable = true;     # -> upstream Server seed (GitHub #99, M5)
+profiles.desktop.enable = true;    # -> upstream Desktop seed (GitHub #107, M6)
+# optional on either:
+profiles.server.extraPackages = [ "postgresql-16" ];
+profiles.desktop.extraPackages = [ "some-other-locked-deb" ];
+```
+
+Each exposes a `validateDecl`/`render`/`renderJSON` triple under
+`flake.lib.profiles.server` / `flake.lib.profiles.desktop`
+(`validateDecl` throws — collecting every violation, not just the first —
+on a non-boolean `enable`, a non-list `extraPackages`, or an
+`extraPackages` entry not present in the locked archive set,
+`archive.lock.json`; `enable = false` always renders an inert, empty
+manifest with no packages and no `etc` entries).
+
+**Seed derivation posture (read before touching either `*SeedPackages`
+list).** Neither `serverSeedPackages` nor `desktopSeedPackages` is a
+hand-curated list. Both are computed identically: every package name in
+the project's own locked archive set (`archive.lock.json`, via
+`config.flake.lib.archive.lockfile`), minus a small explicitly-enumerated
+`*SeedExceptions` list (`hello`, `htop`, `ed`, `jq` — the M1
+stdenv/archive-fetch proof fixtures, not real members of any upstream
+seed). This is deliberate: a real apt-solver resolve against a live
+Ubuntu archive mirror is the only way to know the true upstream Server/
+Desktop task-set closure, and this dev/CI environment has no outbound
+network to do that resolve. Rather than fake a second, hand-typed package
+list that would silently drift from reality, both seeds are defined as
+this project's own already-resolved, already-hash-verified closure — a
+real, if narrower, stand-in — with the gap against the true upstream
+seed tracked explicitly (see `nix/profiles.nix`'s own header, "PM ACTION
+REQUIRED") until the real resolver is re-run with network access and the
+lockfile regenerated. The eventual CI parity diff against upstream's own
+published seed manifests is M7/R11 scope, not this module's.
+
+As of GitHub issue #107, `archive.lock.json` carries **no GNOME/gdm
+packages at all** — `desktopSeedPackages` is therefore currently identical
+in content to `serverSeedPackages` (both drawn from the one shared,
+base-system-only lockfile). `nix/profiles.nix`'s header enumerates the
+real GNOME/gdm package names a fuller Desktop seed needs (`gdm3`,
+`gnome-shell`, `gnome-session`, `xserver-xorg`, `network-manager`, the
+`ubuntu-desktop` meta-package, and others) that must be resolved and
+pinned via `bin/ubx-resolve` before the seed can grow to match them.
+
+**Desktop-specific: display manager + graphical target.** `profiles.
+desktop`'s `render` additionally carries a `graphicalSession` field (only
+when `enable = true`) describing the intended `default.target ->
+graphical.target` and `display-manager.service -> gdm.service` wiring —
+what a real `systemctl set-default graphical.target` plus a display
+manager package's own postinst would each write. This is pure declarative
+data in `render`; `packages.desktop-parity-image` (below) is what
+materializes it into real (today, deliberately dangling — see above)
+symlinks on a built image.
+
+**Parity example configs + build-time proof targets.** `examples/
+server.nix` / `examples/desktop.nix` are the parity example configs
+(SPEC.md §10): plain attrsets wiring the landed base modules
+(`networking`, `fileSystems`/`swapDevices`, `i18n`/`console`/`time`,
+`users`) together with the relevant `profiles.*.enable = true;`.
+`nix/profiles.nix`'s own `perSystem` block compiles each through every
+owning base module's `render`/`validate` and bakes the result onto the
+M1 boot pipeline, exposed as `packages.server-parity-image` /
+`packages.desktop-parity-image` — real, `nix flake check`/build-forced
+targets so CI evaluates the whole pipeline even before a QEMU e2e boots
+either image. The **live graphical-boot QEMU e2e** for
+`desktop-parity-image` is tracked separately as GitHub issue #108 — issue
+#107's own scope stops at a build-time proof target structured so #108
+has something real to boot.
+
 ## Where to track progress
 
 Primitives land incrementally across milestones **M1** (boot, debconf,

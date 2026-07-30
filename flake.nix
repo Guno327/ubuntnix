@@ -35,6 +35,7 @@
         ./nix/localization.nix
         ./nix/networking.nix
         ./nix/profiles.nix
+        ./nix/home.nix
       ];
     };
 }

@@ -316,6 +316,20 @@ jobs:
           }
           [ -f result-systemd-proof/manifest.json ] || { echo "no manifest.json in systemd-proof output"; exit 1; }
           python3 tests/lib/check-systemd-proof.py result-systemd-proof
+      # Per-user home files/services proof (SPEC.md §9, §4.3 switching-table
+      # row "Home files, user services"; issue #98, M5): nix/home.nix's
+      # `render` evaluated end to end against a small fixture declaration
+      # (one user with one file and one service) -- the one part of this
+      # issue that can only be exercised where a real `nix` binary exists;
+      # the planner half (bin/ubx-home) is unit-tested without one under
+      # tests/unit/18x (see nix/home.nix's own header, "What this file is,
+      # and what it deliberately is NOT").
+      - name: Build home-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#home-proof -L -o result-home-proof
+          sudo chown -R "$USER" result-home-proof
+      - name: Assert home-proof output tree + manifest
+        run: python3 tests/lib/check-home-proof.py result-home-proof
       - name: Upload flake.lock
         uses: actions/upload-artifact@v4
         with:

@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# bin/ubx-home — diff-driven per-user home activation PLANNER (SPEC.md §9
+# "Per-user configuration (home modules)", §4.3 switching-table row "Home
+# files, user services | home-module activation into writable `/home` |
+# none"; GitHub issue #98, milestone M5).
+#
+# -- Scope: planner only, never touches a filesystem it's asked about ------
+#
+# Exactly bin/ubx-etc's/bin/ubx-systemd's own posture (this file is their
+# direct sibling — read either header first if you haven't): this script
+# computes what SHOULD happen; it never installs a file, never chowns/
+# chmods anything, never calls `systemctl --user`, never deletes anything.
+# Given two generations' home manifests (as rendered by nix/home.nix's
+# `render` — see that file's "Interface with bin/ubx-home /
+# bin/ubx-home-apply") and an observed-state manifest (see `observe`,
+# below), `plan` prints a deterministic JSON action plan. Applying that
+# plan to a real `/home` is bin/ubx-home-apply's job, deliberately kept in
+# a SEPARATE, thin script.
+#
+# -- Why python3 -----------------------------------------------------------
+#
+# See bin/ubx-etc's own header, "Why this depends on python3" — it applies
+# verbatim here: nix/home.nix's `render` emits a JSON manifest, and
+# `python3` is a safe, always-present dependency on stock Ubuntu.
+#
+# -- This is etc's file diff AND systemd's service diff, each re-scoped
+#    per declared user -----------------------------------------------------
+#
+# A home declaration carries two independent things per user — files (a
+# nix/etc.nix-shaped diff problem) and services (a nix/systemd.nix-shaped
+# diff problem, minus the refuse-restart classes: see nix/home.nix's own
+# header, "Unit classes: restart-safe only" — every home service class is
+# restart-safe, so there is no `refuse-restart` action anywhere in this
+# script). This planner runs BOTH algorithms once per user named in either
+# manifest, producing one combined, per-user-grouped action list.
+#
+# -- Inputs: three manifests, one schema per side ---------------------------
+#
+#   --old-manifest / --new-manifest   nix/home.nix's `render` output
+#                                       ($out/manifest.json) for generation
+#                                       N and N+1 -- the DECLARED schema:
+#     { "version": 1, "users": [
+#         { "name": "gunnar",
+#           "files": [ {"path": ".bashrc", "sha256": <64 hex>, "mode": "0644"}, ... ],
+#           "services": [ {"name": "backup.service", "class": "service",
+#                           "sha256": <64 hex>, "enable": true, "mask": false}, ... ] },
+#         ... ] }
+#
+#   --observed-manifest                what is ACTUALLY on disk/in the user
+#                                       session right now -- the OBSERVED
+#                                       schema (see `observe` below):
+#     { "version": 1, "users": [
+#         { "name": "gunnar",
+#           "files": [ {"path": ".bashrc", "sha256": <64 hex>, "mode": "0644"}, ... ],
+#           "services": [ {"name": "backup.service", "sha256": <64 hex|null>,
+#                           "enabled": true, "masked": false, "active": true}, ... ] },
+#         ... ] }
+#
+# Exactly bin/ubx-etc's/bin/ubx-systemd's own "diff against OBSERVED state,
+# not against the previous generation's own record of itself" posture (see
+# either header for the full reasoning) — `--old-manifest` is consulted
+# only to know which paths/units were previously MANAGED, so `remove`/
+# `remove-service-file`/`stop`/`disable` only ever target something this
+# project itself declared before.
+#
+# Home file entries carry NO owner/group (nix/home.nix's declaration
+# surface has no such knob — see that file's header): ownership is always
+# implicitly "this user", so this planner's diff never compares owner/group
+# for a MANAGED file the way bin/ubx-etc does. It is still observed and
+# reported as `drift-file` metadata only, informational, in case a file was
+# chowned away from the user out-of-band.
+#
+# -- The plan algorithm, per user -------------------------------------------
+#
+# Files (identical shape to bin/ubx-etc's own algorithm, scoped to this
+# user's files array, minus owner/group in the diff -- see above):
+#   - path in NEW, absent from observed          -> install-file (create)
+#   - path in NEW, present, sha256 differs        -> install-file (update-content)
+#   - path in NEW, present, sha256+mode match      -> no action
+#   - path in NEW, present, sha256 matches, mode
+#     differs                                      -> update-file-metadata
+#   - path in OLD but not NEW, present in observed -> remove-file
+#   - path in observed, in neither OLD nor NEW      -> drift-file
+#
+# Services (identical shape to bin/ubx-systemd's own algorithm restricted
+# to the three restart-safe classes -- see nix/home.nix's header -- so
+# there is no refuse-restart branch at all):
+#   - hasContent implicitly true always (a home service is always fully
+#     owned content -- see nix/home.nix's header); absent/null observed
+#     sha256 -> write-service-file (create); differing sha256 ->
+#     write-service-file (update-content)
+#   - mask differs -> mask/unmask
+#   - enable differs (and not masked) -> enable/disable (disable also
+#     stops first if active)
+#   - content change -> start (newly created + enabled + not masked) or
+#     restart (pre-existing + (active or (enable and not masked)))
+#   - content unchanged, disabled->enabled while not active -> start
+#   - dropped from NEW (was in OLD): stop if active, disable if enabled,
+#     remove-service-file if OLD had content and observed still shows one
+#   - exactly one `daemon-reload` per user IFF that user had at least one
+#     write-service-file/remove-service-file action (mirrors
+#     bin/ubx-systemd's own "exactly one coalesced daemon-reload" rule,
+#     scoped per-user since `systemctl --user daemon-reload` is itself a
+#     per-user-session operation)
+#
+# -- Deterministic ordering -----------------------------------------------
+#
+# Users are processed in sorted-name order. Within a user: file actions
+# first (create/update-content/update-metadata/remove/drift, each group
+# sorted by path — mirrors bin/ubx-etc's own single PATH-ascending sort,
+# since every file action there carries equal weight regardless of kind),
+# then service actions in bin/ubx-systemd's own fixed group order (write ->
+# remove -> daemon-reload -> stop -> disable -> mask -> unmask -> enable ->
+# start -> restart), each group sorted by unit name.
+#
+# -- Output -----------------------------------------------------------------
+#
+# A single JSON object on stdout (or --out):
+#   { "version": 1, "actions": [ {"op": ..., "user": ..., ...}, ... ] }
+# An empty (fully converged) input produces `"actions": []` and exit 0.
+#
+# `report` renders an already-computed plan as human-readable text (feeds
+# `ubx diff`), kept separate from `plan` for the same reason
+# bin/ubx-systemd's own `report` is kept separate from its `plan`.
+set -euo pipefail
+
+prog_name="ubx-home"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-home <command> [options]
+
+commands:
+  plan       compute a deterministic, per-user, ordered home-activation
+             action plan from two generations' home manifests plus an
+             observed-state manifest
+  observe    walk a real (or fixture) set of per-user home directories
+             (+ optional systemd --user state) and emit an observed-state
+             manifest
+  report     render an already-computed plan as human-readable text
+  -h, --help  show this message
+
+Run 'ubx-home <command> --help' for a command's own options. See this
+script's header for the manifest schemas and the plan algorithm (SPEC.md
+§9, §4.3).
+USAGE
+}
+
+write_out() {
+  local out="$1" content="$2"
+  if [ "$out" = - ]; then
+    printf '%s' "$content"
+  else
+    local tmp
+    tmp="$(mktemp "$(dirname "$out")/.ubx-home.XXXXXX")"
+    printf '%s' "$content" > "$tmp"
+    mv -f "$tmp" "$out"
+  fi
+}
+
+# =====================================================================
+# observe
+# =====================================================================
+
+cmd_observe_usage() {
+  cat <<'USAGE'
+usage: ubx-home observe --homes-dir DIR --user NAME [--user NAME ...] \
+         [--state FILE] [--out FILE|-]
+
+For each --user, walks HOMES_DIR/<user> recursively for regular files
+(relative paths, sha256+mode observed — same shape as bin/ubx-etc's own
+`observe`, minus owner/group) and HOMES_DIR/<user>/.config/systemd/user
+(flat, one regular file per unit) for service units, then emits an
+observed-state manifest (this script's own schema — see the header).
+
+--state FILE (optional): a JSON object
+  { "<user>": { "<unit-name>": {"enabled": bool, "masked": bool, "active": bool}, ... }, ... }
+representing what a real, per-user `systemctl --user is-enabled`/
+`is-active`/`is-active --quiet` query would report -- mirrors
+bin/ubx-systemd's own --state input, one level deeper (per user).
+
+--out defaults to stdout ("-"); a real path is written atomically.
+USAGE
+}
+
+cmd_observe() {
+  local homes_dir="" state="" out="-"
+  local -a users=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --homes-dir) [ $# -ge 2 ] || die "--homes-dir requires an argument"; homes_dir="$2"; shift 2 ;;
+      --user) [ $# -ge 2 ] || die "--user requires an argument"; users+=("$2"); shift 2 ;;
+      --state) [ $# -ge 2 ] || die "--state requires an argument"; state="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_observe_usage; exit 0 ;;
+      *) echo "$prog_name: observe: unknown option: $1" >&2; cmd_observe_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$homes_dir" ] || die "observe: --homes-dir is required"
+  [ "${#users[@]}" -gt 0 ] || die "observe: at least one --user is required"
+  [ -z "$state" ] || [ -f "$state" ] || die "observe: no such file: $state"
+
+  local users_json
+  users_json="$(printf '%s\n' "${users[@]}" | python3 -c 'import json,sys; print(json.dumps([l.rstrip("\n") for l in sys.stdin]))')"
+
+  local content
+  content="$(python3 - "$homes_dir" "$state" "$users_json" <<'PYEOF'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+homes_dir, state_path, users_json = sys.argv[1:4]
+users = json.loads(users_json)
+
+state = {}
+if state_path:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+out_users = []
+for user in sorted(users):
+    home = os.path.join(homes_dir, user)
+    files = []
+    unit_dir = os.path.join(home, ".config", "systemd", "user")
+    if os.path.isdir(home):
+        for dirpath, dirnames, filenames in os.walk(home):
+            dirnames.sort()
+            # Never descend into the unit directory as if it were a
+            # plain home file -- unit content is observed separately,
+            # below, with its own (unit-name-keyed, non-recursive) shape.
+            if os.path.abspath(dirpath) == os.path.abspath(unit_dir):
+                dirnames[:] = []
+                continue
+            for fname in sorted(filenames):
+                full = os.path.join(dirpath, fname)
+                st = os.lstat(full)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                rel = os.path.relpath(full, home).replace(os.sep, "/")
+                mode = "0" + oct(stat.S_IMODE(st.st_mode))[2:].zfill(3)
+                files.append({"path": rel, "sha256": sha256_of(full), "mode": mode})
+        files.sort(key=lambda e: e["path"])
+
+    services = []
+    unit_files = {}
+    if os.path.isdir(unit_dir):
+        for fname in sorted(os.listdir(unit_dir)):
+            full = os.path.join(unit_dir, fname)
+            st = os.lstat(full)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            unit_files[fname] = sha256_of(full)
+
+    user_state = state.get(user, {})
+    names = sorted(set(unit_files) | set(user_state))
+    for name in names:
+        st_entry = user_state.get(name, {})
+        services.append({
+            "name": name,
+            "sha256": unit_files.get(name),
+            "enabled": bool(st_entry.get("enabled", False)),
+            "masked": bool(st_entry.get("masked", False)),
+            "active": bool(st_entry.get("active", False)),
+        })
+
+    out_users.append({"name": user, "files": files, "services": services})
+
+print(json.dumps({"version": 1, "users": out_users}, indent=2, ensure_ascii=False))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# plan
+# =====================================================================
+
+cmd_plan_usage() {
+  cat <<'USAGE'
+usage: ubx-home plan --old-manifest FILE --new-manifest FILE \\
+         --observed-manifest FILE [--out FILE|-]
+
+Computes a deterministic, per-user, ordered home-activation action plan
+(see this script's header for the full algorithm) and prints it as a JSON
+object:
+
+  { "version": 1, "actions": [ {"op": ..., "user": ..., ...}, ... ] }
+
+--out defaults to stdout ("-"); a real path is written atomically. Exits 0
+on an empty (fully converged) plan, and also exits 0 for any well-formed
+plan -- `plan` never fails just because changes exist.
+USAGE
+}
+
+cmd_plan() {
+  local old="" new="" observed="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --old-manifest) [ $# -ge 2 ] || die "--old-manifest requires an argument"; old="$2"; shift 2 ;;
+      --new-manifest) [ $# -ge 2 ] || die "--new-manifest requires an argument"; new="$2"; shift 2 ;;
+      --observed-manifest) [ $# -ge 2 ] || die "--observed-manifest requires an argument"; observed="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_plan_usage; exit 0 ;;
+      *) echo "$prog_name: plan: unknown option: $1" >&2; cmd_plan_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$old" ] || die "plan: --old-manifest is required"
+  [ -n "$new" ] || die "plan: --new-manifest is required"
+  [ -n "$observed" ] || die "plan: --observed-manifest is required"
+  [ -f "$old" ] || die "plan: no such file: $old"
+  [ -f "$new" ] || die "plan: no such file: $new"
+  [ -f "$observed" ] || die "plan: no such file: $observed"
+
+  local content
+  content="$(python3 - "$old" "$new" "$observed" <<'PYEOF'
+import json
+import sys
+
+old_path, new_path, observed_path = sys.argv[1:4]
+
+
+def load(path, label):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("version") != 1:
+        print(f"ubx-home: plan: {label} ({path}): manifest 'version' must be 1", file=sys.stderr)
+        sys.exit(1)
+    return {u["name"]: u for u in data.get("users", [])}
+
+
+old = load(old_path, "--old-manifest")
+new = load(new_path, "--new-manifest")
+observed = load(observed_path, "--observed-manifest")
+
+EMPTY_USER = {"files": [], "services": []}
+EMPTY_OBS_SVC = {"sha256": None, "enabled": False, "masked": False, "active": False}
+
+all_users = sorted(set(old) | set(new) | set(observed))
+
+actions = []
+
+for user in all_users:
+    old_u = old.get(user, EMPTY_USER)
+    new_u = new.get(user, EMPTY_USER)
+    obs_u = observed.get(user, EMPTY_USER)
+
+    old_files = {f["path"]: f for f in old_u.get("files", [])}
+    new_files = {f["path"]: f for f in new_u.get("files", [])}
+    obs_files = {f["path"]: f for f in obs_u.get("files", [])}
+
+    file_actions = []
+    for path, tgt in new_files.items():
+        obs = obs_files.get(path)
+        if obs is None:
+            file_actions.append(("create", path, tgt))
+        elif obs["sha256"] != tgt["sha256"]:
+            file_actions.append(("update-content", path, tgt))
+        elif obs["mode"] != tgt["mode"]:
+            file_actions.append(("update-metadata", path, tgt))
+        # else: already converged.
+
+    for path in old_files:
+        if path in new_files:
+            continue
+        if path in obs_files:
+            file_actions.append(("remove", path, None))
+
+    managed_files = set(old_files) | set(new_files)
+    for path, obs in obs_files.items():
+        if path in managed_files:
+            continue
+        file_actions.append(("drift", path, obs))
+
+    file_actions.sort(key=lambda t: t[1])
+
+    for action, path, meta in file_actions:
+        if action in ("create", "update-content"):
+            actions.append({
+                "op": "install-file", "user": user, "path": path,
+                "action": action, "mode": meta["mode"], "sha256": meta["sha256"],
+            })
+        elif action == "update-metadata":
+            actions.append({"op": "update-file-metadata", "user": user, "path": path, "mode": meta["mode"]})
+        elif action == "remove":
+            actions.append({"op": "remove-file", "user": user, "path": path})
+        elif action == "drift":
+            actions.append({
+                "op": "drift-file", "user": user, "path": path,
+                "sha256": meta["sha256"], "mode": meta["mode"],
+            })
+
+    # -- services: bin/ubx-systemd's own algorithm, restricted to the
+    # restart-safe classes only (nix/home.nix never declares any other
+    # kind -- see this script's header) -- no refuse-restart branch.
+    old_svcs = {s["name"]: s for s in old_u.get("services", [])}
+    new_svcs = {s["name"]: s for s in new_u.get("services", [])}
+    obs_svcs = {s["name"]: s for s in obs_u.get("services", [])}
+
+    creates, updates, removes = [], [], []
+    stops, disables = set(), set()
+    masks, unmasks, enables, starts, restarts = [], [], [], [], []
+
+    for name in sorted(new_svcs):
+        tgt = new_svcs[name]
+        obs = obs_svcs.get(name, EMPTY_OBS_SVC)
+
+        content_changed = False
+        is_new_file = False
+        if obs["sha256"] is None:
+            creates.append(name)
+            content_changed = True
+            is_new_file = True
+        elif obs["sha256"] != tgt["sha256"]:
+            updates.append(name)
+            content_changed = True
+
+        if tgt["mask"] != obs["masked"]:
+            (masks if tgt["mask"] else unmasks).append(name)
+
+        if not tgt["mask"] and tgt["enable"] != obs["enabled"]:
+            if tgt["enable"]:
+                enables.append(name)
+            else:
+                disables.add(name)
+                if obs["active"]:
+                    stops.add(name)
+
+        if content_changed:
+            if is_new_file:
+                if tgt["enable"] and not tgt["mask"]:
+                    starts.append(name)
+            else:
+                if obs["active"] or (tgt["enable"] and not tgt["mask"]):
+                    restarts.append(name)
+        else:
+            if not tgt["mask"] and tgt["enable"] and not obs["enabled"] and not obs["active"]:
+                starts.append(name)
+
+    for name in sorted(set(old_svcs) - set(new_svcs)):
+        old_s = old_svcs[name]
+        obs = obs_svcs.get(name, EMPTY_OBS_SVC)
+        if obs["active"]:
+            stops.add(name)
+        if obs["enabled"]:
+            disables.add(name)
+        if obs["sha256"] is not None:
+            removes.append(name)
+
+    daemon_reload = bool(creates or updates or removes)
+
+    for name in creates:
+        actions.append({"op": "write-service-file", "action": "create", "user": user, "service": name, "sha256": new_svcs[name]["sha256"]})
+    for name in updates:
+        actions.append({"op": "write-service-file", "action": "update-content", "user": user, "service": name, "sha256": new_svcs[name]["sha256"]})
+    for name in sorted(removes):
+        actions.append({"op": "remove-service-file", "user": user, "service": name})
+    if daemon_reload:
+        actions.append({"op": "daemon-reload", "user": user})
+    for name in sorted(stops):
+        actions.append({"op": "stop", "user": user, "service": name})
+    for name in sorted(disables):
+        actions.append({"op": "disable", "user": user, "service": name})
+    for name in sorted(masks):
+        actions.append({"op": "mask", "user": user, "service": name})
+    for name in sorted(unmasks):
+        actions.append({"op": "unmask", "user": user, "service": name})
+    for name in sorted(enables):
+        actions.append({"op": "enable", "user": user, "service": name})
+    for name in sorted(starts):
+        actions.append({"op": "start", "user": user, "service": name})
+    for name in sorted(restarts):
+        actions.append({"op": "restart", "user": user, "service": name})
+
+plan = {"version": 1, "actions": actions}
+sys.stdout.write(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
+PYEOF
+  )"
+  write_out "$out" "$content"
+}
+
+# =====================================================================
+# report
+# =====================================================================
+
+cmd_report_usage() {
+  cat <<'USAGE'
+usage: ubx-home report --plan FILE [--out FILE|-]
+
+Renders an already-computed plan (bin/ubx-home plan's own output) as
+human-readable text -- feeds `ubx diff`. Kept separate from `plan` itself
+so the machine-readable plan stays inspectable/diffable on its own.
+USAGE
+}
+
+cmd_report() {
+  local plan="" out="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) [ $# -ge 2 ] || die "--plan requires an argument"; plan="$2"; shift 2 ;;
+      --out) [ $# -ge 2 ] || die "--out requires an argument"; out="$2"; shift 2 ;;
+      -h | --help) cmd_report_usage; exit 0 ;;
+      *) echo "$prog_name: report: unknown option: $1" >&2; cmd_report_usage >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$plan" ] || die "report: --plan is required"
+  [ -f "$plan" ] || die "report: no such file: $plan"
+
+  local content
+  content="$(python3 - "$plan" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    plan = json.load(f)
+
+actions = plan.get("actions", [])
+if not actions:
+    print("home: nothing to do (fully converged)")
+    sys.exit(0)
+
+VERB = {
+    "install-file": lambda a: f"install file: {a['user']}:{a['path']} ({a['action']})",
+    "update-file-metadata": lambda a: f"update metadata: {a['user']}:{a['path']}",
+    "remove-file": lambda a: f"remove file: {a['user']}:{a['path']}",
+    "drift-file": lambda a: f"DRIFT: {a['user']}:{a['path']} (unmanaged)",
+    "write-service-file": lambda a: f"install user unit: {a['user']}:{a['service']} ({a['action']})",
+    "remove-service-file": lambda a: f"remove user unit: {a['user']}:{a['service']}",
+    "daemon-reload": lambda a: f"daemon-reload --user ({a['user']})",
+    "stop": lambda a: f"stop {a['user']}:{a['service']}",
+    "disable": lambda a: f"disable {a['user']}:{a['service']}",
+    "mask": lambda a: f"mask {a['user']}:{a['service']}",
+    "unmask": lambda a: f"unmask {a['user']}:{a['service']}",
+    "enable": lambda a: f"enable {a['user']}:{a['service']}",
+    "start": lambda a: f"start {a['user']}:{a['service']}",
+    "restart": lambda a: f"restart {a['user']}:{a['service']}",
+}
+
+lines = [f"home: {len(actions)} action(s) planned:"]
+for a in actions:
+    render = VERB.get(a["op"])
+    lines.append(f"  - {render(a) if render else a}")
+print("\n".join(lines))
+PYEOF
+  )"
+  write_out "$out" "$content"$'\n'
+}
+
+# =====================================================================
+# main
+# =====================================================================
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    -h | --help | "" | help)
+      usage
+      [ "$cmd" = "" ] && exit 2
+      exit 0
+      ;;
+    plan) shift; cmd_plan "$@" ;;
+    observe) shift; cmd_observe "$@" ;;
+    report) shift; cmd_report "$@" ;;
+    *)
+      echo "$prog_name: unknown command: $cmd" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

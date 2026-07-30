@@ -8,17 +8,21 @@
 (`SPEC.md` §8.1, GitHub issue #79) — the git-crypt encryption boundary and
 the per-machine GPG identity / collaborator-onboarding mechanism are real
 and unit-tested (`tests/unit/166-secrets-gitcrypt-gitattributes.sh` through
-`168-secrets-gitcrypt-roundtrip.sh`). **Wiring this into a real installer
-flow — generating a machine's own key automatically at first boot and
-handing a fresh `/flake/secrets/` to it — is milestone M7, out of scope
-for this issue** (see `SPEC.md` §11's own M4/M7 split). Everything on this
-page is exercised by test today; nothing here yet runs unattended on a
-real installed machine. See {doc}`workflows`'s own "Secrets workflow"
-section for how this fits into the declare → converge → activate picture,
-and {doc}`etc`/{doc}`users` for the two closest sibling primitives this
-one's planner/executor split mirrors (once that split exists here too —
-see nix/secrets.nix's and `bin/ubx-secrets`/`bin/ubx-secrets-apply`'s own
-headers, issue #78).
+`168-secrets-gitcrypt-roundtrip.sh`). `bin/ubx-flake-init` (GitHub issue
+#114) COMPOSES this page's mechanism — the `secrets/` template and
+`ubx-secrets-key machine-init` — together with `git init`/`git-crypt
+init`/an initial commit into the single idempotent `/flake` bootstrap flow
+SPEC.md §10's installer step 3 describes; see {doc}`install`. **Wiring
+that flow to run unattended, automatically, at a real machine's first
+boot is still milestone M7, out of scope for this issue** (see `SPEC.md`
+§11's own M4/M7 split) — `ubx-flake-init` itself is real and unit-tested
+(`tests/unit/205-ubx-flake-init.sh`) today, it is just not yet invoked by
+anything running on a real installed machine. See {doc}`workflows`'s own
+"Secrets workflow" section for how this fits into the declare → converge →
+activate picture, and {doc}`etc`/{doc}`users` for the two closest sibling
+primitives this one's planner/executor split mirrors (once that split
+exists here too — see nix/secrets.nix's and `bin/ubx-secrets`/
+`bin/ubx-secrets-apply`'s own headers, issue #78).
 ```
 
 ## Why this exists

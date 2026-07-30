@@ -101,11 +101,18 @@ mode="$(stat -c '%a' "$homes_dir/gunnar/.bashrc")"
 # 3) --apply with service actions present, but neither runuser nor
 #    systemctl reliably resolvable: refuses outright rather than silently
 #    downgrading (mirrors bin/ubx-systemd-apply's own refusal posture) --
-#    forced here by pointing PATH at an empty directory.
+#    forced here by pointing PATH at a curated directory that carries only
+#    the tools the executor needs BEFORE its runuser/systemctl check (bash
+#    for the '#!/usr/bin/env bash' shebang, python3 for the service-action
+#    scan) but deliberately omits runuser/systemctl themselves. Emptying
+#    PATH entirely would break the shebang so the script could never run,
+#    never reach its refusal, and print the wrong error.
 # =====================================================================
-empty_path_dir="$work/empty-path"
-mkdir -p "$empty_path_dir"
-svc_out="$(PATH="$empty_path_dir" "$apply_bin" --plan "$plan" --content-dir "$work/content" --homes-dir "$homes_dir" --apply 2>&1)"
+no_svc_path="$work/tools-no-svc"
+mkdir -p "$no_svc_path"
+ln -sf "$(command -v bash)" "$no_svc_path/bash"
+ln -sf "$(command -v python3)" "$no_svc_path/python3"
+svc_out="$(PATH="$no_svc_path" "$apply_bin" --plan "$plan" --content-dir "$work/content" --homes-dir "$homes_dir" --apply 2>&1)"
 svc_rc=$?
 [ "$svc_rc" -ne 0 ] || fail "--apply with service actions and no runuser/systemctl on PATH should refuse (nonzero exit), got 0: $svc_out"
 contains "$svc_out" "runuser" || contains "$svc_out" "systemctl" || fail "refusal message should mention runuser/systemctl, got: $svc_out"

@@ -1376,7 +1376,7 @@ Execution options:
                             bin/ubx-home-apply targets (default /home)
   --home-content-dir DIR    (default: alongside the new home manifest, its
                             own tree/ subdirectory -- nix/home.nix's
-                            render's own $out/tree layout)
+                            render's own \$out/tree layout)
 
 See SPEC.md §4.3, §4.5 for the full verb semantics.
 USAGE

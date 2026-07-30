@@ -322,10 +322,12 @@ let
   # ipEntryLines -- the fields `interfaces.<name>` and `wifi.<name>` share
   # (dhcp4/dhcp6/addresses/routes/nameservers), rendered at indent level n.
   ipEntryLines = n: e:
-    (boolLine n "dhcp4" e.dhcp4)
-    :: (boolLine n "dhcp6" e.dhcp6)
-    :: (lib.optionals (e.addresses != [ ]) (
-      (ln n "addresses:") :: (map (a: ln (n + 1) "- ${a}") e.addresses)
+    [
+      (boolLine n "dhcp4" e.dhcp4)
+      (boolLine n "dhcp6" e.dhcp6)
+    ]
+    ++ (lib.optionals (e.addresses != [ ]) (
+      [ (ln n "addresses:") ] ++ (map (a: ln (n + 1) "- ${a}") e.addresses)
     ))
     ++ (lib.optionals (e.gateway != null) [
       (ln n "routes:")
@@ -351,7 +353,7 @@ let
     else
       [ (ln 1 "ethernets:") ]
       ++ (lib.concatMap
-        (name: (ln 2 "${name}:") :: (ipEntryLines 3 interfaces.${name}))
+        (name: [ (ln 2 "${name}:") ] ++ (ipEntryLines 3 interfaces.${name}))
         (builtins.attrNames interfaces));
 
   wifisBlock = wifi:
@@ -360,8 +362,8 @@ let
       [ (ln 1 "wifis:") ]
       ++ (lib.concatMap
         (name:
-          (ln 2 "${name}:")
-          :: (ipEntryLines 3 wifi.${name})
+          [ (ln 2 "${name}:") ]
+          ++ (ipEntryLines 3 wifi.${name})
           ++ (accessPointLines 3 wifi.${name}))
         (builtins.attrNames wifi));
 

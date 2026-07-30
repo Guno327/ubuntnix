@@ -66,7 +66,17 @@ it never emits its own netplan config and ubuntnix's own
    itself is real and unit-tested
    (`tests/unit/205-ubx-flake-init.sh`) ahead of that.
 4. Prompt for an Ubuntu Pro token (required; free personal tokens exist),
-   store it via the secrets mechanism, and attach the machine.
+   store it via the secrets mechanism, and attach the machine. `bin/
+   ubx-pro-token` (GitHub issue #115) is this step's mechanism today — it
+   captures a token (`--token`/`--token-file`/an interactive echo-off `
+   /dev/tty` prompt), writes it to the flake's own
+   `secrets/pro-token` (git-crypt-encrypted at rest by the template step 3
+   already materialized) and commits it idempotently, then drives the
+   already-landed `bin/ubx-pro-apply` executor's real `attach` action with
+   it — see {doc}`pro`'s own "Install-time attach: `bin/ubx-pro-token`"
+   section for the full flow. Wiring it to run unattended at real install
+   time is still milestone **M7**; the flow itself is real and
+   unit-tested (`tests/unit/206-ubx-pro-token.sh`) ahead of that.
 5. Finish by encouraging the user to add a git remote for `/flake` so the
    machine's definition is durably backed up off-device.
 

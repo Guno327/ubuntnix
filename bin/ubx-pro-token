@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# bin/ubx-pro-token — the install-time Ubuntu Pro TOKEN prompt+store+attach
+# step (SPEC.md §10 installer step 4: "prompts for an Ubuntu Pro token
+# (required; free personal tokens), stores it via the secrets mechanism,
+# and attaches"; SPEC.md §8.2 "Attachment happens at install time ... and
+# the token is managed thereafter through the secrets mechanism"; SPEC.md
+# §11 milestone M7; GitHub issue #115).
+#
+# -- What this script is, and what it deliberately is NOT -------------------
+#
+# A COMPOSITION, not a reimplementation, of already-landed, already-tested
+# mechanisms — exactly bin/ubx-flake-init's own posture (see that script's
+# header):
+#
+#   - `secrets/index.nix` (issue #79, materialized into a real `/flake` by
+#     bin/ubx-flake-init, issue #114) already declares `proToken = { src =
+#     ./pro-token; owner = "root"; mode = "0400"; }`. This script does not
+#     invent a new secret name or a new declaration shape; it writes real
+#     token BYTES to exactly the path that declaration already names,
+#     `<flake>/secrets/pro-token`, and nothing else.
+#   - `secrets/.gitattributes` (issue #79) is what actually encrypts
+#     `secrets/pro-token` at rest the moment this script `git add`s it —
+#     this script never touches git-crypt's clean/smudge filter, a GPG
+#     key, or `.git-crypt/` itself; it relies entirely on bin/ubx-flake-init
+#     (SPEC.md §10 installer step 3, issue #114) having already run against
+#     the same `--flake` dir and left it git-crypt-initialized and unlocked
+#     under this machine's own key. This script does not re-run, and does
+#     not need to re-run, any of that setup.
+#   - `bin/ubx-pro-apply` (issue #82, milestone M4) is the ONLY place a
+#     real `pro attach` call is ever issued, gated behind its own
+#     `--pro-bin`/`UBX_PRO_CMD` mock seam and its own "skip cleanly, never
+#     fail" availability checks (see that script's header, "Availability").
+#     This script never shells out to a `pro` binary itself — it hands
+#     `ubx-pro-apply` a minimal, hand-built one-action PLAN (`{"op":
+#     "attach", "tokenSecretName": ...}`) and lets that executor's own,
+#     already-tested attach codepath do the real work.
+#
+# Why a hand-built plan, not `bin/ubx-pro plan`: that planner's own input
+# is a MANIFEST rendered by `nix/pro.nix` from a machine's live, evaluated
+# configuration (`ubuntnix.pro.enable`, etc — see that script's header,
+# "The manifest schema") — evaluating that at THIS point in the installer
+# is circular (the very configuration being evaluated is what this install
+# run is still assembling; nothing has been built or switched to yet).
+# SPEC.md §10 step 4 asks for exactly one unconditional action — store the
+# token, then attach — not a general Pro convergence decision (enable/
+# disable esm-apps/livepatch are `ubx rebuild switch`'s own job, once a
+# real generation with `ubuntnix.pro.*` set is built and switched to, same
+# as every other declarative domain). A single-action `attach` plan is the
+# smallest input that drives ubx-pro-apply's real, tested attach codepath
+# without this script re-deriving any part of that planner's own logic.
+#
+# -- Token handling: value never touches stdout/stderr/logs -----------------
+#
+# Mirrors bin/ubx-pro-apply's own "Token handling" (see that script's
+# header) and bin/ubx-pro's own "THE ABSOLUTE INVARIANT": the token value
+# is read once (flag, file, or an interactive `/dev/tty` prompt with echo
+# off), written ONLY as raw bytes to two files this script itself controls
+# (`<flake>/secrets/pro-token`, and — the same "materialize as needed"
+# ubx-pro-apply's own attach codepath reads from — `<run-secrets-dir>/
+# <secret-name>`), and never interpolated into any `echo`/`printf .. >&2`/
+# die() message, any command's printed argv, or any file this script did
+# not itself just create for exactly this purpose. `set -x` is never
+# enabled here for the same reason.
+#
+# -- Materializing <run-secrets-dir>/<secret-name> ---------------------------
+#
+# A REAL install, at this exact installer step, has not yet run
+# bin/ubx-secrets-apply even once (SPEC.md's own ordering: `ubx-secrets-apply`
+# only ever runs as part of an `ubx rebuild switch|test|boot` convergence,
+# and the very first such convergence happens AFTER this installer step,
+# once the freshly-initialized `/flake` builds and switches for the first
+# time) — so there is no existing `/run/secrets/proToken` for
+# bin/ubx-pro-apply's own attach codepath to read yet. This script
+# materializes it itself, directly, with the exact mode
+# `secrets/index.nix`'s own `proToken.mode` ("0400") already declares —
+# not a general secrets-materialization reimplementation (that stays
+# bin/ubx-secrets-apply's job alone, exercised for real on the first
+# `ubx rebuild switch` right after this step), just the one file this
+# step's own attach call needs to exist to read from, in the one place
+# ubx-pro-apply already knows to look (`--run-secrets-dir/<name>`, exactly
+# ubx-pro-apply's own "Path resolution" convention — see that script's
+# header). `chown root` is only attempted when running as root (mirrors
+# bin/ubx-secrets-apply's own "Privilege" posture); a non-root test run
+# simply skips it.
+#
+# -- Idempotence + commit identity -------------------------------------------
+#
+# Safe to re-run: writing the same token bytes twice leaves the flake
+# working tree clean (git sees no diff), so the commit step is skipped
+# exactly like bin/ubx-flake-init's own step 4 ("commit, only if the
+# working tree is actually dirty" — see that script's header). Re-running
+# with a DIFFERENT token (rotation) overwrites the file and commits the
+# change — this script does not attempt to distinguish "first token" from
+# "rotated token"; both are just "the working tree is dirty, so commit".
+# Commit identity is set repo-local (never `--global`), idempotently, the
+# same deterministic values and for the same reason bin/ubx-flake-init's
+# own "Commit identity" section documents (a freshly-installed machine has
+# no reason to already carry an ambient git identity).
+set -euo pipefail
+
+prog_name="ubx-pro-token"
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+
+default_flake="/flake"
+default_secret_name="proToken"
+default_run_secrets_dir="/run/secrets"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-pro-token [--flake DIR] (--token VALUE | --token-file FILE)
+                      [--secret-name NAME] [--run-secrets-dir DIR]
+                      [--pro-bin CMD] [--dry-run]
+
+Prompts for (or accepts) an Ubuntu Pro token, stores it via the secrets
+mechanism (git-crypt-encrypted at rest under <flake>/secrets/pro-token —
+SPEC.md §10 installer step 4, §8.1), and attaches through the already-
+landed bin/ubx-pro-apply executor.
+
+  --flake DIR            target flake directory, already initialized by
+                          ubx-flake-init (default /flake)
+  --token VALUE           the token value directly (never logged; prefer
+                          --token-file or the interactive prompt on a real
+                          machine -- a literal argv is visible to other
+                          processes via /proc/<pid>/cmdline)
+  --token-file FILE       read the token from FILE (trailing newline
+                          stripped)
+  --secret-name NAME      the secrets/index.nix declared name the token is
+                          stored under (default proToken, matching that
+                          template's own proToken.src)
+  --run-secrets-dir DIR   where the token is materialized for
+                          ubx-pro-apply's own attach codepath to read, as
+                          DIR/<secret-name> (default /run/secrets; override
+                          for testing -- never a real /run in tests)
+  --pro-bin CMD           passthrough to ubx-pro-apply's own --pro-bin
+                          (default $UBX_PRO_CMD, else "pro" -- see that
+                          script's header, "The injectable pro-mutation
+                          command seam")
+  --dry-run               print, don't run the real attach (passthrough to
+                          ubx-pro-apply; the token is still stored+
+                          committed either way -- storing is not itself a
+                          live-system mutation the way attach is)
+
+With neither --token nor --token-file, and stdin is a tty, prompts
+interactively with echo off (never --dry-run-only; a real install always
+needs a real value one way or another). Missing token in any other case is
+a required-field error, exit 1.
+USAGE
+}
+
+resolve_token() {
+  local token_opt="$1" token_file_opt="$2"
+  local token=""
+
+  if [ -n "$token_opt" ]; then
+    token="$token_opt"
+  elif [ -n "$token_file_opt" ]; then
+    [ -f "$token_file_opt" ] || die "no such --token-file: $token_file_opt"
+    token="$(cat -- "$token_file_opt")"
+  elif [ -t 0 ] && [ -r /dev/tty ]; then
+    local prompted=""
+    read -r -s -p "Ubuntu Pro token (https://ubuntu.com/pro): " prompted < /dev/tty
+    echo >&2
+    token="$prompted"
+  else
+    die "no Ubuntu Pro token provided -- required field (use --token, --token-file, or run interactively)"
+  fi
+
+  [ -n "$token" ] || die "Ubuntu Pro token is empty -- required field"
+  printf '%s' "$token"
+}
+
+main() {
+  local flake="$default_flake" token_opt="" token_file_opt=""
+  local secret_name="$default_secret_name" run_secrets_dir="$default_run_secrets_dir"
+  local pro_bin="${UBX_PRO_CMD:-pro}" dry_run=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --flake) [ $# -ge 2 ] || die "--flake requires an argument"; flake="$2"; shift 2 ;;
+      --token) [ $# -ge 2 ] || die "--token requires an argument"; token_opt="$2"; shift 2 ;;
+      --token-file) [ $# -ge 2 ] || die "--token-file requires an argument"; token_file_opt="$2"; shift 2 ;;
+      --secret-name) [ $# -ge 2 ] || die "--secret-name requires an argument"; secret_name="$2"; shift 2 ;;
+      --run-secrets-dir) [ $# -ge 2 ] || die "--run-secrets-dir requires an argument"; run_secrets_dir="$2"; shift 2 ;;
+      --pro-bin) [ $# -ge 2 ] || die "--pro-bin requires an argument"; pro_bin="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+
+  [ -z "$token_opt" ] || [ -z "$token_file_opt" ] ||
+    die "--token and --token-file are mutually exclusive"
+
+  command -v git >/dev/null 2>&1 || die "git is required but not installed"
+  [ -d "$flake/.git" ] || die "$flake is not a git repository -- run ubx-flake-init first (SPEC.md §10 installer step 3)"
+  [ -f "$flake/secrets/index.nix" ] || die "$flake/secrets/index.nix is missing -- run ubx-flake-init first"
+
+  local token
+  token="$(resolve_token "$token_opt" "$token_file_opt")"
+
+  # Repo-local commit identity, idempotent -- see this script's header,
+  # "Idempotence + commit identity", and bin/ubx-flake-init's own "Commit
+  # identity" section for why LOCAL (never --global) and why deterministic.
+  git -C "$flake" config user.name "ubuntnix installer"
+  git -C "$flake" config user.email "installer@ubuntnix.invalid"
+
+  local secret_rel="secrets/pro-token"
+  mkdir -p -- "$flake/secrets"
+  # A prior run's 0400 (below) would otherwise make a REWRITE (rotation,
+  # or this exact idempotent rerun) fail with "Permission denied" as a
+  # non-root user who owns but cannot write their own 0400 file -- ensure
+  # writable first, every time, before the write this script itself is
+  # about to do.
+  [ ! -e "$flake/$secret_rel" ] || chmod u+w -- "$flake/$secret_rel" 2>/dev/null || true
+  # Raw bytes only, no trailing newline this script itself adds -- exactly
+  # the bytes ubx-pro-apply's own ubx_pro_attach_from_file later `cat`s
+  # back out verbatim (see that script's header, "Token handling").
+  printf '%s' "$token" > "$flake/$secret_rel"
+  chmod 0400 "$flake/$secret_rel" 2>/dev/null || true
+
+  ( cd -- "$flake" && git add -- "$secret_rel" )
+  if [ -z "$(cd -- "$flake" && git status --porcelain -- "$secret_rel")" ]; then
+    echo "$prog_name: $flake/$secret_rel already matches the stored token -- skipping commit (idempotent)" >&2
+  else
+    ( cd -- "$flake" && git commit --quiet -m "ubx-pro-token: store Ubuntu Pro token" -- "$secret_rel" )
+    echo "$prog_name: committed $secret_rel in $flake" >&2
+  fi
+
+  # -- materialize <run-secrets-dir>/<secret-name> for ubx-pro-apply's own
+  # attach codepath to read -- see this script's header, "Materializing
+  # <run-secrets-dir>/<secret-name>".
+  mkdir -p -- "$run_secrets_dir"
+  local materialized="$run_secrets_dir/$secret_name"
+  [ ! -e "$materialized" ] || chmod u+w -- "$materialized" 2>/dev/null || true
+  printf '%s' "$token" > "$materialized"
+  chmod 0400 "$materialized" 2>/dev/null || true
+  if [ "$(id -u)" = 0 ]; then
+    chown root:root "$materialized" 2>/dev/null || true
+  fi
+
+  # -- hand-built, single-action attach plan -- see this script's header,
+  # "Why a hand-built plan, not `bin/ubx-pro plan`".
+  local plan
+  plan="$(mktemp)"
+  # shellcheck disable=SC2064  # intentional: expand $plan NOW (mirrors
+  # bin/ubx-pro-apply's own identical trap comment)
+  trap "rm -f '$plan'" EXIT
+  printf '{"version": 1, "empty": false, "actions": [{"op": "attach", "tokenSecretName": %s}]}\n' \
+    "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$secret_name")" > "$plan"
+
+  local apply_args=(--plan "$plan" --run-secrets-dir "$run_secrets_dir" --secret-name "$secret_name" --pro-bin "$pro_bin")
+  if [ "$dry_run" = 1 ]; then
+    apply_args+=(--dry-run)
+  else
+    apply_args+=(--apply)
+  fi
+  "$bin_dir/ubx-pro-apply" "${apply_args[@]}"
+}
+
+main "$@"

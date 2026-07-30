@@ -234,6 +234,64 @@ exercises `switch`/`test`/`boot`/`rollback`/`diff` end to end behind a mock
 mock's very first recorded call is a real `attach` reading the token the
 secrets block, running immediately before it, just materialized.
 
+## Install-time attach: `bin/ubx-pro-token`
+
+`SPEC.md` §10 installer step 4: *"prompts for an Ubuntu Pro token
+(required; free personal tokens), stores it via the secrets mechanism, and
+attaches"* (GitHub issue #115). This is the ONE-SHOT install-time step that
+gets a real token into a freshly-initialized `/flake` and drives the very
+first real attach — distinct from, and running strictly before, the
+declarative `ubuntnix.pro.*`/`bin/ubx-pro plan`/`bin/ubx-pro-apply`
+convergence loop described above (which only starts converging once the
+machine's first real generation, with `ubuntnix.pro.enable` actually set,
+builds and switches).
+
+```
+ubx-pro-token [--flake DIR] (--token VALUE | --token-file FILE)
+              [--secret-name NAME] [--run-secrets-dir DIR]
+              [--pro-bin CMD] [--dry-run]
+```
+
+It composes, rather than reimplements, three already-landed mechanisms:
+
+- `secrets/index.nix`'s own `proToken = { src = ./pro-token; ... }`
+  declaration ({doc}`secrets`, issue #79) names exactly where the token's
+  bytes belong — `<flake>/secrets/pro-token` — which `bin/ubx-flake-init`
+  (issue #114, this page's sibling {doc}`install` step 3) has already
+  materialized the git-crypt-encrypting template for by the time this step
+  runs;
+- `secrets/.gitattributes`' `*` rule is what actually encrypts
+  `secrets/pro-token` at rest the moment this script `git add`s and commits
+  it — `ubx-pro-token` never touches git-crypt/GPG machinery itself, it
+  relies entirely on step 3 having already run;
+- `bin/ubx-pro-apply`'s own real, tested `attach` codepath (above) is the
+  only place a `pro attach` call is actually issued — `ubx-pro-token` hands
+  it a minimal, hand-built one-action plan (`{"op": "attach",
+  "tokenSecretName": ...}`) rather than going through `bin/ubx-pro plan`,
+  because that planner's own input (a manifest rendered from a live,
+  evaluated `ubuntnix.pro.*` configuration) does not exist yet at this
+  point in a real install — nothing has been built or switched to.
+
+Since `bin/ubx-secrets-apply` has not run yet either at this installer
+step, `ubx-pro-token` also materializes `--run-secrets-dir/<secret-name>`
+(default `/run/secrets/proToken`) itself, with the same `0400` mode
+`secrets/index.nix`'s own `proToken.mode` declares, purely so
+`bin/ubx-pro-apply`'s existing attach codepath has a file to read from in
+the one place it already knows to look.
+
+Exactly this page's own "THE ABSOLUTE INVARIANT": the token value never
+appears in this script's own stdout/stderr, in any printed command, or
+anywhere in the git object store except as git-crypt ciphertext —
+`tests/unit/206-ubx-pro-token.sh` proves the committed blob is not the
+plaintext token, greps the *entire* git object store for the raw value,
+and proves a real attach call (behind the same `--pro-bin` mock seam
+`bin/ubx-pro-apply` already establishes) actually fires with the stored
+token. Safe to re-run: an unchanged token is a real no-op commit; a
+different token (rotation) overwrites and re-commits, and still drives a
+fresh attach call each time — this script's own job is "make sure it's
+stored and attached," not "was it already attached" (that distinction is
+`bin/ubx-pro plan`'s job, once the declarative loop above takes over).
+
 See {doc}`secrets` for the underlying secrets primitive this page's token
 reference sources from, and {doc}`ubx` for the shared domain-plan/
 `execute_domains` orchestration concepts this page's wiring section

@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# bin/ubx-flake-init — the single idempotent /flake INIT flow (SPEC.md §10
+# installer step 3: "Initialize `/flake` as a git repository containing
+# that example configuration, with git-crypt set up for the `secrets/`
+# folder and a generated per-machine GPG identity added as a
+# collaborator"; SPEC.md §8.1 "The installer generates a machine keypair
+# (stored root-only outside the store) and adds it as a git-crypt
+# collaborator"; GitHub issue #114).
+#
+# -- What this script is, and what it deliberately is NOT -------------------
+#
+# A COMPOSITION, not a reimplementation, of already-landed, already-tested
+# mechanisms:
+#
+#   - `secrets/.gitattributes` + `secrets/index.nix` (issue #79) — the
+#     git-crypt encryption-boundary TEMPLATE this script materializes
+#     verbatim into the target flake's own `secrets/` folder. See those
+#     files' own headers for why the boundary is drawn where it is.
+#   - `bin/ubx-secrets-key machine-init` (issue #79) — the per-machine GPG
+#     identity generator + git-crypt collaborator-onboarder. This script
+#     CALLS it (see step 5 below); it never generates a key or shells out
+#     to `git-crypt add-gpg-user` itself.
+#   - `nix/installer.nix`'s `compileAnswers` (issue #113) — the
+#     answers→config COMPILER. This script does not run it; it only knows
+#     how to seed a compiled config FILE (`--config`) into the flake it
+#     initializes. Wiring an installer's live compiled output through here
+#     is the caller's job, not this script's.
+#
+# This script's own job is exactly the five steps SPEC.md §10's installer
+# step 3 names, each independently idempotent so the WHOLE flow is safe to
+# invoke more than once against the same `--flake` dir (e.g. a rerun after
+# an interrupted first attempt, or `ubx rebuild` calling it defensively on
+# every boot the same way `ubx-secrets-key machine-init` is already
+# designed to be re-invoked — see that script's own "Idempotence" header
+# section):
+#
+#   1. `git init` the flake dir, only if it is not already a git repo.
+#   2. Materialize the compiled config + the `secrets/` git-crypt template,
+#      only creating/overwriting files that are actually missing or
+#      changed.
+#   3. `git-crypt init`, only if the repo has no `.git-crypt/` yet.
+#   4. Commit, only if the working tree is actually dirty (never an empty
+#      commit).
+#   5. `ubx-secrets-key machine-init --repo` — generate/reuse this
+#      machine's own GPG identity and onboard it as a git-crypt
+#      collaborator (that script's own idempotence covers this step
+#      entirely; see its header).
+#
+# -- Commit identity -----------------------------------------------------
+#
+# A freshly-initialized machine has no reason to already carry a global
+# `user.name`/`user.email` (and must not depend on one existing) — every
+# commit this script makes uses `git -c user.name=... -c user.email=...`
+# scoped to that one invocation, never `git config --global` and never a
+# bare `git commit` relying on ambient config. The identity is
+# deterministic (not e.g. timestamp-derived) so a rerun's would-be commit,
+# were the tree not already clean, is reproducible.
+#
+# -- Where the compiled config lands --------------------------------------
+#
+# `--config FILE` (default: `examples/server.nix`, resolved relative to
+# this project's own repo root — via `UBX_REPO_ROOT` if set, else this
+# script's own location under `bin/`) is copied verbatim to
+# `<flake>/configuration.nix`. This is a deliberately simple, single-file
+# layout for this issue: SPEC.md §10 step 2 already establishes that the
+# initial generation IS one of the parity example configs (or an
+# installer-compiled equivalent shape, issue #113); this script does not
+# invent a new flake.nix/module-import structure on top of that — a real
+# `/flake` growing a `flake.nix` that imports `configuration.nix` (and
+# eventually `secrets/index.nix`) is downstream installer/base-module
+# wiring, not this issue's own scope.
+set -euo pipefail
+
+prog_name="ubx-flake-init"
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="${UBX_REPO_ROOT:-$(cd "$bin_dir/.." && pwd)}"
+
+default_flake="/flake"
+default_config="$repo_root/examples/server.nix"
+default_gnupg_home="/var/lib/ubuntnix/secrets-gpg"
+
+die() {
+  echo "$prog_name: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+usage: ubx-flake-init [--flake DIR] [--config FILE] [--gnupg-home DIR] [--uid UID]
+
+  --flake DIR       target flake directory to initialize (default /flake)
+  --config FILE     compiled config to seed as <flake>/configuration.nix
+                     (default: this repo's examples/server.nix)
+  --gnupg-home DIR  passthrough to `ubx-secrets-key machine-init
+                     --gnupg-home` (default /var/lib/ubuntnix/secrets-gpg;
+                     override for testing -- never a real /var in tests)
+  --uid UID         passthrough to `ubx-secrets-key machine-init --uid`
+
+Idempotent: safe to re-run against an already-initialized --flake -- see
+this script's own header, "What this script is, and what it deliberately
+is NOT".
+USAGE
+}
+
+ensure_git() {
+  command -v git >/dev/null 2>&1 || die "git is required but not installed"
+}
+
+ensure_git_crypt() {
+  command -v git-crypt >/dev/null 2>&1 || die "git-crypt is required but not installed"
+}
+
+# -- copy_if_changed SRC DST: materialize SRC at DST, but only actually
+# write (and thus only actually touch DST's mtime / dirty the working
+# tree) when DST is absent or its content differs from SRC. This is what
+# makes step 2 a real no-op on a rerun instead of merely "the bytes end up
+# the same but the file was rewritten anyway" -- irrelevant for git's own
+# diff (content-addressed), but keeps this idempotent in the more general
+# "did we touch the filesystem at all" sense too. ---------------------------
+copy_if_changed() {
+  local src="$1" dst="$2"
+  if [ -f "$dst" ] && cmp -s -- "$src" "$dst"; then
+    return 0
+  fi
+  mkdir -p -- "$(dirname -- "$dst")"
+  cp -- "$src" "$dst"
+}
+
+main() {
+  local flake="$default_flake" config="$default_config"
+  local gnupg_home="$default_gnupg_home" uid=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --flake) [ $# -ge 2 ] || die "--flake requires an argument"; flake="$2"; shift 2 ;;
+      --config) [ $# -ge 2 ] || die "--config requires an argument"; config="$2"; shift 2 ;;
+      --gnupg-home) [ $# -ge 2 ] || die "--gnupg-home requires an argument"; gnupg_home="$2"; shift 2 ;;
+      --uid) [ $# -ge 2 ] || die "--uid requires an argument"; uid="$2"; shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      *) echo "$prog_name: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+  done
+
+  ensure_git
+  ensure_git_crypt
+  [ -f "$config" ] || die "no such config file: $config"
+  [ -f "$repo_root/secrets/.gitattributes" ] || die "template not found: $repo_root/secrets/.gitattributes"
+  [ -f "$repo_root/secrets/index.nix" ] || die "template not found: $repo_root/secrets/index.nix"
+
+  mkdir -p -- "$flake"
+
+  # -- step 1: git init, only if not already a repo --------------------------
+  if [ -d "$flake/.git" ]; then
+    echo "$prog_name: $flake is already a git repository -- skipping git init (idempotent)" >&2
+  else
+    git -C "$flake" init --quiet -b main
+    echo "$prog_name: initialized git repository at $flake" >&2
+  fi
+
+  # -- step 2: materialize the compiled config + the secrets/ template -------
+  copy_if_changed "$config" "$flake/configuration.nix"
+  copy_if_changed "$repo_root/secrets/.gitattributes" "$flake/secrets/.gitattributes"
+  copy_if_changed "$repo_root/secrets/index.nix" "$flake/secrets/index.nix"
+
+  # -- step 3: git-crypt init, only if not already initialized ---------------
+  if [ -d "$flake/.git-crypt" ]; then
+    echo "$prog_name: git-crypt is already initialized in $flake -- skipping (idempotent)" >&2
+  else
+    ( cd -- "$flake" && git-crypt init )
+    echo "$prog_name: initialized git-crypt in $flake" >&2
+  fi
+
+  # -- step 4: commit, only if the working tree is actually dirty ------------
+  #
+  # `git status --porcelain` covers both untracked files (the very first
+  # run) and modified-but-tracked ones (a rerun where --config's content
+  # legitimately changed) -- empty output means a real no-op rerun, so no
+  # commit (and no git-crypt re-filtering churn) happens at all.
+  ( cd -- "$flake" && git add -A )
+  if [ -z "$(cd -- "$flake" && git status --porcelain)" ]; then
+    echo "$prog_name: $flake working tree is already clean -- skipping commit (idempotent)" >&2
+  else
+    (
+      cd -- "$flake"
+      git -c user.name="ubuntnix installer" -c user.email="installer@ubuntnix.invalid" \
+        commit --quiet -m "ubx-flake-init: initialize /flake"
+    )
+    echo "$prog_name: committed /flake initialization in $flake" >&2
+  fi
+
+  # -- step 5: generate/reuse the machine's own GPG identity and onboard it
+  # as a git-crypt collaborator -- ubx-secrets-key machine-init's own
+  # idempotence (see that script's header) covers this step entirely; this
+  # script never generates a key or calls `git-crypt add-gpg-user` itself. -
+  local key_args=(--gnupg-home "$gnupg_home" --repo "$flake")
+  [ -n "$uid" ] && key_args+=(--uid "$uid")
+  "$bin_dir/ubx-secrets-key" machine-init "${key_args[@]}" >/dev/null
+
+  # `add_collaborator`'s own commit (inside ubx-secrets-key, when it
+  # actually adds a NEW collaborator) is the only other thing that can
+  # dirty the tree after step 4 -- nothing further to commit here.
+
+  # -- step 6: leave the repo unlocked with a clean git-crypt status ---------
+  #
+  # The key just generated/reused in step 5 is now a collaborator, so this
+  # repo's own working tree -- encrypted under the key this same call just
+  # onboarded -- is already the plaintext this process itself just wrote;
+  # `git-crypt unlock` is what a FRESH clone needs, not the repo that did
+  # the encrypting. `git-crypt status` here is the actual assertion this
+  # script makes about its own end state: nothing left encrypted-but-
+  # should-be-plaintext-looking or vice versa.
+  ( cd -- "$flake" && GNUPGHOME="$gnupg_home" git-crypt status ) >/dev/null
+
+  echo "$prog_name: $flake is initialized and unlocked" >&2
+}
+
+main "$@"

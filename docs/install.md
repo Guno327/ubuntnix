@@ -55,7 +55,16 @@ it never emits its own netplan config and ubuntnix's own
    `examples/desktop.nix`, per the Desktop-vs-Server choice above).
 3. Initialize `/flake` as a git repository containing that example
    configuration, with git-crypt set up for the `secrets/` folder and a
-   generated per-machine GPG identity added as a collaborator.
+   generated per-machine GPG identity added as a collaborator. `bin/
+   ubx-flake-init` (GitHub issue #114) is this step's mechanism today —
+   a single idempotent flow that composes `git init`, materializing the
+   compiled config and the `secrets/.gitattributes`/`index.nix`
+   git-crypt template, `git-crypt init`, an initial commit, and
+   `ubx-secrets-key machine-init --repo` (issue #79's machine-identity/
+   collaborator onboarding) into one command. Wiring it to run
+   unattended at real install time is still milestone **M7**; the flow
+   itself is real and unit-tested
+   (`tests/unit/205-ubx-flake-init.sh`) ahead of that.
 4. Prompt for an Ubuntu Pro token (required; free personal tokens exist),
    store it via the secrets mechanism, and attach the machine.
 5. Finish by encouraging the user to add a git remote for `/flake` so the

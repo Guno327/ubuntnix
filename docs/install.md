@@ -102,5 +102,18 @@ configurations the installer will hand off to — `examples/server.nix`
 (M5, proven end-to-end in QEMU by `tests/e2e/050-qemu-server-parity-e2e.sh`)
 and `examples/desktop.nix` (M6, proven by
 `tests/e2e/070-qemu-desktop-parity-e2e.sh`) — already land ahead of M7.
+
+The M7 exit proof itself — a QEMU end-to-end test that boots the installer
+ISO, drives it non-interactively through compiled autoinstall answers,
+reboots into the freshly installed system, and asserts it matches an
+upstream install (package-set parity per `SPEC.md` §11 R11, `/flake` present
+as a git-crypt-protected git repo carrying the machine's generated GPG key,
+Ubuntu Pro attached when a token is supplied, a generation marker and GRUB
+present, and a re-run `ubx rebuild switch` converging cleanly) — lives in
+`tests/e2e/080-qemu-installer-parity-e2e.sh` (GitHub issue #119). The host-
+side harness and its skip logic are already landed and exercised in CI by
+`tests/unit/207-qemu-installer-parity-e2e-cli.sh`; the full boot-and-assert
+proof self-skips until issue #117 produces a bootable `.#installer-iso`.
+
 Full-disk encryption groundwork begins at M4/M5; TPM-backed auto-unlock is
 a post-v1 stretch goal.

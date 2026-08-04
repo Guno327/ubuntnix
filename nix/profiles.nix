@@ -173,8 +173,12 @@ let
   # packages) that happen to share the one project-wide lockfile with every
   # real boot-critical package (kernel, grub, filesystem tools, ...) — see
   # archive.packages.json's own header for why the lockfile is one shared
-  # set rather than per-consumer subsets. None of the four is a real member
-  # of any upstream Ubuntu Server install.
+  # set rather than per-consumer subsets. They are excluded from the parity
+  # diff because of that proof-fixture role, NOT because they are absent
+  # from upstream: `htop`, `ed`, and `jq` are in fact present in the
+  # upstream Ubuntu 24.04.3 Server manifest (see
+  # tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.manifest)
+  # — only `hello` is genuinely non-upstream.
   serverSeedExceptions = [ "hello" "htop" "ed" "jq" ];
 
   serverSeedPackages =
@@ -294,8 +298,12 @@ let
   # See header, "Desktop" / "What 'the upstream Server seed' means in this
   # repo". Same four M1 stdenv/archive-fetch proof fixtures as
   # `serverSeedExceptions` -- they share the one project-wide lockfile
-  # (archive.packages.json's own header) and are equally not real members
-  # of any upstream Desktop seed.
+  # (archive.packages.json's own header) and are excluded from the parity
+  # diff for that same proof-fixture reason, NOT because they are absent
+  # from upstream: `htop`, `ed`, and `jq` are in fact present in the
+  # upstream Ubuntu 24.04.3 Server manifest (see
+  # tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.manifest)
+  # — only `hello` is genuinely non-upstream.
   desktopSeedExceptions = [ "hello" "htop" "ed" "jq" ];
 
   desktopSeedPackages =

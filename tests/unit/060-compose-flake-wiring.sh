@@ -162,6 +162,19 @@ grep -q -- '-processors 1' "$compose_nix" ||
 grep -q 'touch.*-d @0' "$compose_nix" ||
   fail "$compose_nix does not reset mtimes to the epoch for cross-build comparability"
 
+# Regression guard (GitHub issue #118): the in-chroot configure script MUST
+# reset TMPDIR to a real in-chroot path. A Nix build inherits TMPDIR pointing
+# at the outer sandbox dir (e.g. /build), which does not exist inside the
+# chroot, so any maintainer script calling `mktemp` (openssh-server's postinst
+# — first pulled in by the #118 Server seed — is the canonical case) dies and
+# cascades `dpkg --configure -a` into failure. Assert the reset is present, and
+# that the compose-time temp residue is scrubbed before packing so R1
+# determinism holds.
+grep -qE 'export[[:space:]]+TMPDIR=/tmp' "$compose_nix" ||
+  fail "$compose_nix does not reset TMPDIR to an in-chroot path before dpkg --configure (issue #118: mktemp in postinsts dies on the inherited outer-sandbox TMPDIR)"
+grep -qE 'rm -rf /tmp/\*' "$compose_nix" ||
+  fail "$compose_nix does not scrub the in-chroot /tmp before packing (issue #118 R1 determinism)"
+
 # -- CI wiring ---------------------------------------------------------------
 ci_yml=".github/workflows/ci.yml"
 [ -f "$ci_yml" ] || fail "$ci_yml does not exist"

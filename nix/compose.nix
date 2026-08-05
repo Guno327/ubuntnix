@@ -510,6 +510,27 @@ let
         export DEBCONF_NONINTERACTIVE_SEEN=true
         export LC_ALL=C LANG=C
 
+        # In-chroot TMPDIR reset (GitHub issue #118 regression). A Nix build
+        # exports TMPDIR/TMP/TEMP/TEMPDIR all pointing at the *outer* build
+        # sandbox dir (e.g. /build), and those values are inherited straight
+        # through the chroot below — where that path does not exist. Any
+        # maintainer script that calls `mktemp` then dies: the openssh-server
+        # postinst (first pulled in by the #118 Server seed expansion:
+        # openssh-server, cloud-init, netplan.io) does exactly this to stage
+        # its host-key generation, hitting
+        # `mktemp: failed to create file via template '/build/tmp.XXXXXXXXXX':
+        # No such file or directory`, which aborts `dpkg --configure -a` and
+        # cascades (ca-certificates, python3-certifi, python3-requests,
+        # cloud-init all left unconfigured). Point every temp-dir variable at
+        # a real in-chroot path and make sure it exists with the canonical
+        # world-writable-sticky mode. Ubuntu base ships /tmp already; the
+        # mkdir/chmod are idempotent belt-and-suspenders so this holds even if
+        # a future base image omits it. Anything written here during configure
+        # is scrubbed before the rootfs is packed (see the /tmp cleanup near
+        # this script's end), so R1 determinism is preserved.
+        export TMPDIR=/tmp TMP=/tmp TEMP=/tmp TEMPDIR=/tmp
+        mkdir -p /tmp && chmod 1777 /tmp
+
         # R1 determinism (issue #22): pin Perl's per-process hash-iteration
         # randomization (perlsec(1); default since Perl 5.18, a
         # hardening measure against algorithmic-complexity attacks, not a
@@ -809,6 +830,15 @@ let
 
         # Compose-time staging is not part of the composed system.
         rm -rf /.ubx-compose
+
+        # R1 determinism (issue #118): scrub anything maintainer scripts left
+        # in the in-chroot TMPDIR (/tmp, set at the top of this script) during
+        # `dpkg --configure -a`. A real Ubuntu install boots with an empty
+        # /tmp (tmpfs), so removing compose-time temp residue matches the
+        # shipped state and keeps the packed tree build-invariant. The
+        # directory itself is kept (with its 1777 mode) — only its contents
+        # go. `.[!.]*` also catches dotfiles without matching `.`/`..`.
+        rm -rf /tmp/* /tmp/.[!.]* /tmp/..?* 2>/dev/null || true
 
         # R1 normalization (see this file's header): dpkg's own action log
         # is a literal timestamp transcript of this build.

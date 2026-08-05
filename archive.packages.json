@@ -3,6 +3,7 @@
   "series": "noble",
   "components": ["main", "universe"],
   "packages": [
+    "cloud-init",
     "dosfstools",
     "e2fsprogs",
     "ed",
@@ -19,7 +20,9 @@
     "libnl-genl-3-200",
     "linux-image-virtual",
     "mtools",
+    "netplan.io",
     "nix-bin",
+    "openssh-server",
     "parted",
     "squashfs-tools",
     "systemd-sysv",

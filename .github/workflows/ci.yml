@@ -19,7 +19,7 @@ jobs:
     name: Test suite
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install git-crypt (for the secrets round-trip test, #79)
         run: |
           sudo apt-get update
@@ -31,7 +31,7 @@ jobs:
     name: Shell lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck
         run: |
           # *.sh anywhere, plus extensionless scripts identified by a
@@ -56,7 +56,7 @@ jobs:
     name: Flake evaluation
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -340,7 +340,7 @@ jobs:
     name: Rootfs composition (SPEC.md §4.2/§11 M1; issue #9)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -558,7 +558,7 @@ jobs:
     name: Bootable disk image + QEMU e2e (SPEC.md §11 M1 exit criterion; issue #10)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -629,7 +629,7 @@ jobs:
     name: Server-parity QEMU e2e (SPEC.md §11 M5 exit criterion; issue #99)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -697,7 +697,7 @@ jobs:
     name: Desktop-parity QEMU e2e (SPEC.md §11 M6 exit criterion; issue #108)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -782,7 +782,7 @@ jobs:
     name: Installer-parity QEMU e2e (SPEC.md §11 M7 exit criterion; issue #119) -- expected to skip until issue #117 lands the installer ISO
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -850,7 +850,7 @@ jobs:
     name: Switch-loop QEMU e2e (SPEC.md §11 M2 exit criterion; issue #32)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -922,7 +922,7 @@ jobs:
     name: Soft-reboot re-exec QEMU e2e (GitHub issue #59, follow-up to #55/#58)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -983,7 +983,7 @@ jobs:
     name: M3 snap-convergence QEMU e2e (SPEC.md §11 M3 exit criterion; issue #64)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -1046,7 +1046,7 @@ jobs:
     name: Home-activation QEMU e2e (SPEC.md §9, §11 M5 exit criterion; issue #105)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
         run: |
           sudo apt-get update
@@ -1110,7 +1110,7 @@ jobs:
     name: Archive resolution (apt solver, end-to-end)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # apt-solver-based resolution (SPEC.md §4.4; GitHub issue #8,
       # milestone M1: "the `ubx update` archive-pins portion"). Runs
       # bin/ubx-resolve directly against a real snapshot.ubuntu.com
@@ -1125,7 +1125,7 @@ jobs:
       #
       # This resolves into THIS JOB'S OWN ephemeral checkout's
       # archive.lock.json only — every job here gets its own isolated
-      # checkout (actions/checkout@v4 above), so overwriting it has zero
+      # checkout (actions/checkout@v5 above), so overwriting it has zero
       # effect on the "flake" job's checkout, whose archive-fetch-proof
       # assertions are pinned to the COMMITTED lockfile's specific
       # packages/hashes. Nothing in this job pushes any change back to the
@@ -1170,7 +1170,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Same mechanism as the `resolve` job above (see its comments), but
       # its OUTPUT is the deliverable: the emitted lockfile is uploaded as
       # an artifact for the PM to download, review, and commit -- the

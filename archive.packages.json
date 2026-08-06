@@ -4,6 +4,7 @@
   "components": ["main", "universe"],
   "packages": [
     "cloud-init",
+    "cron",
     "dosfstools",
     "e2fsprogs",
     "ed",
@@ -24,6 +25,7 @@
     "nix-bin",
     "openssh-server",
     "parted",
+    "rsyslog",
     "squashfs-tools",
     "systemd-sysv",
     "tzdata",

@@ -87,6 +87,24 @@
         "size": 82668
       },
       {
+        "name": "cron",
+        "version": "3.0pl1-184ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/c/cron/cron_3.0pl1-184ubuntu2_amd64.deb",
+        "sha256": "5a257b6b3b05d290964f68868db8127cca7eeef64c30dc9586f46cd4f68f1b90",
+        "size": 85350
+      },
+      {
+        "name": "cron-daemon-common",
+        "version": "3.0pl1-184ubuntu2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/cron/cron-daemon-common_3.0pl1-184ubuntu2_all.deb",
+        "sha256": "289604310fb1e92b9dae924161f94194533af1fccef3b156f970e5365848ff34",
+        "size": 13578
+      },
+      {
         "name": "curl",
         "version": "8.5.0-2ubuntu10.11",
         "arch": "amd64",
@@ -645,6 +663,15 @@
         "size": 57810
       },
       {
+        "name": "libestr0",
+        "version": "0.1.11-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libe/libestr/libestr0_0.1.11-1build1_amd64.deb",
+        "sha256": "b3f55d93a7391e2c1ce5ef6765461fe3124e9f08fde90db25e1a14981c67672f",
+        "size": 7802
+      },
+      {
         "name": "libexpat1",
         "version": "2.6.1-2ubuntu0.4",
         "arch": "amd64",
@@ -670,6 +697,15 @@
         "path": "pool/main/f/fakeroot/libfakeroot_1.33-1_amd64.deb",
         "sha256": "a78087f50586595375f850b4445261f7a47a83005b05ce521331929fab49df4b",
         "size": 32374
+      },
+      {
+        "name": "libfastjson4",
+        "version": "1.2304.0-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libf/libfastjson/libfastjson4_1.2304.0-1build1_amd64.deb",
+        "sha256": "5ee94f099a0188055b0df3a151119aed95ba69c682955eb01661c0517df62ff9",
+        "size": 23106
       },
       {
         "name": "libfdisk1",
@@ -1912,6 +1948,15 @@
         "path": "pool/main/r/readline/readline-common_8.2-4build1_all.deb",
         "sha256": "879bfd7f8a9bc4c0f7cdc777cdd8bc6de5f8c4a2ac80c060322a1b22f13504bb",
         "size": 56484
+      },
+      {
+        "name": "rsyslog",
+        "version": "8.2312.0-3ubuntu9.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/r/rsyslog/rsyslog_8.2312.0-3ubuntu9.2_amd64.deb",
+        "sha256": "66cd3b735f9d3273f49e31213b93c1b6ffa4e12b0724b218ff6c3e67ee4e0899",
+        "size": 511264
       },
       {
         "name": "sensible-utils",

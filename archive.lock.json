@@ -42,6 +42,33 @@
         "size": 34534
       },
       {
+        "name": "ca-certificates",
+        "version": "20260601~24.04.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/ca-certificates/ca-certificates_20260601%7e24.04.1_all.deb",
+        "sha256": "6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50",
+        "size": 139430
+      },
+      {
+        "name": "cloud-guest-utils",
+        "version": "0.33-1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/cloud-utils/cloud-guest-utils_0.33-1_all.deb",
+        "sha256": "4a9a79b50a58c68c09430675cf4849abd6bd3ec386dc4c55c0f8e76acadfa441",
+        "size": 19528
+      },
+      {
+        "name": "cloud-init",
+        "version": "26.1-0ubuntu1~24.04.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/cloud-init/cloud-init_26.1-0ubuntu1%7e24.04.1_all.deb",
+        "sha256": "1cb0b11bcaf4d6578b45c86ccfc0b2ee28b7b233f0d6e7a3d1a35f615c8f9de8",
+        "size": 629412
+      },
+      {
         "name": "coreutils",
         "version": "9.4-3ubuntu6.2",
         "arch": "amd64",
@@ -159,6 +186,15 @@
         "size": 56062
       },
       {
+        "name": "ethtool",
+        "version": "1:6.7-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/e/ethtool/ethtool_6.7-1build1_amd64.deb",
+        "sha256": "b0f36f1da7a0438aac6e537453dc1a3c817b1b88e49230ed25943a94b73aa226",
+        "size": 228510
+      },
+      {
         "name": "fakeroot",
         "version": "1.33-1",
         "arch": "amd64",
@@ -166,6 +202,15 @@
         "path": "pool/main/f/fakeroot/fakeroot_1.33-1_amd64.deb",
         "sha256": "d58b7fc73f0b7ae8b9441b0aa41e44ead0d7e4deedf5aaf5696db182eac71031",
         "size": 67216
+      },
+      {
+        "name": "fdisk",
+        "version": "2.39.3-9ubuntu6.5",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/u/util-linux/fdisk_2.39.3-9ubuntu6.5_amd64.deb",
+        "sha256": "9c59ae2c2626cbd1d07a3aa6b244e34274fae937df64b07bdfe998f71ccde05c",
+        "size": 121544
       },
       {
         "name": "gcc-14-base",
@@ -231,6 +276,15 @@
         "size": 170528
       },
       {
+        "name": "init-system-helpers",
+        "version": "1.66ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/i/init-system-helpers/init-system-helpers_1.66ubuntu1_all.deb",
+        "sha256": "8eb801f9ce084dab9bf4cbc3ec0ee5ac75516a4cc1f25e3f92298c632e75b700",
+        "size": 39402
+      },
+      {
         "name": "initramfs-tools",
         "version": "0.142ubuntu25.8",
         "arch": "all",
@@ -256,6 +310,15 @@
         "path": "pool/main/i/initramfs-tools/initramfs-tools-core_0.142ubuntu25.8_all.deb",
         "sha256": "1a26fed5136ae049e5abc33995ac362f7af26bd7470e6a49c596474da0c3e1b8",
         "size": 50458
+      },
+      {
+        "name": "iproute2",
+        "version": "6.1.0-1ubuntu6.4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/iproute2/iproute2_6.1.0-1ubuntu6.4_amd64.deb",
+        "sha256": "f6c91ec6dba02f8965c88f901205c7db72bc8bf38ef1fdfaaee51030dfa145ea",
+        "size": 1119922
       },
       {
         "name": "jq",
@@ -375,6 +438,15 @@
         "size": 237090
       },
       {
+        "name": "libbpf1",
+        "version": "1:1.3.0-2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libb/libbpf/libbpf1_1.3.0-2build2_amd64.deb",
+        "sha256": "5654cbb145c2b299472cd208dd06c7dc09bf06cad4c4663fc42a865a51a0d96f",
+        "size": 165734
+      },
+      {
         "name": "libbrotli1",
         "version": "1.1.0-2build2",
         "arch": "amd64",
@@ -427,6 +499,24 @@
         "path": "pool/main/libc/libcap2/libcap2_2.66-5ubuntu2.4_amd64.deb",
         "sha256": "23c627c77c66552a658e62852f244f4946dc543898e0ec5428d5dc6bffde2d6a",
         "size": 30500
+      },
+      {
+        "name": "libcap2-bin",
+        "version": "1:2.66-5ubuntu2.4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libc/libcap2/libcap2-bin_2.66-5ubuntu2.4_amd64.deb",
+        "sha256": "a8c875e1711a7a101e995814e6500c826cb658551660ef967ec15fbda79a3997",
+        "size": 34134
+      },
+      {
+        "name": "libcbor0.10",
+        "version": "0.10.2-1.2ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libc/libcbor/libcbor0.10_0.10.2-1.2ubuntu2_amd64.deb",
+        "sha256": "6ae45862612eb5d9918a005b882a67b722428cfde06d56bb651d3c04a47f4d2d",
+        "size": 25844
       },
       {
         "name": "libcom-err2",
@@ -519,6 +609,15 @@
         "size": 139194
       },
       {
+        "name": "libedit2",
+        "version": "3.1-20230828-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libe/libedit/libedit2_3.1-20230828-1build1_amd64.deb",
+        "sha256": "3afbc8ddf835049dd4d88275b9d13680e4c4cdd59e191cbd63424152cc08e00e",
+        "size": 97586
+      },
+      {
         "name": "libefiboot1t64",
         "version": "38-3.1build1",
         "arch": "amd64",
@@ -535,6 +634,15 @@
         "path": "pool/main/e/efivar/libefivar1t64_38-3.1build1_amd64.deb",
         "sha256": "e0e9f13e133de21b52fc2231e09102f01ed54f3530c8813a52bc9ce66744bc50",
         "size": 57784
+      },
+      {
+        "name": "libelf1t64",
+        "version": "0.190-1.1ubuntu0.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/e/elfutils/libelf1t64_0.190-1.1ubuntu0.1_amd64.deb",
+        "sha256": "b4aee123a37472d213647594b4f7d4a0d13615b0ca2a6fd33926b768d6b232c2",
+        "size": 57810
       },
       {
         "name": "libexpat1",
@@ -580,6 +688,15 @@
         "path": "pool/main/libf/libffi/libffi8_3.4.6-1build1_amd64.deb",
         "sha256": "637e6a7744de08cd331a41f4efd0d24e6ea9064843dea9d1c6ca87bdb5f038a2",
         "size": 24718
+      },
+      {
+        "name": "libfido2-1",
+        "version": "1.14.0-1build3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libf/libfido2/libfido2-1_1.14.0-1build3_amd64.deb",
+        "sha256": "1dfed970b870e3c949b983f2bcc28e33e1a1207c6cf5a60ee2cb226bb02b1da7",
+        "size": 83526
       },
       {
         "name": "libfreetype6",
@@ -643,6 +760,15 @@
         "path": "pool/main/g/gdbm/libgdbm6t64_1.23-5.1build1_amd64.deb",
         "sha256": "18d6d74a5c038b458d95ba0c0909e0f086cd50bb9a0fee32697902724fc5645e",
         "size": 34440
+      },
+      {
+        "name": "libglib2.0-0t64",
+        "version": "2.80.0-6ubuntu3.8",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/glib2.0/libglib2.0-0t64_2.80.0-6ubuntu3.8_amd64.deb",
+        "sha256": "ca4eda0e01c76ba2e5e501e77decce53d98a641234b517eb98fc5d74980f913f",
+        "size": 1545474
       },
       {
         "name": "libgmp10",
@@ -834,6 +960,15 @@
         "size": 26976
       },
       {
+        "name": "libmnl0",
+        "version": "1.0.5-2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libm/libmnl/libmnl0_1.0.5-2build1_amd64.deb",
+        "sha256": "5170658bf0eaf54a8c7d53061ca6b47a6cf33a83543a75fa521de7046cb7197a",
+        "size": 12272
+      },
+      {
         "name": "libmount1",
         "version": "2.39.3-9ubuntu6.5",
         "arch": "amd64",
@@ -850,6 +985,15 @@
         "path": "pool/main/n/ncurses/libncursesw6_6.4%2b20240113-1ubuntu2.1_amd64.deb",
         "sha256": "bc860e63d1f8e653b1d14695ed5e3e8baf88b14c38ba0e6a93c67809a7c116a6",
         "size": 147818
+      },
+      {
+        "name": "libnetplan1",
+        "version": "1.1.2-8ubuntu1~24.04.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/netplan.io/libnetplan1_1.1.2-8ubuntu1%7e24.04.2_amd64.deb",
+        "sha256": "e5119f6231de7da9fe1ae535fa0f6dabdd57ec1061a72b6c48afa4ba55b7c1ac",
+        "size": 132984
       },
       {
         "name": "libnettle8t64",
@@ -924,6 +1068,15 @@
         "size": 51850
       },
       {
+        "name": "libpam-runtime",
+        "version": "1.5.3-5ubuntu5.5",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/pam/libpam-runtime_1.5.3-5ubuntu5.5_all.deb",
+        "sha256": "f637c92621811f238f185f9072f9a03090e783e91eaa4817ef148822ffc952d0",
+        "size": 40754
+      },
+      {
         "name": "libpam0g",
         "version": "1.5.3-5ubuntu5.5",
         "arch": "amd64",
@@ -967,6 +1120,15 @@
         "path": "pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5ubuntu0.6_amd64.deb",
         "sha256": "ac0163f58b8aa52dfdd17cdc10a83f3db084cb91a62686023f5c983d6ff89f8b",
         "size": 188776
+      },
+      {
+        "name": "libproc2-0",
+        "version": "2:4.0.4-4ubuntu3.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/procps/libproc2-0_4.0.4-4ubuntu3.2_amd64.deb",
+        "sha256": "52684291f6bb77a0a72c893f5c00c0742c30105d93e1f885566f4521b1f97946",
+        "size": 59454
       },
       {
         "name": "libpsl5t64",
@@ -1212,6 +1374,15 @@
         "size": 36058
       },
       {
+        "name": "libwrap0",
+        "version": "7.6.q-33",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/t/tcp-wrappers/libwrap0_7.6.q-33_amd64.deb",
+        "sha256": "36118b862539868408ee056411d6e470068d14c46e5296b29bfb744770f5d2ce",
+        "size": 47874
+      },
+      {
         "name": "libwww-curl-perl",
         "version": "4.17-10build4",
         "arch": "amd64",
@@ -1230,6 +1401,15 @@
         "size": 763972
       },
       {
+        "name": "libxtables12",
+        "version": "1.8.10-3ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/iptables/libxtables12_1.8.10-3ubuntu2_amd64.deb",
+        "sha256": "c94063499d1b0b336f39607107efb7de95d52a5d4e7e6a9368a5f7308f05b714",
+        "size": 35704
+      },
+      {
         "name": "libxxhash0",
         "version": "0.8.2-2build1",
         "arch": "amd64",
@@ -1237,6 +1417,15 @@
         "path": "pool/main/x/xxhash/libxxhash0_0.8.2-2build1_amd64.deb",
         "sha256": "75de256c2d162dfc541beb69a83f025742cd13329262af9059eff3ca42a53239",
         "size": 24056
+      },
+      {
+        "name": "libyaml-0-2",
+        "version": "0.2.5-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/liby/libyaml/libyaml-0-2_0.2.5-1build1_amd64.deb",
+        "sha256": "f5271b120d936dcc7ddf17b9e718df41d55386a6075555d0c634925eaef0b2ac",
+        "size": 51492
       },
       {
         "name": "libzstd1",
@@ -1338,6 +1527,24 @@
         "size": 13112
       },
       {
+        "name": "netplan-generator",
+        "version": "1.1.2-8ubuntu1~24.04.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/netplan.io/netplan-generator_1.1.2-8ubuntu1%7e24.04.2_amd64.deb",
+        "sha256": "6b56882355e83b423aba003ec4aaed8e3fd758231b785cfffdfacdad0c0b8865",
+        "size": 61166
+      },
+      {
+        "name": "netplan.io",
+        "version": "1.1.2-8ubuntu1~24.04.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/netplan.io/netplan.io_1.1.2-8ubuntu1%7e24.04.2_amd64.deb",
+        "sha256": "93d5c8ce8ac8f0f60cbbbb06425c19f5069e4194e13930e981b5416f01212a30",
+        "size": 69754
+      },
+      {
         "name": "nix-bin",
         "version": "2.18.1+dfsg-1ubuntu5",
         "arch": "amd64",
@@ -1345,6 +1552,42 @@
         "path": "pool/universe/n/nix/nix-bin_2.18.1%2bdfsg-1ubuntu5_amd64.deb",
         "sha256": "1aecc4a6435e75791dcd3f0b43992361cfa0f56eaa99ea165a3299725c330947",
         "size": 2684388
+      },
+      {
+        "name": "openssh-client",
+        "version": "1:9.6p1-3ubuntu13.18",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/o/openssh/openssh-client_9.6p1-3ubuntu13.18_amd64.deb",
+        "sha256": "900ee53c747920694bd508e598702aa794911a7c8273e66f292fe45144a00a9f",
+        "size": 907808
+      },
+      {
+        "name": "openssh-server",
+        "version": "1:9.6p1-3ubuntu13.18",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/o/openssh/openssh-server_9.6p1-3ubuntu13.18_amd64.deb",
+        "sha256": "81a6c622a2b566a95f1939f25776e0ec05b6b40c2fa61f7cd9f148bca4344208",
+        "size": 511450
+      },
+      {
+        "name": "openssh-sftp-server",
+        "version": "1:9.6p1-3ubuntu13.18",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/o/openssh/openssh-sftp-server_9.6p1-3ubuntu13.18_amd64.deb",
+        "sha256": "2287e3e9e3d0ace278173ca218d32d41a24b87afec3b42ef7dabfda4d9125edd",
+        "size": 37264
+      },
+      {
+        "name": "openssl",
+        "version": "3.0.13-0ubuntu3.11",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/o/openssl/openssl_3.0.13-0ubuntu3.11_amd64.deb",
+        "sha256": "e3b33fefcebc3ef8f3367572a1ffead2e8ddf7807aec1d442b843e50b70261f4",
+        "size": 1002796
       },
       {
         "name": "parted",
@@ -1392,6 +1635,15 @@
         "size": 3110248
       },
       {
+        "name": "procps",
+        "version": "2:4.0.4-4ubuntu3.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/procps/procps_4.0.4-4ubuntu3.2_amd64.deb",
+        "sha256": "73166776dc49e148f5c05813171fbc5db5703e7a1e981329b63bd201abc10f42",
+        "size": 707124
+      },
+      {
         "name": "python-apt-common",
         "version": "2.7.7ubuntu5.2",
         "arch": "all",
@@ -1419,6 +1671,141 @@
         "size": 169242
       },
       {
+        "name": "python3-attr",
+        "version": "23.2.0-2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-attrs/python3-attr_23.2.0-2_all.deb",
+        "sha256": "219601ac95dbb78c22e5347704a272dfeee7e2ce38b31f521f50c74647c28bc9",
+        "size": 48568
+      },
+      {
+        "name": "python3-blinker",
+        "version": "1.7.0-1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/b/blinker/python3-blinker_1.7.0-1_all.deb",
+        "sha256": "bb671458cb2ef3fca3ba8819e03d318a7821870ecd508de8921afcf0190356f2",
+        "size": 14312
+      },
+      {
+        "name": "python3-certifi",
+        "version": "2023.11.17-1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-certifi/python3-certifi_2023.11.17-1_all.deb",
+        "sha256": "1a7ee6751fdc263319f4a2e559e8104f7a1e9af0cdb9926e5a145ebfec0dd148",
+        "size": 164904
+      },
+      {
+        "name": "python3-cffi-backend",
+        "version": "1.16.0-2build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/python-cffi/python3-cffi-backend_1.16.0-2build1_amd64.deb",
+        "sha256": "a49f5e49b15146f6b2217cb3b6e6d62c503b02a7b271295e6d569d483ccdf687",
+        "size": 77292
+      },
+      {
+        "name": "python3-chardet",
+        "version": "5.2.0+dfsg-1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/chardet/python3-chardet_5.2.0%2bdfsg-1_all.deb",
+        "sha256": "042ec127434ad634a1f312514680b8d0de7bd1e9733b255d93170a6bb843a043",
+        "size": 116904
+      },
+      {
+        "name": "python3-configobj",
+        "version": "5.0.8-3",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/configobj/python3-configobj_5.0.8-3_all.deb",
+        "sha256": "6495d7f7441b9fbcaf5f81889a1b882e5860a9573ea86cc0dbf17d1c5d5c67b0",
+        "size": 33844
+      },
+      {
+        "name": "python3-cryptography",
+        "version": "41.0.7-4ubuntu0.4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/python-cryptography/python3-cryptography_41.0.7-4ubuntu0.4_amd64.deb",
+        "sha256": "8fa33b608a16df054bf26ea3a653b1d512ab745d01e56fa938673ebc8c727060",
+        "size": 815068
+      },
+      {
+        "name": "python3-debconf",
+        "version": "1.5.86ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/d/debconf/python3-debconf_1.5.86ubuntu1_all.deb",
+        "sha256": "88bca2b9ace3465bcedf4e3cc53242c0ffcd6663bba3dce18666192a15b51584",
+        "size": 4158
+      },
+      {
+        "name": "python3-idna",
+        "version": "3.6-2ubuntu0.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-idna/python3-idna_3.6-2ubuntu0.1_all.deb",
+        "sha256": "23cb4f5bba28d608acf4be3aaee2e0a928df9019236faf85b70b41ccfc240c69",
+        "size": 48984
+      },
+      {
+        "name": "python3-jinja2",
+        "version": "3.1.2-1ubuntu1.3",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/j/jinja2/python3-jinja2_3.1.2-1ubuntu1.3_all.deb",
+        "sha256": "3929521159dd53451b0005ac6b8a1a8dbc42bf74ce83309b50389520f08a937c",
+        "size": 108358
+      },
+      {
+        "name": "python3-json-pointer",
+        "version": "2.0-0ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-json-pointer/python3-json-pointer_2.0-0ubuntu1_all.deb",
+        "sha256": "17c302b65e6d9d3406a6b119388f1bab6bfe1269e108e135225b52d8d5639150",
+        "size": 8320
+      },
+      {
+        "name": "python3-jsonpatch",
+        "version": "1.32-3",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-json-patch/python3-jsonpatch_1.32-3_all.deb",
+        "sha256": "4c7545d1e9ab4297098c28998b44a32059e47002286531ddae1f44856ce37f2b",
+        "size": 12114
+      },
+      {
+        "name": "python3-jsonschema",
+        "version": "4.10.3-2ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-jsonschema/python3-jsonschema_4.10.3-2ubuntu1_all.deb",
+        "sha256": "109e90bb041b8e1d74bcb18d2d6fd7961fb8a140638743068b17383da25c4575",
+        "size": 62912
+      },
+      {
+        "name": "python3-jwt",
+        "version": "2.7.0-1ubuntu0.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/pyjwt/python3-jwt_2.7.0-1ubuntu0.1_all.deb",
+        "sha256": "038c42e9957c683e98834dbe405572e01c8c3aa0ebcd410beec33a260d0f0022",
+        "size": 20162
+      },
+      {
+        "name": "python3-markupsafe",
+        "version": "2.1.5-1build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/m/markupsafe/python3-markupsafe_2.1.5-1build2_amd64.deb",
+        "sha256": "5fd479735e81694be2881d4bd77b0b72e83adb1cb9fbfb1895274ac70ab230f4",
+        "size": 12666
+      },
+      {
         "name": "python3-minimal",
         "version": "3.12.3-0ubuntu2.1",
         "arch": "amd64",
@@ -1426,6 +1813,78 @@
         "path": "pool/main/p/python3-defaults/python3-minimal_3.12.3-0ubuntu2.1_amd64.deb",
         "sha256": "9ba5dd55cdcf6121c147dc5cb87403169b5933e3a56da0de57774f2ce819cf06",
         "size": 27442
+      },
+      {
+        "name": "python3-netplan",
+        "version": "1.1.2-8ubuntu1~24.04.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/netplan.io/python3-netplan_1.1.2-8ubuntu1%7e24.04.2_amd64.deb",
+        "sha256": "b3d0f909f79248d38963020444638d412a9881fec82f8c6f2dbf01f7ebc5b916",
+        "size": 24252
+      },
+      {
+        "name": "python3-oauthlib",
+        "version": "3.2.2-1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-oauthlib/python3-oauthlib_3.2.2-1_all.deb",
+        "sha256": "de2429f930ca495315d06eba8646ef5299c8cf3848f31afb948856639dca79ff",
+        "size": 89666
+      },
+      {
+        "name": "python3-pkg-resources",
+        "version": "68.1.2-2ubuntu1.2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/s/setuptools/python3-pkg-resources_68.1.2-2ubuntu1.2_all.deb",
+        "sha256": "13caaa69d5ba8b02e90087d4bcef714c0581e591e820804d15d12f582055147a",
+        "size": 167914
+      },
+      {
+        "name": "python3-pyrsistent",
+        "version": "0.20.0-1build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/pyrsistent/python3-pyrsistent_0.20.0-1build2_amd64.deb",
+        "sha256": "feb780a8c0bad95c496f1bb7fa8e140cfb6fdd7ed1a75881a03878cc89425dfc",
+        "size": 55814
+      },
+      {
+        "name": "python3-requests",
+        "version": "2.31.0+dfsg-1ubuntu1.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/r/requests/python3-requests_2.31.0%2bdfsg-1ubuntu1.1_all.deb",
+        "sha256": "e9d0795c374b9be099042444bad44ba6c9cad70523744e4165b087c17d6d5fa0",
+        "size": 50784
+      },
+      {
+        "name": "python3-serial",
+        "version": "3.5-2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/pyserial/python3-serial_3.5-2_all.deb",
+        "sha256": "8a85d5160f57558edfae21efb34b7c9c645c8107109354edf68414afb9e177e3",
+        "size": 78642
+      },
+      {
+        "name": "python3-urllib3",
+        "version": "2.0.7-1ubuntu0.7",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/p/python-urllib3/python3-urllib3_2.0.7-1ubuntu0.7_all.deb",
+        "sha256": "84970da97957c055f5ccc7c4d470f31a4091318dffa2c47f670db23665b7aa95",
+        "size": 95448
+      },
+      {
+        "name": "python3-yaml",
+        "version": "6.0.1-2build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/pyyaml/python3-yaml_6.0.1-2build2_amd64.deb",
+        "sha256": "315e59500af855f23ee4e95525b99009bd798c4d2658af8eb4b2d66a8a91ec23",
+        "size": 122568
       },
       {
         "name": "python3.12",
@@ -1453,6 +1912,15 @@
         "path": "pool/main/r/readline/readline-common_8.2-4build1_all.deb",
         "sha256": "879bfd7f8a9bc4c0f7cdc777cdd8bc6de5f8c4a2ac80c060322a1b22f13504bb",
         "size": 56484
+      },
+      {
+        "name": "sensible-utils",
+        "version": "0.0.22",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/s/sensible-utils/sensible-utils_0.0.22_all.deb",
+        "sha256": "410c29ff82c6916d14e235b511287e67a45cb78d509b19aab48608acdc941254",
+        "size": 22462
       },
       {
         "name": "squashfs-tools",
@@ -1518,6 +1986,15 @@
         "size": 280102
       },
       {
+        "name": "ucf",
+        "version": "3.0043+nmu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/u/ucf/ucf_3.0043%2bnmu1_all.deb",
+        "sha256": "397e541af11db776ed7facf1674ee37b56e7de51348c9f077d7a283912c4b458",
+        "size": 56522
+      },
+      {
         "name": "udev",
         "version": "255.4-1ubuntu8.16",
         "arch": "amd64",
@@ -1547,7 +2024,7 @@
     ]
   },
   "esm": {
-    "_comment": "Still empty (GitHub issue #81, milestone M4): esm.ubuntu.com has no snapshot service, so this tier is pinned directly by (name, version, sha256, path, source: \"esm\"). The fetching/resolution plumbing (nix/archive.nix's fetchEsmDeb/esmDebs, bin/ubx-resolve-esm) is wired up as of M4, but populating this list for real needs a real Ubuntu Pro token/subscription -- a needs-owner item; see bin/ubx-resolve-esm's header and docs/archive.md. esm content is subscription-gated and never redistributed publicly -- bin/ubx-archive-public-manifest excludes this tier by construction.",
+    "_comment": "Empty until M4 (SPEC.md §4.4, R4): esm.ubuntu.com has no snapshot service, so this tier is pinned directly by (name, version, arch, component, path, sha256, size) once M4 wires up fetching against a Pro token. esm content is subscription-gated and never redistributed publicly.",
     "packages": []
   }
 }

@@ -688,6 +688,85 @@ let
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
         mount -t proc proc /proc
 
+        # policy-rc.d service-start suppression (GitHub issue #118
+        # regression). A Server-seed maintainer script's postinst calls
+        # `invoke-rc.d` to start/restart its daemon -- rsyslog's is the
+        # concrete case (first pulled in by the ubuntu-standard metapackage):
+        # `invoke-rc.d: unknown initscript, /etc/init.d/rsyslog not found` /
+        # `invoke-rc.d: could not determine current runlevel`. Both errors
+        # are inherent to a chroot, not a packaging bug: there is no PID 1
+        # init running here (this whole tree is composed offline, never
+        # booted) and no /etc/init.d SysV entry to query, so invoke-rc.d has
+        # no runlevel to act on and exits non-zero, which aborts
+        # `dpkg --configure -a` under `set -eu` and cascades every
+        # not-yet-configured package into "Errors were encountered while
+        # processing". The canonical fix -- used by debootstrap,
+        # live-build, and every Debian/Ubuntu container image builder -- is
+        # a `/usr/sbin/policy-rc.d` executable that unconditionally exits
+        # 101 ("action forbidden by policy"): invoke-rc.d(8) checks for this
+        # file FIRST and treats exit code 101 as "administrator policy
+        # forbids starting services here", which it reports and then exits
+        # 0 itself, letting `dpkg --configure -a` proceed instead of
+        # actually trying (and failing) to start anything in an unbootable
+        # chroot. This is purely a build-time compose aid -- a real system
+        # booting the packed rootfs must start its services normally -- so
+        # it is deleted again below (see the /.ubx-compose cleanup) before
+        # the rootfs is packed, never shipping in $out.
+        mkdir -p /usr/sbin
+        printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+        chmod 0755 /usr/sbin/policy-rc.d
+
+        # invoke-rc.d divert stub (GitHub issue #118 follow-up). Staging
+        # policy-rc.d above did NOT fix the reported failure -- the exact
+        # same "unknown initscript, /etc/init.d/rsyslog not found" /
+        # "could not determine current runlevel" text, and the same
+        # ubuntu-standard configure failure, still occurred byte-identical
+        # afterward. Reading init-system-helpers' actual
+        # /usr/sbin/invoke-rc.d (noble 1.66ubuntu1) shows why: the "unknown
+        # initscript ... not found" message is printed by an UNCONDITIONAL
+        # existence check --
+        #   elif test ! -f "''${INITDPREFIX}''${INITSCRIPTID}" ; then
+        #       printerror unknown initscript, ''${INITDPREFIX}''${INITSCRIPTID} not found.
+        #   fi
+        # (the ''${...} above are Nix escapes -- this comment lives inside a
+        # Nix indented string, so an unescaped antiquotation would fail
+        # evaluation with "undefined variable 'INITDPREFIX'"; upstream's
+        # actual source has no such escaping.)
+        # -- that runs at the very top of the script, long before
+        # policy-rc.d is ever consulted (querypolicy() is only called later,
+        # and only when the initscript file is present and executable in
+        # the first place). A policy-rc.d exit code therefore cannot
+        # possibly short-circuit this path: there is nothing left for it to
+        # intervene on. Even on the branches where querypolicy() IS reached,
+        # invoke-rc.d's own documented default -- deny a start/restart/reload
+        # when the runlevel is unknown (exactly this chroot's situation,
+        # PID 1 never having run) -- and a policy-rc.d 101 denial collapse to
+        # the SAME internal state (RC=101), and RC=101 without
+        # --disclose-deny/--query resolves to a plain `exit 0` at the very
+        # end of the script; adding policy-rc.d changes nothing observable
+        # in that case either. In short: policy-rc.d only ever narrows WHICH
+        # services get denied a start; it cannot suppress invoke-rc.d's own
+        # informational stderr diagnostics, and for a chroot with no init at
+        # all it is not even reliably the mechanism producing the eventual
+        # `dpkg --configure -a` failure. The canonical, comprehensive
+        # answer used by Debian/Ubuntu chroot-composing tooling (debootstrap
+        # and live-build both do exactly this) is to divert invoke-rc.d
+        # ITSELF to an unconditional no-op for the compose's duration, which
+        # covers every maintainer script's invoke-rc.d call -- including
+        # ones that do not use policy-rc.d-aware guards at all -- rather
+        # than relying on invoke-rc.d's own internal policy plumbing.
+        # `dpkg-divert` (not a plain mv) so dpkg itself knows this path was
+        # relocated and does not re-clobber the stub if invoke-rc.d is
+        # reconfigured/reinstalled later in this same run; the real binary
+        # is un-diverted (and the stub removed) below, alongside the
+        # policy-rc.d cleanup, so neither the diversion nor the stub ships
+        # in $out -- a real booted system must run the genuine
+        # init-system-helpers invoke-rc.d.
+        dpkg-divert --local --rename \
+          --divert /usr/sbin/invoke-rc.d.ubx-real --add /usr/sbin/invoke-rc.d
+        printf '#!/bin/sh\nexit 0\n' >/usr/sbin/invoke-rc.d
+        chmod 0755 /usr/sbin/invoke-rc.d
+
         # dpkg --unpack every declared package FIRST (this registers each
         # package's *.templates under /var/lib/dpkg/info/, and runs
         # preinst) BEFORE preseeding: debconf-set-selections needs a
@@ -827,6 +906,22 @@ let
         # residual risk, mitigated but not proven by the PERL_HASH_SEED
         # pin above).
         rm -f /var/cache/debconf/*.dat-old
+
+        # Remove the policy-rc.d shim staged above (issue #118): it exists
+        # only to keep invoke-rc.d from failing while THIS chroot has no
+        # running init, and must not ship in the packed rootfs, where a
+        # real booted system needs services to start normally.
+        rm -f /usr/sbin/policy-rc.d
+
+        # Undo the invoke-rc.d divert staged above (issue #118 follow-up):
+        # remove the no-op stub and hand the real path back to
+        # init-system-helpers' own binary via `dpkg-divert --rename
+        # --remove`, so the packed rootfs boots with the genuine
+        # invoke-rc.d -- a real running system needs its policy/runlevel
+        # logic intact, not this compose-only stub.
+        rm -f /usr/sbin/invoke-rc.d
+        dpkg-divert --local --rename \
+          --divert /usr/sbin/invoke-rc.d.ubx-real --remove /usr/sbin/invoke-rc.d
 
         # Compose-time staging is not part of the composed system.
         rm -rf /.ubx-compose

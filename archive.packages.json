@@ -30,6 +30,7 @@
     "systemd-sysv",
     "tzdata",
     "ubuntu-minimal",
+    "ubuntu-standard",
     "zlib1g"
   ]
 }

@@ -122,9 +122,15 @@ list).** Neither `serverSeedPackages` nor `desktopSeedPackages` is a
 hand-curated list. Both are computed identically: every package name in
 the project's own locked archive set (`archive.lock.json`, via
 `config.flake.lib.archive.lockfile`), minus a small explicitly-enumerated
-`*SeedExceptions` list (`hello`, `htop`, `ed`, `jq` — the M1
-stdenv/archive-fetch proof fixtures, not real members of any upstream
-seed). This is deliberate: a real apt-solver resolve against a live
+`*SeedExceptions` list (`hello` — the M1 stdenv/archive-fetch proof
+fixture, not a real member of any upstream seed. `htop`, `ed`, and `jq`
+used to be in this list too, on the same theory, but GitHub issue #118's
+reconciliation against the committed upstream Server manifest
+(`tests/fixtures/upstream-manifests/`) proved all three ARE genuine
+upstream Server-seed packages — and excluding `ed` was actively breaking
+`ubuntu-standard`'s dpkg configuration once that metapackage was declared,
+so they were removed from both exception lists). This is deliberate: a
+real apt-solver resolve against a live
 Ubuntu archive mirror is the only way to know the true upstream Server/
 Desktop task-set closure, and this dev/CI environment has no outbound
 network to do that resolve. Rather than fake a second, hand-typed package

@@ -51,17 +51,25 @@ for f in "$server_manifest" "$desktop_manifest" archive.lock.json "$profiles_nix
 done
 
 # The exception set is hand-mirrored from nix/profiles.nix's
-# serverSeedExceptions/desktopSeedExceptions (identical: [hello htop ed jq]).
+# serverSeedExceptions/desktopSeedExceptions (identical: [hello] — this
+# used to also include htop/ed/jq, but GitHub issue #118's reconciliation
+# against the very upstream manifests this test reads proved those three
+# ARE real upstream Server-seed members, and excluding "ed" was actively
+# breaking ubuntu-standard's dpkg configuration once that metapackage was
+# declared, so nix/profiles.nix dropped them from both exception lists).
 # Confirm the source still agrees so this test can't silently drift from it.
 for excl_var in serverSeedExceptions desktopSeedExceptions; do
   line="$(grep -m1 "$excl_var = \[" "$profiles_nix")" || true
   [ -n "$line" ] || fail "$profiles_nix: could not find '$excl_var = [ ... ];'"
-  for pkg in hello htop ed jq; do
-    case "$line" in
-    *"\"$pkg\""*) ;;
-    *) fail "$profiles_nix: $excl_var no longer lists \"$pkg\" — update this test's exception set to match" ;;
-    esac
-  done
+  case "$line" in
+  *'"hello"'*) ;;
+  *) fail "$profiles_nix: $excl_var no longer lists \"hello\" — update this test's exception set to match" ;;
+  esac
+  case "$line" in
+  *htop* | *'"ed"'* | *'"jq"'*)
+    fail "$profiles_nix: $excl_var still lists htop/ed/jq — update this test's exception set to match (they are real upstream packages per GitHub issue #118, not exceptions)"
+    ;;
+  esac
 done
 
 if ! python3 - "$server_manifest" "$desktop_manifest" <<'PYEOF'
@@ -146,7 +154,7 @@ def is_addition(name):
 #    exactly as nix/profiles.nix computes serverSeedPackages/desktopSeedPackages.
 lockfile = json.load(open("archive.lock.json", encoding="utf-8"))
 locked_names = sorted(p["name"] for p in lockfile["public"]["packages"])
-EXCEPTIONS = {"hello", "htop", "ed", "jq"}
+EXCEPTIONS = {"hello"}
 declared_seed = [n for n in locked_names if n not in EXCEPTIONS]
 
 if not declared_seed:

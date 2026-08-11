@@ -50,9 +50,21 @@
 # consistent by a real apt solve at `bin/ubx-resolve` time, and already
 # proven to boot by `boot-image-proof`/tests/e2e/010), MINUS the small,
 # explicitly enumerated set of M1 proof-only fixture packages
-# (`serverSeedExceptions`) that were added purely to exercise the stdenv/
-# archive-fetch machinery (issue #6/#7) and are not real members of any
-# upstream Server seed. This is the exact same posture nix/archive.nix's
+# (`serverSeedExceptions`) that are not real members of any upstream Server
+# seed. As of GitHub issue #118's reconciliation against the committed
+# upstream manifest (tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-
+# server-amd64.manifest), that set is exactly ONE package: `hello`, the M1
+# stdenv/archive-fetch proof fixture (issue #6/#7) that has no upstream
+# Ubuntu package at all. `htop`, `ed`, and `jq` were REMOVED from this
+# exception list by this same reconciliation — issue #128 had already
+# corrected this section's prose to note that all three genuinely appear in
+# the upstream Server manifest, but deliberately left the exception lists
+# themselves alone because nothing depended on the distinction yet; it does
+# now, because excluding `ed` broke `ubuntu-standard`'s own postinst
+# configuration (`dpkg: dependency problems ... Package ed is not
+# installed`) once that metapackage was declared, so keeping a real upstream
+# dependency out of the seed is an active correctness bug, not a harmless
+# simplification. This is the exact same posture nix/archive.nix's
 # own "esm-tier fetching" section already takes for its own gap (a real,
 # needs-owner action — extending the resolver's declared input,
 # `archive.packages.json`, with real Server-task-set package names and
@@ -168,18 +180,32 @@ let
   # -- serverSeedPackages / serverSeedExceptions ---------------------------
   #
   # See header, "What 'the upstream Server seed' means in this repo".
-  # `hello`/`htop`/`ed`/`jq` are the small M1 stdenv/archive-fetch proof
-  # fixtures (nix/stdenv.nix/nix/archive.nix/nix/compose.nix's own proof
-  # packages) that happen to share the one project-wide lockfile with every
-  # real boot-critical package (kernel, grub, filesystem tools, ...) — see
+  # `hello` is the sole M1 stdenv/archive-fetch proof fixture (nix/
+  # stdenv.nix/nix/archive.nix/nix/compose.nix's own proof package) that
+  # happens to share the one project-wide lockfile with every real
+  # boot-critical package (kernel, grub, filesystem tools, ...) — see
   # archive.packages.json's own header for why the lockfile is one shared
-  # set rather than per-consumer subsets. They are excluded from the parity
-  # diff because of that proof-fixture role, NOT because they are absent
-  # from upstream: `htop`, `ed`, and `jq` are in fact present in the
-  # upstream Ubuntu 24.04.3 Server manifest (see
-  # tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.manifest)
-  # — only `hello` is genuinely non-upstream.
-  serverSeedExceptions = [ "hello" "htop" "ed" "jq" ];
+  # set rather than per-consumer subsets. It is excluded from the parity
+  # diff because of that proof-fixture role, NOT because it is absent from
+  # upstream by accident: `hello` genuinely has no upstream Ubuntu package
+  # (see tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.
+  # manifest, which does not list it).
+  #
+  # `htop`, `ed`, and `jq` used to sit in this list too, on the same
+  # "M1 proof fixture" theory. GitHub issue #118's reconciliation against
+  # that same committed upstream manifest proved the theory wrong for all
+  # three: they ARE genuine members of the real Ubuntu Server seed (issue
+  # #128 already corrected this section's prose to say so, but deliberately
+  # left the list itself alone, since nothing depended on it yet). Once
+  # `ubuntu-standard` was declared as part of extending the seed toward the
+  # real upstream task-set, excluding `ed` stopped being harmless: dpkg
+  # refused to configure `ubuntu-standard` because one of its real
+  # dependencies (`ed`) was missing from the composed image
+  # (`dpkg: dependency problems ... Package ed is not installed`). Removing
+  # `htop`/`ed`/`jq` from this list is therefore a correctness fix, not a
+  # simplification: it makes the composed image match upstream more
+  # closely, which is exactly what this list exists to guarantee.
+  serverSeedExceptions = [ "hello" ];
 
   serverSeedPackages =
     builtins.sort (a: b: a < b)
@@ -296,15 +322,23 @@ let
   # -- desktopSeedPackages / desktopSeedExceptions -------------------------
   #
   # See header, "Desktop" / "What 'the upstream Server seed' means in this
-  # repo". Same four M1 stdenv/archive-fetch proof fixtures as
-  # `serverSeedExceptions` -- they share the one project-wide lockfile
-  # (archive.packages.json's own header) and are excluded from the parity
-  # diff for that same proof-fixture reason, NOT because they are absent
-  # from upstream: `htop`, `ed`, and `jq` are in fact present in the
-  # upstream Ubuntu 24.04.3 Server manifest (see
-  # tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.manifest)
-  # — only `hello` is genuinely non-upstream.
-  desktopSeedExceptions = [ "hello" "htop" "ed" "jq" ];
+  # repo". Same single M1 stdenv/archive-fetch proof fixture as
+  # `serverSeedExceptions` (`hello`) -- it shares the one project-wide
+  # lockfile (archive.packages.json's own header) and is excluded from the
+  # parity diff for that same proof-fixture reason, NOT because it is
+  # absent from upstream by accident: `hello` genuinely has no upstream
+  # Ubuntu package (see tests/fixtures/upstream-manifests/ubuntu-24.04.3-
+  # live-server-amd64.manifest, which does not list it).
+  #
+  # `htop`, `ed`, and `jq` used to sit in this list too. GitHub issue #118's
+  # reconciliation against that same committed upstream manifest proved
+  # they are genuine upstream Server-seed members (issue #128 already
+  # corrected this section's prose to say so, but deliberately left the
+  # list itself alone). They were removed from `serverSeedExceptions` (see
+  # that binding's own comment above for the full "ubuntu-standard" story,
+  # which mirrors here field-for-field) as a correctness fix, and removed
+  # from this list too so both profiles stay identical by construction.
+  desktopSeedExceptions = [ "hello" ];
 
   desktopSeedPackages =
     builtins.sort (a: b: a < b)

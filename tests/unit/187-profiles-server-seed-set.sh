@@ -33,18 +33,18 @@ for f in "$profiles_nix" archive.lock.json; do
 done
 
 # -- serverSeedExceptions: the small, explicitly-enumerated set of M1
-# proof-only fixture packages (hello/htop/ed/jq) that are not real members
-# of any upstream Server seed -- see nix/profiles.nix's own header for the
+# proof-only fixture packages (just "hello" as of GitHub issue #118 --
+# htop/ed/jq were removed once the committed upstream manifest proved they
+# are genuine upstream Server-seed members) that are not real members of
+# any upstream Server seed -- see nix/profiles.nix's own header for the
 # reasoning. Extracted textually and confirmed present.
 exceptions_line="$(grep -m1 'serverSeedExceptions = \[' "$profiles_nix")"
 [ -n "$exceptions_line" ] || fail "$profiles_nix: could not find a 'serverSeedExceptions = [ ... ];' line"
 
-for pkg in hello htop ed jq; do
-  case "$exceptions_line" in
-  *"\"$pkg\""*) ;;
-  *) fail "$profiles_nix: serverSeedExceptions does not list \"$pkg\"" ;;
-  esac
-done
+case "$exceptions_line" in
+*'"hello"'*) ;;
+*) fail "$profiles_nix: serverSeedExceptions does not list \"hello\"" ;;
+esac
 
 # -- serverSeedPackages = sort(lockfile names - exceptions) ---------------
 #
@@ -56,7 +56,7 @@ import sys
 lockfile = json.load(open("archive.lock.json", encoding="utf-8"))
 locked_names = sorted(p["name"] for p in lockfile["public"]["packages"])
 
-exceptions = {"hello", "htop", "ed", "jq"}
+exceptions = {"hello"}
 expected_seed = sorted(n for n in locked_names if n not in exceptions)
 
 if not expected_seed:

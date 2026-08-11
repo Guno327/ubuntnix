@@ -15,6 +15,24 @@
         "size": 100872
       },
       {
+        "name": "apt",
+        "version": "2.8.3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/a/apt/apt_2.8.3_amd64.deb",
+        "sha256": "c9ace99efc7726fe0035f921a9acf262a9723bbf35b861aab4f9075a0be67442",
+        "size": 1375526
+      },
+      {
+        "name": "apt-utils",
+        "version": "2.8.3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/a/apt/apt-utils_2.8.3_amd64.deb",
+        "sha256": "2284b5d72e67d528a4fc19400519ab8584ca00f8f394b0e4ec13f7340459049d",
+        "size": 215990
+      },
+      {
         "name": "bash-static",
         "version": "5.2.21-2ubuntu4",
         "arch": "amd64",
@@ -67,6 +85,24 @@
         "path": "pool/main/c/cloud-init/cloud-init_26.1-0ubuntu1%7e24.04.1_all.deb",
         "sha256": "1cb0b11bcaf4d6578b45c86ccfc0b2ee28b7b233f0d6e7a3d1a35f615c8f9de8",
         "size": 629412
+      },
+      {
+        "name": "console-setup",
+        "version": "1.226ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/console-setup/console-setup_1.226ubuntu1_all.deb",
+        "sha256": "7742985212c35abf6934385394b29a7f83e23d7ad9b504215c0a019dad457856",
+        "size": 109854
+      },
+      {
+        "name": "console-setup-linux",
+        "version": "1.226ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/console-setup/console-setup-linux_1.226ubuntu1_all.deb",
+        "sha256": "d00a8dfd142a1af64c0346b2c8d47c9bd412e15c6b63cf3a42606029bdb862e7",
+        "size": 1880202
       },
       {
         "name": "coreutils",
@@ -123,6 +159,15 @@
         "size": 124096
       },
       {
+        "name": "debconf-i18n",
+        "version": "1.5.86ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/d/debconf/debconf-i18n_1.5.86ubuntu1_all.deb",
+        "sha256": "1d139fdc52af51c89a044d973937d411750c254f636b7b3228c8570085d59586",
+        "size": 204734
+      },
+      {
         "name": "debianutils",
         "version": "5.17build1",
         "arch": "amd64",
@@ -139,6 +184,15 @@
         "path": "pool/main/d/dhcpcd/dhcpcd-base_10.0.6-1ubuntu3.2_amd64.deb",
         "sha256": "606672ce6eec804b6490e261c0afd77bfeedf73ff29aab165a464e1e8df43a43",
         "size": 215178
+      },
+      {
+        "name": "distro-info",
+        "version": "1.7build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/d/distro-info/distro-info_1.7build1_amd64.deb",
+        "sha256": "e93fb6f8e178de630c64abe15982d1695f6dadbd6b36617dc08cbda1b72b223c",
+        "size": 19874
       },
       {
         "name": "distro-info-data",
@@ -204,6 +258,15 @@
         "size": 56062
       },
       {
+        "name": "eject",
+        "version": "2.39.3-9ubuntu6.5",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/u/util-linux/eject_2.39.3-9ubuntu6.5_amd64.deb",
+        "sha256": "51df8e0b0249fc46937285de712ae9ff7d701b9b8b0aaacb51283762a54a6e49",
+        "size": 26266
+      },
+      {
         "name": "ethtool",
         "version": "1:6.7-1build1",
         "arch": "amd64",
@@ -247,6 +310,15 @@
         "path": "pool/main/g/gettext/gettext-base_0.21-14ubuntu2_amd64.deb",
         "sha256": "3e2806e94aba780cac11961ede06bffd14d4b840c4085be33d597ec93773fba5",
         "size": 38400
+      },
+      {
+        "name": "gpgv",
+        "version": "2.4.4-2ubuntu17.4",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/gnupg2/gpgv_2.4.4-2ubuntu17.4_amd64.deb",
+        "sha256": "ed2e1fcd39d5a50d592a58a24d80df90682c4da40ba25a73da36d52c422cc4bb",
+        "size": 158030
       },
       {
         "name": "grub-common",
@@ -294,6 +366,15 @@
         "size": 170528
       },
       {
+        "name": "init",
+        "version": "1.66ubuntu1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/init-system-helpers/init_1.66ubuntu1_amd64.deb",
+        "sha256": "fd0c5e9692e4fec0e43769d5792ef3ae83f07c7ba7a11a2a4f4dd70fdf335591",
+        "size": 6186
+      },
+      {
         "name": "init-system-helpers",
         "version": "1.66ubuntu1",
         "arch": "all",
@@ -339,6 +420,15 @@
         "size": 1119922
       },
       {
+        "name": "iputils-ping",
+        "version": "3:20240117-1ubuntu0.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/iputils/iputils-ping_20240117-1ubuntu0.1_amd64.deb",
+        "sha256": "6d9674cc32e110bb6bb26555f5be13381ee839466f2544b284b2b13572482de7",
+        "size": 44584
+      },
+      {
         "name": "jq",
         "version": "1.7.1-3ubuntu0.24.04.2",
         "arch": "amd64",
@@ -346,6 +436,24 @@
         "path": "pool/main/j/jq/jq_1.7.1-3ubuntu0.24.04.2_amd64.deb",
         "sha256": "f59183392f84fe67b407b494d8ba6185e9b0e4a106ffcb369490bd20a83fd40e",
         "size": 65694
+      },
+      {
+        "name": "kbd",
+        "version": "2.6.4-2ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/k/kbd/kbd_2.6.4-2ubuntu2_amd64.deb",
+        "sha256": "ed05cafcbedae499a4a12ed492cc935611b8e76e0c291df3a2228b92a55a124c",
+        "size": 241220
+      },
+      {
+        "name": "keyboard-configuration",
+        "version": "1.226ubuntu1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/c/console-setup/keyboard-configuration_1.226ubuntu1_all.deb",
+        "sha256": "5fc6de2984dcebecc202f07dd6b42396024ab532536832562a969437923fbb22",
+        "size": 211794
       },
       {
         "name": "klibc-utils",
@@ -364,6 +472,15 @@
         "path": "pool/main/k/kmod/kmod_31%2b20240202-2ubuntu7.2_amd64.deb",
         "sha256": "687693dfad23c96570d96a1c7cc1b8709d31a93f82ac765a11b2bd9130f1dfae",
         "size": 101742
+      },
+      {
+        "name": "less",
+        "version": "590-2ubuntu2.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/less/less_590-2ubuntu2.1_amd64.deb",
+        "sha256": "f26481c7f5e492e7536f9e75a9aa237f4772b637cdc933f356bc567e180b8a39",
+        "size": 141544
       },
       {
         "name": "libacl1",
@@ -409,6 +526,15 @@
         "path": "pool/main/a/argon2/libargon2-1_0%7e20190702%2bdfsg-4build1_amd64.deb",
         "sha256": "e2c50cb5c50ca598585397f4d4ce43e6f0b5e3ddc212c23b30bdb34ca4a61f66",
         "size": 20824
+      },
+      {
+        "name": "libassuan0",
+        "version": "2.5.6-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/liba/libassuan/libassuan0_2.5.6-1build1_amd64.deb",
+        "sha256": "59c6ee6aa6fffb5d181f37373baec18c26791f5d1c907ceeb62163460b11daf2",
+        "size": 37256
       },
       {
         "name": "libattr1",
@@ -490,6 +616,15 @@
         "path": "pool/main/b/bzip2/libbz2-1.0_1.0.8-5.1build0.1_amd64.deb",
         "sha256": "d557ab12b42ab370249142099fae3cbb979948934e4dfa58c2ab59bf5bbbda73",
         "size": 34370
+      },
+      {
+        "name": "libc-bin",
+        "version": "2.39-0ubuntu8.7",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/g/glibc/libc-bin_2.39-0ubuntu8.7_amd64.deb",
+        "sha256": "38e3e603aeca8cbbaefce34eec6b8190f53939425bf2eb2c8a3956d0a947a630",
+        "size": 681842
       },
       {
         "name": "libc6",
@@ -951,6 +1086,15 @@
         "size": 197620
       },
       {
+        "name": "liblocale-gettext-perl",
+        "version": "1.07-6ubuntu5",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libl/liblocale-gettext-perl/liblocale-gettext-perl_1.07-6ubuntu5_amd64.deb",
+        "sha256": "19daa45d4ef74b06a6a7b88bf37e709e96c499a6375d0ea22a8171c42694b3f1",
+        "size": 15812
+      },
+      {
         "name": "liblowdown1",
         "version": "1.1.0-1",
         "arch": "amd64",
@@ -1041,6 +1185,15 @@
         "size": 181636
       },
       {
+        "name": "libnewt0.52",
+        "version": "0.52.24-2ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/newt/libnewt0.52_0.52.24-2ubuntu2_amd64.deb",
+        "sha256": "1b55b7bb5a89bab48a643e0eae1e7468d21826d654eb32b393d20c97868087f7",
+        "size": 46774
+      },
+      {
         "name": "libnghttp2-14",
         "version": "1.59.0-1ubuntu0.4",
         "arch": "amd64",
@@ -1066,6 +1219,15 @@
         "path": "pool/main/libn/libnl3/libnl-genl-3-200_3.7.0-0.3build1.1_amd64.deb",
         "sha256": "9ca0cb63f295d00e6346b9924278c07cfc61311cbd288b805b06e25aa08c9fd8",
         "size": 12232
+      },
+      {
+        "name": "libnpth0t64",
+        "version": "1.6-3.1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/npth/libnpth0t64_1.6-3.1build1_amd64.deb",
+        "sha256": "b380eca1221a9ac855427652452801c5ca9161dd69e12446d300524eba00944e",
+        "size": 8378
       },
       {
         "name": "libonig5",
@@ -1156,6 +1318,15 @@
         "path": "pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5ubuntu0.6_amd64.deb",
         "sha256": "ac0163f58b8aa52dfdd17cdc10a83f3db084cb91a62686023f5c983d6ff89f8b",
         "size": 188776
+      },
+      {
+        "name": "libpopt0",
+        "version": "1.19+dfsg-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/p/popt/libpopt0_1.19%2bdfsg-1build1_amd64.deb",
+        "sha256": "b3e7ea5192e57c847b77c527d51f5b8d4bce47988d2ba326a5c3193f6d173ded",
+        "size": 28562
       },
       {
         "name": "libproc2-0",
@@ -1284,6 +1455,15 @@
         "size": 302950
       },
       {
+        "name": "libslang2",
+        "version": "2.3.3-3build2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/s/slang2/libslang2_2.3.3-3build2_amd64.deb",
+        "sha256": "352deab8d4dcb023ecffc766088d9c5420c36a3bef9ef5b1c9b173d1c3c88bd7",
+        "size": 505982
+      },
+      {
         "name": "libsmartcols1",
         "version": "2.39.3-9ubuntu6.5",
         "arch": "amd64",
@@ -1372,6 +1552,33 @@
         "path": "pool/main/libt/libtasn1-6/libtasn1-6_4.19.0-3ubuntu0.24.04.2_amd64.deb",
         "sha256": "f82c9ad142f952ea523bda5bfca7bb0802af3a50b8c0f0dd9ec18cdfa104bde7",
         "size": 44468
+      },
+      {
+        "name": "libtext-charwidth-perl",
+        "version": "0.04-11build3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libt/libtext-charwidth-perl/libtext-charwidth-perl_0.04-11build3_amd64.deb",
+        "sha256": "de34eec83eece9900f60ae4d4fa617cde3d6442d231ce1c269a055cc91a6d396",
+        "size": 9358
+      },
+      {
+        "name": "libtext-iconv-perl",
+        "version": "1.7-8build3",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/libt/libtext-iconv-perl/libtext-iconv-perl_1.7-8build3_amd64.deb",
+        "sha256": "b5f873b2d90987a112107a17d0f91aa3234a16b78a0d48fd7b557a85c5606e08",
+        "size": 13478
+      },
+      {
+        "name": "libtext-wrapi18n-perl",
+        "version": "0.06-10",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/libt/libtext-wrapi18n-perl/libtext-wrapi18n-perl_0.06-10_all.deb",
+        "sha256": "936619071dd5d81ff672b685af9ad20e1f524be2241cbd80556aedc376844a36",
+        "size": 7694
       },
       {
         "name": "libtinfo6",
@@ -1509,6 +1716,15 @@
         "size": 39045312
       },
       {
+        "name": "locales",
+        "version": "2.39-0ubuntu8.7",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/g/glibc/locales_2.39-0ubuntu8.7_all.deb",
+        "sha256": "27e74084e2b33a05754e10a4c304ed0a559b3325098fa65b2930fc46e914aaaf",
+        "size": 4225168
+      },
+      {
         "name": "logsave",
         "version": "1.47.0-2.4~exp1ubuntu4.1",
         "arch": "amd64",
@@ -1525,6 +1741,24 @@
         "path": "pool/main/l/lsb/lsb-base_11.6_all.deb",
         "sha256": "08a563e3c1984acdb295f12b77b4ec18d2ccf52fd03280a5bea29e506a3350ee",
         "size": 4606
+      },
+      {
+        "name": "lsb-release",
+        "version": "12.0-2",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/l/lsb-release-minimal/lsb-release_12.0-2_all.deb",
+        "sha256": "0ae566092f2d6f3000ce25a7a68497a97b637abf8dc25cbdf961c8ee66e562a7",
+        "size": 6564
+      },
+      {
+        "name": "mawk",
+        "version": "1.3.4.20240123-1build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/m/mawk/mawk_1.3.4.20240123-1build1_amd64.deb",
+        "sha256": "dc7f7f4dad4b48f6012ea65de3198d8376604afef39f06d65ec6167740e203c9",
+        "size": 127222
       },
       {
         "name": "media-types",
@@ -1561,6 +1795,15 @@
         "path": "pool/main/n/netbase/netbase_6.4_all.deb",
         "sha256": "8cdbc9c3dca01e660759bf9d840f72e45ac72faf5d19ca1faecacaf6a60c1a87",
         "size": 13112
+      },
+      {
+        "name": "netcat-openbsd",
+        "version": "1.226-1ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/netcat-openbsd/netcat-openbsd_1.226-1ubuntu2_amd64.deb",
+        "sha256": "b2b837c2f9939aeda64ddb410c47c5ceee3034cf2157939ed7efdee51961aac4",
+        "size": 44292
       },
       {
         "name": "netplan-generator",
@@ -1977,6 +2220,15 @@
         "size": 189326
       },
       {
+        "name": "sudo",
+        "version": "1.9.15p5-3ubuntu5.24.04.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/s/sudo/sudo_1.9.15p5-3ubuntu5.24.04.2_amd64.deb",
+        "sha256": "d5361d4021dc7cb60d49b94b186ba908c10e9e38f33a55cba049175411eb1251",
+        "size": 948024
+      },
+      {
         "name": "systemd",
         "version": "255.4-1ubuntu8.16",
         "arch": "amd64",
@@ -2031,6 +2283,33 @@
         "size": 280102
       },
       {
+        "name": "ubuntu-keyring",
+        "version": "2023.11.28.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1_all.deb",
+        "sha256": "36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8",
+        "size": 11124
+      },
+      {
+        "name": "ubuntu-minimal",
+        "version": "1.539.2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/u/ubuntu-meta/ubuntu-minimal_1.539.2_amd64.deb",
+        "sha256": "b7e0cf2ef11094c7169de2cae11d6745f68e2044386b1473ec15a45ea269c6ae",
+        "size": 11090
+      },
+      {
+        "name": "ubuntu-pro-client",
+        "version": "37.2ubuntu~24.04",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/u/ubuntu-advantage-tools/ubuntu-pro-client_37.2ubuntu%7e24.04_amd64.deb",
+        "sha256": "dde86fe75fe7f387241974451b98cea924ad09447be77dc61864476770340b8a",
+        "size": 258842
+      },
+      {
         "name": "ucf",
         "version": "3.0043+nmu1",
         "arch": "all",
@@ -2047,6 +2326,42 @@
         "path": "pool/main/s/systemd/udev_255.4-1ubuntu8.16_amd64.deb",
         "sha256": "486ce0b9f314cb176f5cb73d2b241fc844d59d864292eabb29366899b3cc693c",
         "size": 1874930
+      },
+      {
+        "name": "vim-common",
+        "version": "2:9.1.0016-1ubuntu7.18",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/v/vim/vim-common_9.1.0016-1ubuntu7.18_all.deb",
+        "sha256": "7596b3b0fc9fa7a841352fd8018a4981c558416a29cc8d30fe777baae2a7c9fe",
+        "size": 388450
+      },
+      {
+        "name": "vim-tiny",
+        "version": "2:9.1.0016-1ubuntu7.18",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/v/vim/vim-tiny_9.1.0016-1ubuntu7.18_amd64.deb",
+        "sha256": "9dfbc40882a3960a3f438a00d8f557230ef88f72fd26a8f60f21441beb179030",
+        "size": 805816
+      },
+      {
+        "name": "whiptail",
+        "version": "0.52.24-2ubuntu2",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/n/newt/whiptail_0.52.24-2ubuntu2_amd64.deb",
+        "sha256": "9e19741a81d81810d3401d2ea822daebdcbece5bbde0f5f59ede4a3f8ecdc6aa",
+        "size": 17998
+      },
+      {
+        "name": "xkb-data",
+        "version": "2.41-2ubuntu1.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/x/xkeyboard-config/xkb-data_2.41-2ubuntu1.1_all.deb",
+        "sha256": "e99f2a0b4c56cdf35dec489e56b6a8418826cab8ce6306ec6d0bd98e2cd0014a",
+        "size": 397328
       },
       {
         "name": "xz-utils",

@@ -725,9 +725,13 @@ let
         # /usr/sbin/invoke-rc.d (noble 1.66ubuntu1) shows why: the "unknown
         # initscript ... not found" message is printed by an UNCONDITIONAL
         # existence check --
-        #   elif test ! -f "${INITDPREFIX}${INITSCRIPTID}" ; then
-        #       printerror unknown initscript, ${INITDPREFIX}${INITSCRIPTID} not found.
+        #   elif test ! -f "''${INITDPREFIX}''${INITSCRIPTID}" ; then
+        #       printerror unknown initscript, ''${INITDPREFIX}''${INITSCRIPTID} not found.
         #   fi
+        # (the ''${...} above are Nix escapes -- this comment lives inside a
+        # Nix indented string, so an unescaped antiquotation would fail
+        # evaluation with "undefined variable 'INITDPREFIX'"; upstream's
+        # actual source has no such escaping.)
         # -- that runs at the very top of the script, long before
         # policy-rc.d is ever consulted (querypolicy() is only called later,
         # and only when the initscript file is present and executable in

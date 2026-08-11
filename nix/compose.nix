@@ -688,6 +688,34 @@ let
         # scripts (ldconfig, update-alternatives, adduser, ...) read it.
         mount -t proc proc /proc
 
+        # policy-rc.d service-start suppression (GitHub issue #118
+        # regression). A Server-seed maintainer script's postinst calls
+        # `invoke-rc.d` to start/restart its daemon -- rsyslog's is the
+        # concrete case (first pulled in by the ubuntu-standard metapackage):
+        # `invoke-rc.d: unknown initscript, /etc/init.d/rsyslog not found` /
+        # `invoke-rc.d: could not determine current runlevel`. Both errors
+        # are inherent to a chroot, not a packaging bug: there is no PID 1
+        # init running here (this whole tree is composed offline, never
+        # booted) and no /etc/init.d SysV entry to query, so invoke-rc.d has
+        # no runlevel to act on and exits non-zero, which aborts
+        # `dpkg --configure -a` under `set -eu` and cascades every
+        # not-yet-configured package into "Errors were encountered while
+        # processing". The canonical fix -- used by debootstrap,
+        # live-build, and every Debian/Ubuntu container image builder -- is
+        # a `/usr/sbin/policy-rc.d` executable that unconditionally exits
+        # 101 ("action forbidden by policy"): invoke-rc.d(8) checks for this
+        # file FIRST and treats exit code 101 as "administrator policy
+        # forbids starting services here", which it reports and then exits
+        # 0 itself, letting `dpkg --configure -a` proceed instead of
+        # actually trying (and failing) to start anything in an unbootable
+        # chroot. This is purely a build-time compose aid -- a real system
+        # booting the packed rootfs must start its services normally -- so
+        # it is deleted again below (see the /.ubx-compose cleanup) before
+        # the rootfs is packed, never shipping in $out.
+        mkdir -p /usr/sbin
+        printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d
+        chmod 0755 /usr/sbin/policy-rc.d
+
         # dpkg --unpack every declared package FIRST (this registers each
         # package's *.templates under /var/lib/dpkg/info/, and runs
         # preinst) BEFORE preseeding: debconf-set-selections needs a
@@ -827,6 +855,12 @@ let
         # residual risk, mitigated but not proven by the PERL_HASH_SEED
         # pin above).
         rm -f /var/cache/debconf/*.dat-old
+
+        # Remove the policy-rc.d shim staged above (issue #118): it exists
+        # only to keep invoke-rc.d from failing while THIS chroot has no
+        # running init, and must not ship in the packed rootfs, where a
+        # real booted system needs services to start normally.
+        rm -f /usr/sbin/policy-rc.d
 
         # Compose-time staging is not part of the composed system.
         rm -rf /.ubx-compose

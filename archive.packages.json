@@ -29,6 +29,7 @@
     "squashfs-tools",
     "systemd-sysv",
     "tzdata",
+    "ubuntu-minimal",
     "zlib1g"
   ]
 }

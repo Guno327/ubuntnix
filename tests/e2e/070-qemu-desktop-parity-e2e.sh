@@ -16,9 +16,11 @@
 # (SPEC.md §12 R12) exists; the rendered networking config (netplan +
 # hostname) landed; and — the M6 exit criterion itself — every
 # `profiles.desktop`-declared seed package is actually `dpkg`-installed and
-# none of nix/profiles.nix's enumerated M1-fixture exceptions (hello, htop,
-# ed, jq) leaked in. See nix/profiles.nix's own header, "What 'the upstream
-# Server seed' means in this repo", for why this is a subset/exclusion
+# none of nix/profiles.nix's enumerated M1-fixture exceptions (just `hello`
+# as of GitHub issue #118 -- htop/ed/jq were removed from the exception
+# list once the committed upstream manifest proved they are real upstream
+# Server packages) leaked in. See nix/profiles.nix's own header, "What 'the
+# upstream Server seed' means in this repo", for why this is a subset/exclusion
 # check rather than byte-for-byte equality against a live upstream Ubuntu
 # Desktop ISO manifest — this sandboxed dev/CI environment has no network
 # access to fetch one.

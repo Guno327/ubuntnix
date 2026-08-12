@@ -1002,6 +1002,116 @@ jobs:
           path: switch-loop-serial.log
           if-no-files-found: ignore
 
+  password-login:
+    name: Password-login QEMU e2e (SPEC.md §11 M4 exit criterion; issue #90, #153)
+    runs-on: ubuntu-24.04
+    # Why this is a SEPARATE job with its OWN freshly-built image, rather
+    # than an extra step appended after "switch-loop" against that job's
+    # result-switch-loop-image/disk.img: that disk.img is a PERSISTENT file
+    # the "switch-loop" job's own QEMU e2e switch-loop test step mutates in
+    # place across up to four guest-initiated reboots (SPEC.md §11 M2's
+    # S1-S4 scenarios) -- by the time that step finishes, disk.img reflects
+    # the END of that boot sequence, not a fresh boot 1. But
+    # tests/e2e/025-qemu-password-login-e2e.sh needs the driver script
+    # (nix/boot.nix's switchLoopDriverScript, shared with 020) run from its
+    # OWN boot 1: the M4 password-login phase lands at the very end of that
+    # driver's own phase 2, after every M2 scenario has already asserted
+    # (see 025's own header for why it can't run any earlier). Sharing
+    # switch-loop's already-mutated image here would either re-run/corrupt
+    # the M2 state or simply never reach the M4 phase at all -- exactly the
+    # bug this job exists to close (issue #153: CI paid the cost of
+    # producing UBX-M4-PW-PASS/-FAIL but asserted nothing about it). A
+    # second job building and booting its own image from scratch sidesteps
+    # that entirely, and since jobs run in parallel this does not extend
+    # overall CI wall-clock time.
+    # timeout-minutes: sized identically to (and for the same reason as)
+    # the "switch-loop" job above -- 025 drives the SAME driver script at
+    # the SAME --timeout 600 per-boot / --max-boots 4 ceiling (40m internal
+    # budget), because the M4 phase only appears after the M2 scenarios
+    # have already run once through this job's own boot sequence. 60m keeps
+    # the same >=2x-style headroom over that 40m ceiling (plus image-build
+    # time) that "switch-loop" uses, rather than the lighter single-boot
+    # jobs' 45m, which could clip a legitimately slow-but-healthy run.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install nix + qemu (Ubuntu archive)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nix qemu-system-x86
+      # Same requirement as the "boot"/"switch-loop" jobs above --
+      # nix/boot.nix's switch-loop-proof composes TWO rootfs trees (its own,
+      # plus reusing M1's boot-proof kernel) through the same hardened
+      # `unshare --user --map-root-user` chroot.
+      - name: Allow unprivileged user namespaces (needed for compose's nested unshare --user)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # `--option sandbox relaxed`: see the "boot" job's identical step for
+      # the full rationale (nix/stdenv.nix's `__noChroot = true` derivation).
+      - name: Build switch-loop-proof
+        run: |
+          sudo nix --extra-experimental-features 'nix-command flakes' --option sandbox relaxed build .#switch-loop-proof -L -o result-password-login-image
+          sudo chown -R "$USER" result-password-login-image
+      - name: Assert switch-loop-proof artifact
+        run: |
+          img="result-password-login-image/disk.img"
+          [ -s "$img" ] || { echo "no (non-empty) disk.img produced"; exit 1; }
+          python3 -c "
+          with open('$img', 'rb') as f:
+              f.seek(510)
+              sig = f.read(2)
+          assert sig == b'\x55\xaa', f'bad MBR boot signature at bytes 510-511: {sig!r}'
+          print('MBR boot signature OK (0x55AA)')
+          "
+      - name: Report KVM availability
+        run: |
+          if [ -e /dev/kvm ]; then
+            # The device exists as crw-rw---- root:kvm but the runner user is
+            # not in the kvm group, so QEMU cannot open it (-w fails) and
+            # every e2e job silently falls back to TCG software emulation
+            # (10-20x slower) -- which is what pushed the #90 login-proof
+            # boot past its 600s ceiling. Grant world rw so acceleration is
+            # actually used.
+            sudo chmod 666 /dev/kvm || true
+            ls -la /dev/kvm
+          else
+            echo "::warning::/dev/kvm not present on this runner -- the e2e password-login boot below will fall back to TCG (slower, still correct; see tests/e2e/025-qemu-password-login-e2e.sh's own KVM-detection logic)"
+          fi
+      # The actual QEMU end-to-end password-login test (SPEC.md §11's M4
+      # exit criterion, "password login from a secret-sourced hash works
+      # end-to-end"): boots this job's own just-built disk image across the
+      # same multi-boot sequence as "switch-loop" (see the job-level comment
+      # above for why this image can't be shared with that job), and
+      # asserts the UBX-M4-PW-PASS serial marker -- see
+      # tests/e2e/025-qemu-password-login-e2e.sh's own header for the exact
+      # scenario. --timeout 600 / --max-boots 4 mirror "switch-loop"'s own
+      # QEMU e2e switch-loop test step, for the identical reason (this same
+      # driver script's phase 2 boot 1 running both the M2 scenarios and the
+      # extra M4 rebuild/convergence work under possible TCG fallback).
+      #
+      # A legitimate skip (exit 77 -- no qemu-system-x86_64, or no image
+      # could be resolved/built; see 025's own header) is explicitly
+      # detected and re-announced as a `::warning::` below, distinct from a
+      # real pass, so it is impossible to mistake a skipped run for
+      # UBX-M4-PW-PASS having actually been asserted in this job's log --
+      # the exact silent-skip-looks-like-a-pass failure mode issue #153
+      # exists to close.
+      - name: QEMU e2e password-login test
+        run: |
+          rc=0
+          ./tests/e2e/025-qemu-password-login-e2e.sh --image result-password-login-image --timeout 600 --max-boots 4 --keep-log password-login-serial.log || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "::warning::tests/e2e/025-qemu-password-login-e2e.sh SKIPPED (exit 77) -- qemu-system-x86_64 not on PATH, or no image could be resolved/built. UBX-M4-PW-PASS was NOT asserted this run; see the script's own header for the skip contract."
+            exit 0
+          fi
+          exit "$rc"
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: password-login-e2e-serial-log
+          path: password-login-serial.log
+          if-no-files-found: ignore
+
   soft-reboot:
     name: Soft-reboot re-exec QEMU e2e (GitHub issue #59, follow-up to #55/#58)
     runs-on: ubuntu-24.04

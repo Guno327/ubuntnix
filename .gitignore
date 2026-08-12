@@ -14,3 +14,7 @@ scratch/
 # generated docs reference (produced by docs/gen_reference.py in CI; see
 # docs/conf.py and docs/reference/index.md)
 docs/reference/options.md
+
+# Python bytecode: build artifacts, never committed (issue #161)
+__pycache__/
+*.pyc

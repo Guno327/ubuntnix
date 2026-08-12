@@ -70,6 +70,16 @@ through M7). See `SPEC.md` §11 for the milestone plan.
   interfaces, wifi (with the Wi-Fi PSK rendered-config escape), and the
   netplan v2 render contract, composed straight onto the `/etc` primitive
   (implemented in M5; no live network-activation proof yet).
+- {doc}`filesystems` — the `fileSystems`/`swapDevices` showcase module:
+  `/etc/fstab` plus matching systemd `.mount`/`.swap` units, including the
+  `/dev/mapper/<name>` crypttab-interop wiring (implemented in M5, baked
+  into the server/desktop parity images; no live mount/swap activation
+  proof yet).
+- {doc}`localization` — the `i18n`/`console`/`time` showcase module:
+  locale/keyboard/timezone debconf preseed answers plus plain `/etc`
+  files (implemented in M5, baked into the server/desktop parity images,
+  including a real `debconf-set-selections` pass at compose time; no live
+  booted-guest content assertion yet).
 - {doc}`secrets` — the git-crypt encryption boundary for `secrets/`,
   per-machine and per-user GPG identity onboarding, and the revocation path
   (mechanism implemented and unit-tested in M4; real installer-flow wiring
@@ -78,6 +88,11 @@ through M7). See `SPEC.md` §11 for the milestone plan.
   converged against a fixture/real `pro status` (planner + executor
   implemented and unit-tested behind a mock `pro` client in M4; a real
   attach needs a real owned subscription token, tracked separately).
+- {doc}`crypttab` — passphrase-LUKS groundwork: declared volumes compiled
+  to `/etc/crypttab` plus matching systemd `.mount` units, with a
+  diff-driven planner and thin executor (mechanism implemented and
+  unit-tested in M4; unwired — not in `ubx rebuild`, no example config, no
+  e2e coverage; the real guided-install LUKS flow is M7).
 - {doc}`boot` — kernel selection, GRUB generation machinery, and the
   bootable disk image (implemented in M1).
 - {doc}`systemd` — systemd units/services: declaration, the refuse-restart
@@ -112,8 +127,11 @@ generations
 users
 etc
 networking
+filesystems
+localization
 secrets
 pro
+crypttab
 boot
 systemd
 home

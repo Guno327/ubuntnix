@@ -30,6 +30,18 @@
 #     though only in the switch-loop proof image, not any server/desktop
 #     profile image (a real, narrower gap this test also pins).
 #
+# Extended for GitHub issue #156 (the three remaining undocumented-module
+# pages: crypttab, localization, filesystems) with the identical
+# grep-for-contradiction-plus-positive-check pattern, guarding against the
+# SAME class of drift in the other direction too: docs/filesystems.md and
+# docs/localization.md must not understate what is real (both modules are
+# genuinely baked into nix/profiles.nix's server/desktop parity images and
+# CI-built/e2e-booted, not just eval-time proofs), while docs/crypttab.md
+# must not overstate what is real (nix/crypttab.nix/bin/ubx-crypttab* are
+# unit-tested groundwork only -- not wired into bin/ubx's execute_domains,
+# no example-config declaration, no e2e coverage -- unlike its filesystems/
+# localization siblings).
+#
 # This is the same self-consistency-enforcement pattern
 # tests/unit/216-install-docs-consistency.sh (issue #148) established:
 # grep for the exact stale phrases, guarded by the real code that
@@ -166,8 +178,87 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# 5. docs/crypttab.md -- must exist, name the real mechanism, and must NOT
+#    claim it is wired into `ubx rebuild`/execute_domains (it genuinely
+#    isn't -- unlike its filesystems/localization/home/etc siblings)
+# ---------------------------------------------------------------------------
+crypttab_doc="docs/crypttab.md"
+if [ ! -f "$crypttab_doc" ]; then
+  fail "$crypttab_doc does not exist (GitHub issue #156: nix/crypttab.nix/bin/ubx-crypttab*/bin/ubx-crypttab-apply have no documentation page)"
+else
+  for needle in "nix/crypttab.nix" "bin/ubx-crypttab" "bin/ubx-crypttab-apply"; do
+    grep -q -- "$needle" "$crypttab_doc" || {
+      fail "$crypttab_doc no longer names '$needle' -- it should say plainly which real, unit-tested mechanism backs this page"
+    }
+  done
+
+  # -- Positive check for the TRUE "unwired" half: if bin/ubx's
+  #    execute_domains genuinely does not invoke bin/ubx-crypttab-apply,
+  #    the doc must not claim otherwise (an overclaim, not an underclaim,
+  #    is the risk for this specific page -- see this test's header).
+  if ! grep -q "ubx-crypttab-apply" bin/ubx 2>/dev/null; then
+    if grep -qiE "wired into \`?ubx rebuild\`?|execute_domains (builds and runs|invokes) .*ubx-crypttab-apply" "$crypttab_doc"; then
+      fail "$crypttab_doc claims bin/ubx-crypttab-apply is wired into ubx rebuild/execute_domains, but bin/ubx does not invoke it -- grep -q ubx-crypttab-apply bin/ubx found nothing"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. docs/filesystems.md and docs/localization.md -- must exist, name the
+#    real mechanism, and must NOT understate the real parity-image wiring
+#    (both modules' render output is genuinely baked into
+#    nix/profiles.nix's server-parity-image/desktop-parity-image, unlike
+#    a module that only has an isolated eval-time proof)
+# ---------------------------------------------------------------------------
+check_base_module_doc() {
+  doc_path="$1"
+  nix_file="$2"
+  lib_attr="$3"
+
+  if [ ! -f "$doc_path" ]; then
+    fail "$doc_path does not exist (GitHub issue #156: $nix_file has no documentation page)"
+    return
+  fi
+
+  grep -q -- "$nix_file" "$doc_path" || {
+    fail "$doc_path no longer names '$nix_file' -- it should say plainly which real, unit-tested module backs this page"
+  }
+
+  # -- Only meaningful once nix/profiles.nix genuinely wires this module's
+  #    render output into the parity images -- if that wiring is ever
+  #    removed, this check should go quiet, not false-fail (mirrors this
+  #    test's own "SKIP-ish" posture elsewhere in this file).
+  if grep -q -- "config.flake.lib.${lib_attr}.render" nix/profiles.nix 2>/dev/null; then
+    grep -qi "server-parity-image\|desktop-parity-image\|examples/server.nix\|examples/desktop.nix" "$doc_path" || {
+      fail "$doc_path does not mention the server/desktop parity images, but nix/profiles.nix really calls config.flake.lib.${lib_attr}.render against examples/server.nix/examples/desktop.nix -- this page should say so, not leave it as an isolated eval-time proof"
+    }
+  else
+    echo "SKIP-ish: nix/profiles.nix does not call config.flake.lib.${lib_attr}.render -- nothing to contradict in $doc_path" >&2
+  fi
+}
+
+check_base_module_doc "docs/filesystems.md" "nix/filesystems.nix" "fileSystems"
+check_base_module_doc "docs/localization.md" "nix/localization.nix" "localization"
+
+# ---------------------------------------------------------------------------
+# 7. docs/index.md -- the three new pages (issue #156) must be wired into
+#    both the prose Guides list and the toctree, the same {doc}`...`
+#    consistency check section 2 already applies to `users`
+# ---------------------------------------------------------------------------
+for page in crypttab filesystems localization; do
+  if grep -q "^${page}\$" "$index_doc"; then
+    # shellcheck disable=SC2016
+    grep -q "{doc}\`${page}\`" "$index_doc" || {
+      fail "$index_doc's toctree lists '$page' but the prose Guides list has no {doc}\`$page\` entry"
+    }
+  else
+    fail "$index_doc's toctree does not list '$page' (GitHub issue #156)"
+  fi
+done
+
 if [ "$fails" -eq 0 ]; then
-  echo "OK: docs/modules.md, docs/index.md, docs/systemd.md, and docs/guards.md do not reassert stale absent/deferred claims contradicted by the real tree, and guards.md still correctly scopes guard installation to the switch-loop proof image"
+  echo "OK: docs/modules.md, docs/index.md, docs/systemd.md, docs/guards.md, docs/crypttab.md, docs/filesystems.md, and docs/localization.md do not reassert stale absent/deferred claims contradicted by the real tree, guards.md still correctly scopes guard installation to the switch-loop proof image, crypttab.md correctly scopes itself as unwired groundwork, and filesystems.md/localization.md correctly claim their real parity-image wiring"
 fi
 
 exit "$fails"

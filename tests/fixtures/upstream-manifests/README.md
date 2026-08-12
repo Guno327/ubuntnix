@@ -11,6 +11,33 @@ upstream ground truth** reproducibly, with **no CI network dependency** and
 **no live-fetch flakiness** — exactly the "committed per-release manifest
 fixtures" approach recorded as the decided source on #118.
 
+**These are LIVE-ISO manifests, not installed-system manifests, and that
+caps how far R11's coverage number can ever go (GitHub issue #143).** The
+`*-live-server-*` / `*-desktop-*` filenames are not a naming quirk: they are
+the ONLY package inventory Canonical publishes for a 24.04.x point release.
+Checked directly against both `releases.ubuntu.com/24.04.3/` and the
+cdimage daily-live tree for this task — neither publishes an
+installed-system manifest at all, only `*-live-server-*`, `*-desktop-*`,
+and `*-wsl-*` `.manifest` files, all of which describe what the **live
+boot medium** carries (the installer plus its live session), not what
+ends up on disk after `install` finishes. A live medium unavoidably
+carries packages an installed system never will — most concretely the
+live-boot/installer stack itself (`casper`, `user-setup`,
+`localechooser-data`, the installer's own pre-seeded snaps) — and pins its
+own kernel ABI build number into package names
+(`linux-image-6.8.0-71-generic` and similar) that will differ from
+whatever ABI build ubuntnix's `archive.lock.json` snapshot happens to
+resolve for the same kernel source. Neither class can ever be "fixed" by
+growing the seed further. `tests/unit/210-upstream-manifest-parity.sh`
+therefore enumerates both classes explicitly (search that file for "issue
+#143") and reports the coverage gap net of each, informationally, right
+next to the raw gap — and **the honest R11 exit target for this metric is
+`gap ⊆ {live-only, kernel-ABI-skew}`, not a raw gap of zero**, because a
+raw zero against a live-ISO fixture is not an achievable, or even
+meaningful, target. `tests/unit/214-live-iso-gap-classification.sh` pins
+that classification logic against these fixtures so it can't silently
+drift out of sync with them.
+
 ## Provenance
 
 Fetched from `https://releases.ubuntu.com/24.04/` (the canonical release

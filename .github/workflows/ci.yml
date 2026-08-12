@@ -18,6 +18,14 @@ jobs:
   test:
     name: Test suite
     runs-on: ubuntu-24.04
+    # Observed: fast (a git-crypt apt install plus tests/run.sh's whole unit
+    # suite, seconds in practice). 15m is generous headroom over that, not
+    # a measured ceiling -- sized so an apt-get hiccup or a slow runner
+    # doesn't trip it, while still failing this job LONG before it could
+    # silently eat GitHub's default 6h (see issue #150: an unrelated job on
+    # this same workflow hung ~80m with no timeout-minutes anywhere in this
+    # file to catch it).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Install git-crypt (for the secrets round-trip test, #79)
@@ -30,6 +38,11 @@ jobs:
   lint:
     name: Shell lint
     runs-on: ubuntu-24.04
+    # Observed ~16s (checkout + shellcheck over the repo's own scripts).
+    # 5m is >15x that -- shellcheck has no network/build step that could
+    # legitimately run long, so a trip here almost certainly means a real
+    # hang, not runner variance (see issue #150).
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck
@@ -55,6 +68,16 @@ jobs:
   flake:
     name: Flake evaluation
     runs-on: ubuntu-24.04
+    # Observed: fast in practice, but this job installs nix from the Ubuntu
+    # archive and then does a dozen-plus real `nix build`/`nix flake`
+    # invocations (stdenv-proof, archive-fetch-proof, the two deliberately-
+    # failing hash-mismatch proofs, snap-proof, snap-fetch-proof,
+    # etc-proof, systemd-proof, home-proof, plus a live network fetch
+    # against api.snapcraft.io) -- each one is a real build/fetch that
+    # could legitimately vary run to run. 20m gives that whole chain
+    # comfortable room without coming anywhere near the 6h default that let
+    # the #150 archive-resolve hang go unnoticed for ~80m.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Install nix (Ubuntu archive)
@@ -339,6 +362,15 @@ jobs:
   compose:
     name: Rootfs composition (SPEC.md §4.2/§11 M1; issue #9)
     runs-on: ubuntu-24.04
+    # Observed: fast in practice, but this job composes a full ubuntu-base
+    # rootfs THREE times over (compose-proof, compose-preseed-proof,
+    # compose-image-proof) and then, in "Two-run determinism check",
+    # deliberately rebuilds compose-proof a SECOND time from scratch
+    # (`--rebuild`) just to diff it byte-for-byte against the first build --
+    # i.e. this job's own design doubles its heaviest build on every run.
+    # 25m leaves headroom for that doubling plus normal apt/nix-install
+    # variance, well short of the 6h default (issue #150).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - name: Install nix (Ubuntu archive)
@@ -557,6 +589,14 @@ jobs:
   boot:
     name: Bootable disk image + QEMU e2e (SPEC.md §11 M1 exit criterion; issue #10)
     runs-on: ubuntu-24.04
+    # Observed: this job's family (single-boot QEMU e2e jobs) typically runs
+    # 15-23m, dominated by the image build plus one guest boot under a 240s
+    # internal harness timeout (see the "QEMU e2e boot test" step below).
+    # 45m is >=2x the high end of that observed range -- enough to absorb a
+    # slow runner or TCG fallback (no /dev/kvm) without masking a real hang,
+    # and nowhere near the 6h default that let a sibling job (Archive
+    # resolution) hang ~80m unnoticed (issue #150).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -628,6 +668,11 @@ jobs:
   server-parity:
     name: Server-parity QEMU e2e (SPEC.md §11 M5 exit criterion; issue #99)
     runs-on: ubuntu-24.04
+    # Same shape/observed range as the "boot" job above (single image build,
+    # single guest boot under a 240s internal harness timeout) -- see that
+    # job's identical comment for the full reasoning. 45m = >=2x the
+    # observed 15-23m typical for this job family.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -696,6 +741,11 @@ jobs:
   desktop-parity:
     name: Desktop-parity QEMU e2e (SPEC.md §11 M6 exit criterion; issue #108)
     runs-on: ubuntu-24.04
+    # Same shape/observed range as the "boot" job above (single image build,
+    # single guest boot under a 240s internal harness timeout) -- see that
+    # job's identical comment for the full reasoning. 45m = >=2x the
+    # observed 15-23m typical for this job family.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -781,6 +831,16 @@ jobs:
   installer-parity:
     name: Installer-parity QEMU e2e (SPEC.md §11 M7 exit criterion; issue #119) -- expected to skip until issue #117 lands the installer ISO
     runs-on: ubuntu-24.04
+    # Observed ~55s TODAY, because `.#installer-iso` doesn't exist yet and
+    # this job's build step fails fast (continue-on-error, see the job
+    # header comment above) -- but the moment issue #117 lands the real
+    # attribute, this job starts actually building+booting an image exactly
+    # like "boot"/"server-parity"/"desktop-parity" above. Sizing to ~55s
+    # would make this job the FIRST thing to start timing out the day #117
+    # lands, for no reason connected to issue #150. 45m matches those
+    # sibling single-boot QEMU e2e jobs (>=2x their observed 15-23m) so this
+    # value stays correct without another edit once the ISO exists.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -849,6 +909,16 @@ jobs:
   switch-loop:
     name: Switch-loop QEMU e2e (SPEC.md §11 M2 exit criterion; issue #32)
     runs-on: ubuntu-24.04
+    # This job's own "QEMU e2e switch-loop test" step below runs up to
+    # --max-boots 4 reboots at a 600s PER-BOOT internal timeout (raised
+    # from the other e2e jobs' 240s specifically because boot 1 also runs
+    # the #90 password-login proof) -- i.e. its own internal budget alone
+    # allows up to 4*600s = 40m before the harness itself would time out,
+    # well past the 15-23m typical of the single-boot e2e jobs. 60m keeps
+    # >=2x-style headroom over that 40m internal ceiling (plus image-build
+    # time) rather than reusing the other jobs' 45m, which could clip a
+    # legitimately slow-but-healthy run of THIS job.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -921,6 +991,11 @@ jobs:
   soft-reboot:
     name: Soft-reboot re-exec QEMU e2e (GitHub issue #59, follow-up to #55/#58)
     runs-on: ubuntu-24.04
+    # Single image build + single guest boot under a 240s internal harness
+    # timeout, same shape as the "boot" job above -- see that job's
+    # identical comment for the full reasoning. 45m = >=2x the observed
+    # 15-23m typical for this job family.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -982,6 +1057,12 @@ jobs:
   snap-convergence:
     name: M3 snap-convergence QEMU e2e (SPEC.md §11 M3 exit criterion; issue #64)
     runs-on: ubuntu-24.04
+    # Single image build (including a real, network-fetched hello-world
+    # snap + assertion) + single guest boot under a 240s internal harness
+    # timeout, same shape as the "boot" job above -- see that job's
+    # identical comment for the full reasoning. 45m = >=2x the observed
+    # 15-23m typical for this job family.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -1045,6 +1126,14 @@ jobs:
   home-activation:
     name: Home-activation QEMU e2e (SPEC.md §9, §11 M5 exit criterion; issue #105)
     runs-on: ubuntu-24.04
+    # This job's "QEMU e2e home-activation test" step below runs up to
+    # --max-boots 3 reboots at a 300s per-boot internal timeout (vs the
+    # single-boot e2e jobs' one boot at 240s) -- its own internal budget
+    # allows up to 3*300s = 15m before the harness itself would time out.
+    # 50m keeps headroom over that plus image-build time, a bit above the
+    # 45m used for the strictly single-boot e2e jobs but well short of
+    # switch-loop's 60m (whose own internal ceiling is nearly 3x this job's).
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v5
       - name: Install nix + qemu (Ubuntu archive)
@@ -1109,6 +1198,18 @@ jobs:
   resolve:
     name: Archive resolution (apt solver, end-to-end)
     runs-on: ubuntu-24.04
+    # THE job issue #150 is about: normally ~8m (two real apt-solver runs
+    # against snapshot.ubuntu.com plus validation), but on `main` @ 5c097d6
+    # its "Re-resolve with unchanged inputs (run 2) and diff for
+    # byte-identity" step hung ~80m -- 10x normal -- and, with no
+    # timeout-minutes anywhere in this file, sat `in_progress` looking
+    # identical to healthy slowness until GitHub's own 6h default would
+    # eventually have killed it. 25m is >=2x-plus the observed ~8m typical,
+    # generous enough to absorb real snapshot.ubuntu.com network variance
+    # (this job is NOT the place to chase the hang itself -- see the linked
+    # issue) while still failing fast, long before another 80m is silently
+    # burned.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       # apt-solver-based resolution (SPEC.md §4.4; GitHub issue #8,
@@ -1169,6 +1270,12 @@ jobs:
     name: Regenerate archive.lock.json (manual, issue #20)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    # Same single apt-solver resolve + validate shape as the "resolve" job
+    # above (see its comment), MINUS that job's second "re-resolve and diff"
+    # pass -- so this job's normal runtime should sit at or below resolve's
+    # ~8m. 20m keeps proportionate headroom without reusing resolve's exact
+    # 25m for a lighter job.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       # Same mechanism as the `resolve` job above (see its comments), but

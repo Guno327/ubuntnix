@@ -9,6 +9,12 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-24.04
+    # Observed ~26s (Sphinx+MyST install, gen_reference.py, one
+    # sphinx-build -W run). 10m is generous headroom for apt/pip variance;
+    # a job this small legitimately hanging that long almost certainly
+    # means a real stall, not slowness (see GitHub issue #150, which is
+    # about exactly this class of undetected hang on a sibling workflow).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -44,6 +50,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     # Pages not yet enabled by owner — see issue #11; flip to strict once enabled
     continue-on-error: true
+    # One actions/deploy-pages call, no build work of its own -- expected to
+    # be fast/fail-fast today (issue #11: Pages isn't enabled yet, hence
+    # continue-on-error above). 10m matches the "build" job's own headroom
+    # for the same class of "small job, generous but not unbounded" ceiling
+    # (issue #150).
+    timeout-minutes: 10
     steps:
       - name: Deploy to GitHub Pages
         id: deployment

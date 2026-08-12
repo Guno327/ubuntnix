@@ -147,4 +147,109 @@ rc=$?
 [ "$(cat "$e2e_etc_dir/greeting.txt" 2> /dev/null)" = "hello from ubx rebuild switch" ] \
   || fail "$e2e_etc_dir/greeting.txt content mismatch: $(cat "$e2e_etc_dir/greeting.txt" 2> /dev/null)"
 
+# =====================================================================
+# 5) update-content actually REWRITES an existing file's bytes
+#    (bin/ubx-etc-apply:166) -- the most destructive action in this
+#    executor and, until this test, entirely uncovered: `create` and
+#    `update-content` share the same install branch, but only `create`
+#    had a fixture (section 1's plan used `create motd`, never an
+#    UPDATE of a file that already exists with different content).
+#    Owner/group are only assertable when running as root (this
+#    script's own "Privilege" header) -- this harness runs unprivileged
+#    (tests/README.md), so only content + mode are asserted here.
+# =====================================================================
+uc_content_dir="$work/uc-content"
+mkdir -p "$uc_content_dir"
+printf 'NEW CONTENT\n' > "$uc_content_dir/motd"
+
+uc_etc_dir="$work/uc-etcdir"
+mkdir -p "$uc_etc_dir"
+printf 'stale old content that must be fully replaced\n' > "$uc_etc_dir/motd"
+chmod 0644 "$uc_etc_dir/motd"
+
+uc_plan="$work/uc-plan.tsv"
+cat > "$uc_plan" <<EOF
+update-content	motd	root	root	0640	$(sha256sum "$uc_content_dir/motd" | cut -d' ' -f1)
+EOF
+
+uc_rc=0
+"$apply" --plan "$uc_plan" --content-dir "$uc_content_dir" --etc-dir "$uc_etc_dir" --apply > /dev/null 2>&1 || uc_rc=$?
+[ "$uc_rc" -eq 0 ] || fail "update-content --apply should exit 0, got $uc_rc"
+[ "$(cat "$uc_etc_dir/motd" 2> /dev/null)" = "NEW CONTENT" ] \
+  || fail "update-content should have replaced motd's bytes entirely, got: $(cat "$uc_etc_dir/motd" 2> /dev/null)"
+[ "$(stat -c '%a' "$uc_etc_dir/motd" 2> /dev/null)" = "640" ] \
+  || fail "update-content should have set mode 0640, got $(stat -c '%a' "$uc_etc_dir/motd" 2> /dev/null)"
+
+# =====================================================================
+# 6) a malformed plan line (not exactly 6 TAB-separated fields) must
+#    exit 1 (bin/ubx-etc-apply:159-161).
+# =====================================================================
+malformed_plan="$work/malformed-plan.tsv"
+printf 'create\tmotd\troot\troot\t0644\n' > "$malformed_plan" # only 5 fields
+malformed_rc=0
+malformed_out="$("$apply" --plan "$malformed_plan" --content-dir "$content_dir" --etc-dir "$etc_dir" --apply 2>&1)" || malformed_rc=$?
+[ "$malformed_rc" -eq 1 ] || fail "a malformed (non-6-field) plan line should exit 1, got $malformed_rc"
+case "$malformed_out" in
+  *"malformed plan line"*) ;;
+  *) fail "a malformed plan line should be diagnosed as such (not merely fail some other way), got: $malformed_out" ;;
+esac
+
+# =====================================================================
+# 7) an unknown plan action must exit 1 (bin/ubx-etc-apply:190-192 --
+#    the script's own "pragma: no cover -- defensive" branch; bin/ubx-etc
+#    never emits this today, but the executor must still fail loudly if
+#    it ever did).
+# =====================================================================
+unknown_plan="$work/unknown-action-plan.tsv"
+printf 'frobnicate\tmotd\troot\troot\t0644\tabc\n' > "$unknown_plan"
+unknown_rc=0
+"$apply" --plan "$unknown_plan" --content-dir "$content_dir" --etc-dir "$etc_dir" --apply > /dev/null 2>&1 || unknown_rc=$?
+[ "$unknown_rc" -eq 1 ] || fail "an unknown plan action should exit 1, got $unknown_rc"
+
+# =====================================================================
+# 8) --plan omitted must die (exit 1) (bin/ubx-etc-apply:132).
+# =====================================================================
+noplan_rc=0
+noplan_out="$("$apply" --etc-dir "$etc_dir" 2>&1)" || noplan_rc=$?
+[ "$noplan_rc" -eq 1 ] || fail "omitting --plan should die (exit 1), got $noplan_rc"
+case "$noplan_out" in
+  *"--plan is required"*) ;;
+  *) fail "omitting --plan should die with an explicit '--plan is required' message, got: $noplan_out" ;;
+esac
+
+# =====================================================================
+# 9) --plan pointing at a missing file must die (exit 1)
+#    (bin/ubx-etc-apply:133).
+# =====================================================================
+missing_plan_rc=0
+missing_plan_out="$("$apply" --plan "$work/does-not-exist.tsv" --etc-dir "$etc_dir" 2>&1)" || missing_plan_rc=$?
+[ "$missing_plan_rc" -eq 1 ] || fail "--plan pointing at a missing file should die (exit 1), got $missing_plan_rc"
+case "$missing_plan_out" in
+  *"no such file"*) ;;
+  *) fail "--plan pointing at a missing file should die with an explicit 'no such file' message, got: $missing_plan_out" ;;
+esac
+
+# =====================================================================
+# 10) an unknown option must exit 2 (bin/ubx-etc-apply:129).
+# =====================================================================
+unknownopt_rc=0
+"$apply" --plan "$plan" --bogus-option foo > /dev/null 2>&1 || unknownopt_rc=$?
+[ "$unknownopt_rc" -eq 2 ] || fail "an unknown option should exit 2, got $unknownopt_rc"
+
+# =====================================================================
+# 11) create whose --content-dir source is missing must not succeed:
+#     `install` fails under `set -e` inside the --apply temp script
+#     (bin/ubx-etc-apply:213-222), and the target must not appear.
+# =====================================================================
+missingsrc_content_dir="$work/missingsrc-content"
+mkdir -p "$missingsrc_content_dir" # deliberately does NOT contain 'ghost'
+missingsrc_etc_dir="$work/missingsrc-etcdir"
+mkdir -p "$missingsrc_etc_dir"
+missingsrc_plan="$work/missingsrc-plan.tsv"
+printf 'create\tghost\troot\troot\t0644\tabc\n' > "$missingsrc_plan"
+missingsrc_rc=0
+"$apply" --plan "$missingsrc_plan" --content-dir "$missingsrc_content_dir" --etc-dir "$missingsrc_etc_dir" --apply > /dev/null 2>&1 || missingsrc_rc=$?
+[ "$missingsrc_rc" -ne 0 ] || fail "create with a missing --content-dir source file must not succeed (install failing under set -e)"
+[ ! -e "$missingsrc_etc_dir/ghost" ] || fail "create with a missing source must not have created $missingsrc_etc_dir/ghost"
+
 exit "$fails"

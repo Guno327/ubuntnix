@@ -1,13 +1,29 @@
 # Installation
 
-```{admonition} Planned (M7)
+```{admonition} Partially implemented — no bootable ISO yet (M7 in progress)
 :class: warning
 
-Nothing in this page exists yet. ubuntnix is pre-M1: there is no installer,
-no ISO, and no `/flake` bootstrap. This page describes the installation
-flow as designed in `SPEC.md` §10, targeted for milestone **M7 — Installer
-& ISOs**. It will be rewritten to describe the real, working installer as
-that milestone lands.
+This is **not** a pre-M1 project and this page is **not** all-future-tense:
+M1 through M6 have shipped, and two of the installer's core mechanisms
+already exist as real, unit-tested code you can run today —
+
+- the subiquity-answers→config **compiler** (`nix/installer.nix`;
+  `validateAnswers`/`compileAnswers`; tests/unit/200–203), and
+- the real **`/flake` bootstrap** (`bin/ubx-flake-init`: `git init` +
+  materialize config + `secrets/.gitattributes`/`index.nix` + `git-crypt
+  init` + initial commit + `ubx-secrets-key machine-init`; tests/unit/205),
+  plus install-time **Ubuntu Pro token capture and attach**
+  (`bin/ubx-pro-token`; tests/unit/206).
+
+What genuinely does **not** exist yet is a **bootable installer ISO that
+runs this flow unattended** on real hardware — that is blocked on GitHub
+issues **#117** (ISO build + publish pipeline) and **#119** (installer
+end-to-end ISO-boot proof), both still owner-blocked. Until those land,
+this page describes the flow as designed in `SPEC.md` §10, targeted for
+milestone **M7 — Installer & ISOs**; each step below is marked with what is
+actually implemented-and-tested today versus what is still only designed.
+It will be rewritten again once the ISO itself boots and runs the flow
+unattended.
 ```
 
 ## What is planned
@@ -48,37 +64,54 @@ it never emits its own netplan config and ubuntnix's own
 
 ### Planned installer steps
 
-1. Partition the disk (accommodating `/ubx`, `/flake`, and the writable
-   paths; optional full-disk encryption once M5 lands).
-2. Write the initial generation, built from the parity example
-   configuration matching the user's choices (`examples/server.nix` or
-   `examples/desktop.nix`, per the Desktop-vs-Server choice above).
-3. Initialize `/flake` as a git repository containing that example
-   configuration, with git-crypt set up for the `secrets/` folder and a
-   generated per-machine GPG identity added as a collaborator. `bin/
-   ubx-flake-init` (GitHub issue #114) is this step's mechanism today —
-   a single idempotent flow that composes `git init`, materializing the
-   compiled config and the `secrets/.gitattributes`/`index.nix`
-   git-crypt template, `git-crypt init`, an initial commit, and
-   `ubx-secrets-key machine-init --repo` (issue #79's machine-identity/
-   collaborator onboarding) into one command. Wiring it to run
-   unattended at real install time is still milestone **M7**; the flow
-   itself is real and unit-tested
-   (`tests/unit/205-ubx-flake-init.sh`) ahead of that.
-4. Prompt for an Ubuntu Pro token (required; free personal tokens exist),
-   store it via the secrets mechanism, and attach the machine. `bin/
-   ubx-pro-token` (GitHub issue #115) is this step's mechanism today — it
-   captures a token (`--token`/`--token-file`/an interactive echo-off `
-   /dev/tty` prompt), writes it to the flake's own
-   `secrets/pro-token` (git-crypt-encrypted at rest by the template step 3
-   already materialized) and commits it idempotently, then drives the
-   already-landed `bin/ubx-pro-apply` executor's real `attach` action with
-   it — see {doc}`pro`'s own "Install-time attach: `bin/ubx-pro-token`"
-   section for the full flow. Wiring it to run unattended at real install
-   time is still milestone **M7**; the flow itself is real and
-   unit-tested (`tests/unit/206-ubx-pro-token.sh`) ahead of that.
-5. Finish by encouraging the user to add a git remote for `/flake` so the
-   machine's definition is durably backed up off-device.
+Each step is marked with what actually exists today. "Implemented and
+unit-tested" means real code with a passing test proves it; it does **not**
+mean it is yet wired to run unattended from an ISO — that wiring is the
+remaining M7 work, gated on issues #117/#119 above.
+
+1. **Not built.** Partition the disk (accommodating `/ubx`, `/flake`, and
+   the writable paths; optional full-disk encryption once M5 lands). No
+   code exists for this step; it is subiquity's own storage-flow UI,
+   unmodified, and nothing here drives it yet.
+2. **Not built.** Write the initial generation, built from the parity
+   example configuration matching the user's choices (`examples/
+   server.nix` or `examples/desktop.nix`, per the Desktop-vs-Server choice
+   above). `nix/installer.nix`'s `compileAnswers` (step-3-adjacent, below)
+   already produces a validated config attrset from answers and
+   `tests/unit/202-installer-roundtrip-validate.sh` proves that output is
+   accepted by every downstream module's own validation — but nothing yet
+   takes that attrset and actually builds/writes a real generation from
+   it on a machine.
+3. **Implemented and unit-tested.** Initialize `/flake` as a git
+   repository containing that example configuration, with git-crypt set
+   up for the `secrets/` folder and a generated per-machine GPG identity
+   added as a collaborator. `bin/ubx-flake-init` (GitHub issue #114) is
+   this step's real mechanism today — a single idempotent flow that
+   composes `git init`, materializing the compiled config and the
+   `secrets/.gitattributes`/`index.nix` git-crypt template, `git-crypt
+   init`, an initial commit, and `ubx-secrets-key machine-init --repo`
+   (issue #79's machine-identity/collaborator onboarding) into one
+   command, proven end-to-end with a real throwaway GPG key and git repo
+   by `tests/unit/205-ubx-flake-init.sh`. Wiring it to run unattended at
+   real install time — invoked automatically from a booted ISO instead of
+   by hand — is still milestone **M7**.
+4. **Implemented and unit-tested.** Prompt for an Ubuntu Pro token
+   (required; free personal tokens exist), store it via the secrets
+   mechanism, and attach the machine. `bin/ubx-pro-token` (GitHub issue
+   #115) is this step's real mechanism today — it captures a token
+   (`--token`/`--token-file`/an interactive echo-off `/dev/tty` prompt),
+   writes it to the flake's own `secrets/pro-token` (git-crypt-encrypted
+   at rest by the template step 3 already materialized) and commits it
+   idempotently, then drives the already-landed `bin/ubx-pro-apply`
+   executor's real `attach` action with it — see {doc}`pro`'s own
+   "Install-time attach: `bin/ubx-pro-token`" section for the full flow,
+   and `tests/unit/206-ubx-pro-token.sh` for the proof (including that the
+   token value never leaks into the git object store or this test's own
+   captured output). Wiring it to run unattended at real install time is
+   still milestone **M7**.
+5. **Not built.** Finish by encouraging the user to add a git remote for
+   `/flake` so the machine's definition is durably backed up off-device.
+   This is a UX prompt, not yet written.
 
 ### Deliberate parity exceptions
 

@@ -6,11 +6,27 @@ Best-effort *textual* scan of ``<root>/modules/**/*.nix`` for
 option's dotted path plus, where present, its ``type``, ``default`` and
 ``description`` fields, and renders a sorted Markdown page.
 
-This is a stopgap. ubuntnix is pre-M1: there is no flake yet, so there is
-nothing to `nix eval`. Once modules/flake.nix exist, this textual regex
-scan should be replaced by a nix-eval-based extractor that evaluates the
-real option declarations (types, defaults, submodules, merged descriptions,
-etc.) instead of grepping source text. Anything this script cannot parse
+This is a stopgap, and as of today it is a stopgap that emits an EMPTY
+page. `flake.nix` exists and is substantial, but the ``modules/`` tree
+this script scans does **not** exist yet: every real ``mkOption``
+declaration currently lives in ``nix/*.nix`` (``nix/networking.nix``,
+``nix/archive.nix``, ``nix/secrets.nix``, ``nix/pro.nix``,
+``nix/users.nix``, ``nix/lib.nix``, ...) as an *internal submodule type*
+used for structural validation, deliberately not yet wired to a public
+``options.ubuntnix.*`` surface. So this script reports "0 option(s) from
+0 file(s)" on every run, and docs/reference/options.md is empty by
+construction rather than by accident.
+
+Two things must therefore happen before this page carries real content,
+and they are separate decisions: (1) the public ``modules/`` surface has
+to exist at all, and (2) this textual regex scan should then be replaced
+by a nix-eval-based extractor that evaluates the real option declarations
+(types, defaults, submodules, merged descriptions, etc.) instead of
+grepping source text. Pointing --root at ``nix/`` today would NOT be a
+fix for (1): it would publish internal validation types as though they
+were a supported user-facing API.
+
+Anything this script cannot parse
 (multi-line attrsets as defaults, computed paths, `lib.mkOption` written
 across unusual formatting, etc.) is simply omitted rather than guessed at.
 

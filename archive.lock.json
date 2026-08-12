@@ -15,6 +15,15 @@
         "size": 100872
       },
       {
+        "name": "amd64-microcode",
+        "version": "3.20251202.1ubuntu0.24.04.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/a/amd64-microcode/amd64-microcode_3.20251202.1ubuntu0.24.04.1_amd64.deb",
+        "sha256": "75f6860067115841864a4aaa2468665f9f398d3142a8a8b12ad07ebe9e00e4db",
+        "size": 458436
+      },
+      {
         "name": "apparmor",
         "version": "4.0.1really4.0.1-0ubuntu0.24.04.7",
         "arch": "amd64",
@@ -807,6 +816,15 @@
         "size": 62426
       },
       {
+        "name": "intel-microcode",
+        "version": "3.20260210.0ubuntu0.24.04.1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/intel-microcode/intel-microcode_3.20260210.0ubuntu0.24.04.1_amd64.deb",
+        "sha256": "bc68035481205a190f937f50e69eb1a1ca7fc209de7dfebe88c921387e328eb5",
+        "size": 13542214
+      },
+      {
         "name": "iproute2",
         "version": "6.1.0-1ubuntu6.4",
         "arch": "amd64",
@@ -832,6 +850,15 @@
         "path": "pool/main/i/iso-codes/iso-codes_4.16.0-1_all.deb",
         "sha256": "cafca0a3a1f07b44fbba53ab7a1f1d9755e6b80cc041173afe2b52e53bed97a7",
         "size": 3491500
+      },
+      {
+        "name": "iucode-tool",
+        "version": "2.3.1-3build1",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/i/iucode-tool/iucode-tool_2.3.1-3build1_amd64.deb",
+        "sha256": "d98748475409b4eaaab8477286a5cfe3da95f334b14b3c2a2e06f802560e211a",
+        "size": 43850
       },
       {
         "name": "jq",
@@ -2544,6 +2571,51 @@
         "size": 19622
       },
       {
+        "name": "linux-firmware",
+        "version": "20240318.git3b128b60-0ubuntu2.27",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux-firmware/linux-firmware_20240318.git3b128b60-0ubuntu2.27_amd64.deb",
+        "sha256": "63c9db2d30f1573354f5a94d03dee1c88ddc293b4aff90a75df155597cc839f0",
+        "size": 640768192
+      },
+      {
+        "name": "linux-generic",
+        "version": "6.8.0-134.134",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux-meta/linux-generic_6.8.0-134.134_amd64.deb",
+        "sha256": "421b690f741c621464875d7517f76fc777ce107bc4797faaffceca3e3c960f90",
+        "size": 1700
+      },
+      {
+        "name": "linux-headers-6.8.0-134",
+        "version": "6.8.0-134.134",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/l/linux/linux-headers-6.8.0-134_6.8.0-134.134_all.deb",
+        "sha256": "264383cc4476dee110ec41a4cc7abbfa2b71798ae602818a27940a8e1690d45f",
+        "size": 13535812
+      },
+      {
+        "name": "linux-headers-6.8.0-134-generic",
+        "version": "6.8.0-134.134",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux/linux-headers-6.8.0-134-generic_6.8.0-134.134_amd64.deb",
+        "sha256": "83ade36cae1fe2d46ae790c72207926068d0ddb1ccc1bd05775ade3b73ad492c",
+        "size": 3779856
+      },
+      {
+        "name": "linux-headers-generic",
+        "version": "6.8.0-134.134",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux-meta/linux-headers-generic_6.8.0-134.134_amd64.deb",
+        "sha256": "4632819590ce3d1e966e9f2ef77d2db46ead7535b58573e442c595c3e7a5e1f9",
+        "size": 11280
+      },
+      {
         "name": "linux-image-6.8.0-134-generic",
         "version": "6.8.0-134.134",
         "arch": "amd64",
@@ -2551,6 +2623,15 @@
         "path": "pool/main/l/linux-signed/linux-image-6.8.0-134-generic_6.8.0-134.134_amd64.deb",
         "sha256": "f87cc60f2495217a151bced4116186e7a5fc9bc728c05e6c3c676d19bc6ea1a0",
         "size": 14802058
+      },
+      {
+        "name": "linux-image-generic",
+        "version": "6.8.0-134.134",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux-meta/linux-image-generic_6.8.0-134.134_amd64.deb",
+        "sha256": "281e0ea178d15445e0236de3ecc5777ec9258daf9d8cb29797907403c330deef",
+        "size": 11446
       },
       {
         "name": "linux-image-virtual",
@@ -2569,6 +2650,15 @@
         "path": "pool/main/l/linux/linux-modules-6.8.0-134-generic_6.8.0-134.134_amd64.deb",
         "sha256": "09f21c75330018315a643ad5f1a51287fa17ffa5ff4866e8bfcb56c868ef1ddd",
         "size": 39045312
+      },
+      {
+        "name": "linux-modules-extra-6.8.0-134-generic",
+        "version": "6.8.0-134.134",
+        "arch": "amd64",
+        "component": "main",
+        "path": "pool/main/l/linux/linux-modules-extra-6.8.0-134-generic_6.8.0-134.134_amd64.deb",
+        "sha256": "f445185d1664025f4ea95d24757baf398fd4a47b6caadcf1bd3b15a1205929f6",
+        "size": 113346752
       },
       {
         "name": "locales",
@@ -3847,6 +3937,15 @@
         "path": "pool/main/n/newt/whiptail_0.52.24-2ubuntu2_amd64.deb",
         "sha256": "9e19741a81d81810d3401d2ea822daebdcbece5bbde0f5f59ede4a3f8ecdc6aa",
         "size": 17998
+      },
+      {
+        "name": "wireless-regdb",
+        "version": "2025.10.07-0ubuntu1~24.04.1",
+        "arch": "all",
+        "component": "main",
+        "path": "pool/main/w/wireless-regdb/wireless-regdb_2025.10.07-0ubuntu1%7e24.04.1_all.deb",
+        "sha256": "5503482911e13606660bbf2d820a5e962ce21f2a02d6fb29e687e1706780d0ab",
+        "size": 7542
       },
       {
         "name": "xfsprogs",

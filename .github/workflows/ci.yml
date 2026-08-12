@@ -64,6 +64,20 @@ jobs:
           # ("not following"), failing this job on a false positive
           # (GitHub issue #31).
           [ -z "$files" ] || shellcheck -x $files
+      - name: Install pyflakes (Ubuntu archive, no pip/PyPI -- issue #154)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pyflakes
+      - name: python lint
+        run: |
+          # *.py anywhere, discovered the same way the shellcheck step
+          # above discovers shell scripts (globbed, not hardcoded), so a
+          # newly added .py file is covered automatically (issue #154).
+          files=$(find . -name '*.py' -not -path './.git/*' -type f | sort -u)
+          if [ -n "$files" ]; then
+            python3 -m compileall -q $files
+            python3 -m pyflakes $files
+          fi
 
   flake:
     name: Flake evaluation

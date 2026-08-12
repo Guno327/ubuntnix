@@ -34,7 +34,7 @@
 #
 # PyYAML happens to be importable in some dev environments but nothing
 # else in this tree imports it (grep the repo -- every other YAML-adjacent
-# check here, e.g. tests/unit/181-networking-netplan-render.sh and
+# check here, e.g. tests/unit/219-networking-netplan-render.sh and
 # tests/unit/204-cloudinit-coexistence-r12.sh, treats netplan/cloud-init
 # YAML as opaque text via grep, never `import yaml`), and this issue's own
 # brief is explicit: do not add a dependency on it being present. GitHub

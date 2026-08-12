@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# tests/unit/181-networking-netplan-render.sh — nix/networking.nix
+# tests/unit/219-networking-netplan-render.sh — nix/networking.nix
 # rendering-shape checks: netplan YAML (dhcp/static/wifi cases),
 # /etc/hostname, /etc/hosts, and the Wi-Fi PSK rendered-config escape
 # (SPEC.md §6, §8.1; GitHub issue #95).
 #
-# Same caveat as tests/unit/180-networking-flake-wiring.sh: this harness
+# Same caveat as tests/unit/218-networking-flake-wiring.sh: this harness
 # has no `nix` binary, so the actual netplan YAML text can only be proven
 # correct by CI's own "flake" job building `.#networking-proof` (which
 # forces validate/render against `exampleNetworking` at eval time -- see

@@ -34,6 +34,32 @@
 # direction asserted here stays correct and useful throughout that growth —
 # it is what catches an unexplained package appearing in our closure — but
 # it is a floor, not a statement that upstream ⊆ ours is out of scope.
+#
+# -- The base layer (GitHub issue #140) -------------------------------------
+#
+# The coverage GAP this test reports (how much of upstream we do NOT yet
+# have) used to be measured as upstream minus the locked closure alone. That
+# overstated the gap: a composed ubuntnix system is not just the locked
+# closure. `nix/compose.nix`'s `composeRootfs` unpacks the `ubuntu-base`
+# tarball FIRST and layers the locked closure on top of it (see that file's
+# "ubuntu-base plus every declared package" language at its composeRootfs
+# header and implementation) — `nix/stdenv.nix` pins exactly which tarball.
+# Packages that ship inside ubuntu-base itself (`bash`, `dash`, `grep`,
+# `gzip`, `util-linux`, `base-files`, `login`, and so on — 15 of them
+# against the Server manifest as of this writing) are present on every real
+# composed system whether or not `archive.lock.json` lists them too, so the
+# honest "how much of upstream does a composed system actually have"
+# question has to compute against base ∪ closure, not closure alone. The
+# base layer's own package inventory is committed as
+# tests/fixtures/upstream-manifests/ubuntu-base-24.04.4-base-amd64.packages
+# (see that directory's README for how it was derived and how it stays
+# pinned to the exact tarball nix/stdenv.nix fetches — tests/unit/213-
+# ubuntu-base-fixture-pin.sh is the tripwire for that). This CHANGES ONLY
+# THE COVERAGE/GAP REPORTING below (an informational OK-line, not an
+# assertion); it does not touch the "declared ⊆ upstream + additions"
+# subset check above, which stays exactly as it was — the base layer isn't
+# something we "declare," so it has no bearing on whether OUR declarations
+# are honest.
 set -u
 
 cd "$UBX_REPO_ROOT" || exit 1
@@ -47,9 +73,10 @@ fail() {
 fixtures_dir="tests/fixtures/upstream-manifests"
 server_manifest="$fixtures_dir/ubuntu-24.04.3-live-server-amd64.manifest"
 desktop_manifest="$fixtures_dir/ubuntu-24.04.3-desktop-amd64.manifest"
+base_packages="$fixtures_dir/ubuntu-base-24.04.4-base-amd64.packages"
 profiles_nix="nix/profiles.nix"
 
-for f in "$server_manifest" "$desktop_manifest" archive.lock.json "$profiles_nix"; do
+for f in "$server_manifest" "$desktop_manifest" "$base_packages" archive.lock.json "$profiles_nix"; do
   [ -f "$f" ] || {
     echo "FAIL: required input '$f' does not exist" >&2
     exit 1
@@ -78,12 +105,12 @@ for excl_var in serverSeedExceptions desktopSeedExceptions; do
   esac
 done
 
-if ! python3 - "$server_manifest" "$desktop_manifest" <<'PYEOF'
+if ! python3 - "$server_manifest" "$desktop_manifest" "$base_packages" <<'PYEOF'
 import hashlib
 import json
 import sys
 
-server_manifest, desktop_manifest = sys.argv[1], sys.argv[2]
+server_manifest, desktop_manifest, base_packages = sys.argv[1], sys.argv[2], sys.argv[3]
 
 rc = 0
 
@@ -120,6 +147,24 @@ def upstream_names(path):
             name = line.split("\t", 1)[0].split(":", 1)[0]
             if name:
                 names.add(name)
+    return names
+
+
+def base_layer_names(path):
+    """Parse the ubuntu-base package-list fixture (GitHub issue #140): one
+    package name per line, `#`-prefixed provenance comments and blank lines
+    ignored. See tests/fixtures/upstream-manifests/README.md's "ubuntu-base
+    base-layer package list" section for what this file is and how it is
+    derived; tests/unit/213-ubuntu-base-fixture-pin.sh is what keeps it
+    honest against nix/stdenv.nix's live tarball pin — this function just
+    reads it."""
+    names = set()
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            names.add(line)
     return names
 
 
@@ -214,6 +259,33 @@ else:
         f"OK: parity — all {len(declared_seed)} declared seed packages accounted for "
         f"({in_union} in upstream Server∪Desktop, {additions} documented ubuntnix "
         f"additions). Per-variant upstream coverage: {per_variant}."
+    )
+
+# -- Coverage/gap reporting: base ∪ closure, not closure alone (issue #140) -
+#
+# The above proves declared ⊆ upstream and stops there — it never asked how
+# much of upstream we're still MISSING. This section answers that, purely
+# informationally (it never sets `rc`; a growing gap is expected and tracked
+# by SPEC.md §11's M5 seed-growth work, not a per-PR CI failure). The
+# effective package set a real composed system has is base ∪ closure (see
+# this file's header and nix/compose.nix's composeRootfs): the ubuntu-base
+# tarball nix/stdenv.nix pins, layered under whatever the locked closure
+# adds. Reporting the gap against the closure alone — as this test did
+# before issue #140 — overstated it by counting packages like `bash` and
+# `grep` as "missing" when every composed system already has them via
+# ubuntu-base.
+base_names = base_layer_names(base_packages)
+effective_system = set(declared_seed) | base_names
+
+for lbl, upstream in variants.items():
+    gap_closure_only = upstream - set(declared_seed)
+    gap_with_base = upstream - effective_system
+    closed_by_base = gap_closure_only - gap_with_base
+    print(
+        f"OK: {lbl} upstream-coverage gap — {len(gap_closure_only)} packages "
+        f"uncovered by the locked closure alone; {len(gap_with_base)} "
+        f"uncovered once the ubuntu-base layer ({len(base_names)} packages) "
+        f"is also counted ({len(closed_by_base)} closed by the base layer)."
     )
 
 sys.exit(rc)

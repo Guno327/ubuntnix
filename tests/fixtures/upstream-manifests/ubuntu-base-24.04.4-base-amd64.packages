@@ -1,0 +1,138 @@
+# tests/fixtures/upstream-manifests/ubuntu-base-24.04.4-base-amd64.packages
+# — the installed-package inventory of the ubuntu-base tarball itself
+# (GitHub issue #140; SPEC.md §12 R11, §11 M7).
+#
+# WHY THIS FIXTURE EXISTS: tests/unit/210-upstream-manifest-parity.sh used
+# to diff ubuntnix's declared, locked closure (archive.lock.json) directly
+# against Canonical's upstream Server manifest and report the difference as
+# "missing from ubuntnix." That is wrong for a composed ubuntnix system:
+# nix/compose.nix's composeRootfs (see its header, and the "ubuntu-base
+# plus every declared package" line at nix/compose.nix:95/291) builds every
+# rootfs as the ubuntu-base tarball UNPACKED FIRST, with the locked closure
+# layered on top. A package that ships inside ubuntu-base itself — bash,
+# dash, grep, gzip, util-linux, base-files, login, and so on — is present
+# on every real composed system whether or not archive.lock.json also lists
+# it. Treating those as "missing" overstated the R11 gap. This fixture lets
+# 210 compute the honest effective package set (base ∪ closure) instead of
+# closure alone, without needing to fetch or unpack the 30MB tarball in CI.
+#
+# PROVENANCE
+#   Source tarball: ubuntu-base-24.04.4-base-amd64.tar.gz
+#   Source URL:     https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-amd64.tar.gz
+#   Tarball SHA-256: c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58
+#     (this is the exact same digest nix/stdenv.nix pins at its `sha256`
+#     assignment for `tarball` — see that file's own "Trust root" comment
+#     for how it was independently reproduced. tests/unit/213-ubuntu-base-
+#     fixture-pin.sh parses nix/stdenv.nix's pin at test time and fails if
+#     it and the value recorded here ever disagree, so this fixture cannot
+#     silently drift onto a different ubuntu-base spin than the one the
+#     build actually fetches.)
+#   Derivation:     the tarball was downloaded, its SHA-256 independently
+#     verified against the digest above, then extracted; this file lists
+#     every package name whose entry in the extracted tree's own
+#     var/lib/dpkg/status has a `Status:` field ending in `installed`
+#     (dpkg's own definition of "actually installed," as opposed to a
+#     stale/half-configured/removed-but-not-purged entry) — i.e. exactly
+#     the package set dpkg itself considers present on a freshly-unpacked
+#     ubuntu-base rootfs, before any of ubuntnix's own composeRootfs step
+#     layers the locked closure on top.
+#   Derived:        2026-08-12
+#   Count:          91 package names, sorted, one per line, no duplicates.
+#
+# Format: one binary package name per line (no version, no `:arch` suffix
+# — ubuntu-base is single-arch amd64 so no multiarch suffix ever appears).
+# Regenerate with, from an independently-verified copy of the tarball:
+#   tar xzf ubuntu-base-24.04.4-base-amd64.tar.gz -O var/lib/dpkg/status \
+#     | awk '/^Package: /{p=$2} /^Status: .* installed$/{print p}' \
+#     | sort -u
+apt
+base-files
+base-passwd
+bash
+bsdutils
+coreutils
+dash
+debconf
+debianutils
+diffutils
+dpkg
+e2fsprogs
+findutils
+gcc-14-base
+gpgv
+grep
+gzip
+hostname
+init-system-helpers
+libacl1
+libapt-pkg6.0t64
+libassuan0
+libattr1
+libaudit-common
+libaudit1
+libblkid1
+libbz2-1.0
+libc-bin
+libc6
+libcap-ng0
+libcap2
+libcom-err2
+libcrypt1
+libdb5.3t64
+libdebconfclient0
+libext2fs2t64
+libffi8
+libgcc-s1
+libgcrypt20
+libgmp10
+libgnutls30t64
+libgpg-error0
+libhogweed6t64
+libidn2-0
+liblz4-1
+liblzma5
+libmd0
+libmount1
+libncursesw6
+libnettle8t64
+libnpth0t64
+libp11-kit0
+libpam-modules
+libpam-modules-bin
+libpam-runtime
+libpam0g
+libpcre2-8-0
+libproc2-0
+libseccomp2
+libselinux1
+libsemanage-common
+libsemanage2
+libsepol2
+libsmartcols1
+libss2
+libssl3t64
+libstdc++6
+libsystemd0
+libtasn1-6
+libtinfo6
+libudev1
+libunistring5
+libuuid1
+libxxhash0
+libzstd1
+login
+logsave
+mawk
+mount
+ncurses-base
+ncurses-bin
+passwd
+perl-base
+procps
+sed
+sensible-utils
+sysvinit-utils
+tar
+ubuntu-keyring
+util-linux
+zlib1g

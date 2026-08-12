@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/unit/180-networking-flake-wiring.sh — nix/networking.nix static
+# tests/unit/218-networking-flake-wiring.sh — nix/networking.nix static
 # wiring checks (SPEC.md §6 showcase modules, §8.1 rendered-config escape;
 # GitHub issue #95).
 #
@@ -11,7 +11,7 @@
 # flake.nix, exposes flake.lib.networking, throws on a bad declaration, is
 # wired to a real per-system proof package that composes onto
 # nix/etc.nix's own render, and that the flake-wide purity guard (021)
-# still holds with it in the tree. tests/unit/181-networking-netplan-
+# still holds with it in the tree. tests/unit/219-networking-netplan-
 # render.sh covers the actual YAML/hosts/hostname content shape.
 set -u
 

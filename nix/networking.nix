@@ -81,7 +81,7 @@
 # placeholder with the real PSK read from `/run/secrets/<name>` when it
 # copies this rendered template into the real, root-only
 # `/etc/netplan/01-ubuntnix.yaml` — never before, and never inside a store
-# object. tests/unit/181-networking-netplan-render.sh statically confirms
+# object. tests/unit/219-networking-netplan-render.sh statically confirms
 # no raw secret VALUE ever appears here — only the name-derived placeholder
 # shape.
 #
@@ -491,7 +491,7 @@ in
     # `packages.*` output either, for the identical reason nix/etc.nix's
     # own header gives: `validate` throws at EVALUATION time, and exposing
     # a throwing call under `packages` would poison `nix flake check` for
-    # the whole flake. tests/unit/180-networking-flake-wiring.sh statically
+    # the whole flake. tests/unit/218-networking-flake-wiring.sh statically
     # greps this file's own code for the real `throw` instead, mirroring
     # tests/unit/111's/170's/175's own posture.
     packages.networking-proof = render {

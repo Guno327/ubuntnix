@@ -1,15 +1,22 @@
 # Module authoring
 
-```{admonition} Planned (M1..M5)
-:class: warning
+```{admonition} Design page; primitives and profiles.* already landed
+:class: note
 
-There is no flake and no `modules/` tree in this repository yet — another
-engineering track is standing up the flake-parts skeleton in parallel. This
-page describes the *design* for the configuration surface and module
-system from `SPEC.md` §6 and G8, so that authors have an accurate mental
-model to build against. It is not a tutorial against working code yet, and
-it will be updated as primitives (roughly M1-M4) and the base module set
-(M5) land.
+The flake (`flake.nix`) and its flake-parts skeleton are real and in the
+tree today — `nix/lib.nix` registers this project's own `flake.lib`
+namespace via `flake-parts-lib.mkSubmoduleOptions`, and every primitive and
+showcase module described below is implemented, unit-tested, and (for
+`profiles.server`/`profiles.desktop`) proven live in QEMU e2e. What has
+**not** landed yet is a dedicated `modules/` tree and a real NixOS-style
+module-evaluation surface (`mkOption`/`config` merging across
+user-authored files): primitives and showcase modules are implemented
+today as hand-written `validateDecl`/`render` function pairs under `nix/`
+(one file per feature), not through module evaluation. This page describes
+the *design* for the configuration surface and module system from
+`SPEC.md` §6 and G8, so that authors have an accurate mental model to
+build against, and calls out below exactly which parts are real today
+versus still design.
 ```
 
 ## Primitives vs. modules
@@ -74,8 +81,14 @@ stock Ubuntu, not a replacement for it.
 
 ubuntnix targets a **dendritic** flake-parts organization: one file per
 feature, each contributing to both the system and home configuration
-classes, rather than one monolithic module tree. Concretely, once the
-flake skeleton lands:
+classes, rather than one monolithic module tree. The flake-parts skeleton
+(`flake.nix`, `nix/lib.nix`) is real today, and every primitive and
+showcase module implemented so far already follows this one-file-per-
+feature layout under `nix/` (`nix/etc.nix`, `nix/systemd.nix`,
+`nix/profiles.nix`, and so on). What remains design, not yet landed, is
+the second half: a dedicated `modules/` tree using real module evaluation
+(`mkOption`/`config` merging across user-authored files) rather than
+today's hand-written `validateDecl`/`render` pairs. Once that lands:
 
 - each file under `modules/` declares one coherent piece of functionality
   (a primitive, a showcase module, a home module) using flake-parts to

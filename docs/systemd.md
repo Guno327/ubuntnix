@@ -1,6 +1,6 @@
 # Systemd units and services: declaration, planning, execution
 
-```{admonition} Implemented standalone (M2, issue #27); activation wiring deferred
+```{admonition} Implemented and wired into `ubx rebuild` (M2, issue #27)
 :class: note
 
 `nix/systemd.nix`, `bin/ubx-systemd`, and `bin/ubx-systemd-apply` exist in
@@ -11,11 +11,15 @@ declaration, eval-time validation, JSON manifest rendering, the ordered
 unit-activation planner, and the thin executor are all real and
 unit-tested (`tests/unit/120-systemd-plan-basic.sh` through
 `124-systemd-observe-report-apply.sh`). **Wiring this into a real running
-system's `ubx rebuild switch`** is explicitly deferred, the same way
-issue #26's `bin/ubx-etc-apply` and issue #28's `ubx-users execute` were
-each unit-tested standalone with real activation-path wiring left for
-later (see {doc}`users`'s own "Scope" section). Nothing on this page
-describes a behavior observable on a running ubuntnix system yet.
+system's `ubx rebuild switch`** is done: `bin/ubx`'s `execute_domains`
+builds and runs `bin/ubx-systemd-apply --plan ... --unit-dir ...
+--content-dir ...` (under `--apply`/`--dry-run` per the requested verb),
+the same way `bin/ubx-etc-apply` is invoked right alongside it — see
+`tests/unit/137-ubx-systemd-apply-real-invocation.sh`, which exists
+specifically to pin that real invocation. What is still ahead is
+on-device Nix evaluation and the soft-reboot path for image changes
+themselves (see {doc}`ubx`), not the unit-activation wiring this page
+describes.
 ```
 
 ## Why this exists
@@ -279,7 +283,10 @@ itself" scope line, adapted: this executor *does* run commands under
 ## Where to track progress
 
 `nix/systemd.nix`, `bin/ubx-systemd`, and `bin/ubx-systemd-apply` land at
-milestone **M2** (`SPEC.md` §11, issue #27). Wiring the whole thing into
-`ubx rebuild switch|boot|test` against a real running system's real
-`/etc/systemd/system` and real `systemctl` is later work, tracked
-alongside {doc}`etc`'s and {doc}`users`'s own activation-wiring follow-ups.
+milestone **M2** (`SPEC.md` §11, issue #27), and `bin/ubx`'s
+`execute_domains` already wires the executor into `ubx rebuild
+switch|boot|test` against a real `/etc/systemd/system` and real
+`systemctl` (`tests/unit/137-ubx-systemd-apply-real-invocation.sh`). What
+is still later work is on-device Nix evaluation and soft-reboot into a
+changed image, tracked alongside {doc}`ubx`'s own "Where to track
+progress".

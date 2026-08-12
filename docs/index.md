@@ -23,16 +23,21 @@ repository root for the full specification):
 ```{admonition} Project status
 :class: important
 
-This repository is **partway through milestone M2**. The flake skeleton,
-the Ubuntu-native stdenv bootstrap, and the archive lockfile with
-snapshot-pinned deb fetching exist; there are no modules and no real Nix
-evaluation/composition for `/etc`, systemd units, or a rootfs image yet.
-`ubx rebuild switch|boot|test`, `rollback`, `list-generations`, and `diff`
-ARE real, orchestrating already-implemented domain planners against
-caller-supplied manifests (see {doc}`ubx`). The guides below are explicit,
-page by page, about what is implemented today versus what is planned for a
-future milestone (M1 through M7). See `SPEC.md` §11 for the milestone
-plan.
+**M1 through M6 have shipped; M7 (installer & ISOs) is in progress** (see
+{doc}`install`). The flake skeleton, the Ubuntu-native stdenv bootstrap,
+the archive lockfile with snapshot-pinned deb fetching, generated `/etc`
+(`nix/etc.nix`), systemd unit declaration/planning/execution
+(`nix/systemd.nix`), snap convergence, secrets + Ubuntu Pro, the base
+module set plus `profiles.server`/`profiles.desktop`, and rootfs/disk-image
+composition (`nix/compose.nix`, `nix/boot.nix`) all exist, are unit-tested,
+and are proven in CI (the `etc-proof`, `systemd-proof`,
+`compose-image-proof`, and `boot-image-proof` jobs, plus the QEMU e2e jobs
+in `.github/workflows/ci.yml`). `ubx rebuild switch|boot|test`,
+`rollback`, `list-generations`, and `diff` ARE real, orchestrating
+already-implemented domain planners against caller-supplied manifests (see
+{doc}`ubx`). The guides below are explicit, page by page, about what is
+implemented today versus what is planned for a future milestone (M1
+through M7). See `SPEC.md` §11 for the milestone plan.
 ```
 
 ## Guides
@@ -53,6 +58,10 @@ plan.
 - {doc}`generations` — the generation model: on-disk layout, numbering,
   retention, and GC planning (planner implemented in M2; activation and
   deletion land later).
+- {doc}`users` — declared users, groups, and secret-backed password
+  hashes: the convergence planner and thin executor (declaration + plan +
+  executor implemented and unit-tested in M2; wiring `ubx-users execute`'s
+  output into a real running system's activation path lands later).
 - {doc}`etc` — the generated `/etc`: declared-entry compilation, the
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands

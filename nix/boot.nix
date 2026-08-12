@@ -1950,19 +1950,19 @@ let
           || mark_fail_pw "first 'ubx rebuild switch' (account creation) did not emit a non-empty users activation script $STATE/pw-users-activate.sh -- see $STATE/m4-create.log"
         sed -n '/^{$/,/^}$/p' "$STATE/m4-create.log" > "$STATE/m4-create.json"
         UBX_M4_PW_USER="${switchLoopPwUserName}" UBX_M4_PW_JSON="$STATE/m4-create.json" python3 <<'UBX_M4_CREATE_CHECK_PY_EOF'
-import json
-import os
-import sys
+    import json
+    import os
+    import sys
 
-with open(os.environ["UBX_M4_PW_JSON"], encoding="utf-8") as f:
-    payload = json.load(f)
-user = os.environ["UBX_M4_PW_USER"]
-expected = [
-    f"user '{user}': not present in /etc/shadow (create the user, e.g. "
-    "via 'ubx-users execute', before setting its password)"
-]
-sys.exit(0 if payload.get("errors") == expected else 1)
-UBX_M4_CREATE_CHECK_PY_EOF
+    with open(os.environ["UBX_M4_PW_JSON"], encoding="utf-8") as f:
+        payload = json.load(f)
+    user = os.environ["UBX_M4_PW_USER"]
+    expected = [
+        f"user '{user}': not present in /etc/shadow (create the user, e.g. "
+        "via 'ubx-users execute', before setting its password)"
+    ]
+    sys.exit(0 if payload.get("errors") == expected else 1)
+    UBX_M4_CREATE_CHECK_PY_EOF
         m4_create_check_rc=$?
         [ "$m4_create_check_rc" -eq 0 ] \
           || mark_fail_pw "first 'ubx rebuild switch' (account creation) reported an unexpected apply-passwords error set (expected exactly one: '${switchLoopPwUserName}' not present in /etc/shadow) -- see $STATE/m4-create.log"

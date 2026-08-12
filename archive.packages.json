@@ -19,6 +19,7 @@
     "liblzo2-2",
     "libnl-3-200",
     "libnl-genl-3-200",
+    "linux-generic",
     "linux-image-virtual",
     "mtools",
     "netplan.io",

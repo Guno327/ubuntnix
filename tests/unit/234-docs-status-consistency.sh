@@ -95,6 +95,12 @@ else
   fi
 
   # -- Guides list must include every toctree page, including users.
+  # The single quotes here are deliberate and required: the pattern is the
+  # LITERAL MyST role {doc}`users`, backticks and all. shellcheck reads
+  # those backticks as a command substitution it thinks we wanted expanded
+  # (SC2016) -- a false positive, since expanding anything here would break
+  # the grep. Quoting it differently would change what we search for.
+  # shellcheck disable=SC2016
   if grep -q '^users$' "$index_doc" && ! grep -q '{doc}`users`' "$index_doc"; then
     fail "$index_doc's toctree lists 'users' but the prose Guides list has no {doc}\`users\` entry"
   fi

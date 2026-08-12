@@ -119,24 +119,27 @@ ubx_rebuild_sidecar_path() {
 }
 
 # ubx_rebuild_write_sidecar ROOT GEN SYSTEMD_REF [SECRETS_REF] [PRO_REF]
-# [HOME_REF] — atomically records SYSTEMD_REF (may be empty) as GEN's
-# systemd-manifest reference, SECRETS_REF (may be empty/omitted, GitHub
-# issue #78, SPEC.md §8.1) as GEN's secrets-manifest reference, PRO_REF
-# (may be empty/omitted, GitHub issue #82, SPEC.md §8.2, milestone M4) as
-# GEN's Ubuntu Pro manifest reference, and, per GitHub issue #98 (SPEC.md
-# §9, milestone M5), HOME_REF (may be empty/omitted) as GEN's per-user home
-# manifest reference, in the SAME sidecar file — the home domain has
-# exactly the same "no reserved bin/ubx-generations manifest field yet"
-# situation GEN_SYSTEMD_REF/SECRETS_MANIFEST/PRO_MANIFEST had (see this
+# [HOME_REF] [CRYPTTAB_REF] — atomically records SYSTEMD_REF (may be empty)
+# as GEN's systemd-manifest reference, SECRETS_REF (may be empty/omitted,
+# GitHub issue #78, SPEC.md §8.1) as GEN's secrets-manifest reference,
+# PRO_REF (may be empty/omitted, GitHub issue #82, SPEC.md §8.2, milestone
+# M4) as GEN's Ubuntu Pro manifest reference, HOME_REF (may be empty/
+# omitted, GitHub issue #98, SPEC.md §9, milestone M5) as GEN's per-user
+# home manifest reference, and, per GitHub issue #170 (SPEC.md §11 M4,
+# §8.3), CRYPTTAB_REF (may be empty/omitted) as GEN's crypttab manifest
+# reference, in the SAME sidecar file — the crypttab domain has exactly
+# the same "no reserved bin/ubx-generations manifest field yet" situation
+# GEN_SYSTEMD_REF/SECRETS_MANIFEST/PRO_MANIFEST/HOME_MANIFEST had (see this
 # file's header, "The systemd-manifest sidecar" — that reasoning applies
-# here verbatim, just for a fourth field instead of inventing a fourth
+# here verbatim, just for a fifth field instead of inventing a fifth
 # sidecar file). A no-op write (empty value) still creates the file, so a
 # generation created without --systemd-ref/--secrets-manifest/
-# --pro-manifest/--home-manifest is unambiguously "sidecar says: nothing
-# declared" rather than "sidecar never written" — both read back as ""
-# either way, but writing it always keeps the on-disk contract uniform.
+# --pro-manifest/--home-manifest/--crypttab-manifest is unambiguously
+# "sidecar says: nothing declared" rather than "sidecar never written" —
+# both read back as "" either way, but writing it always keeps the on-disk
+# contract uniform.
 ubx_rebuild_write_sidecar() {
-  local root="$1" gen="$2" systemd_ref="$3" secrets_ref="${4:-}" pro_ref="${5:-}" home_ref="${6:-}" dir tmp
+  local root="$1" gen="$2" systemd_ref="$3" secrets_ref="${4:-}" pro_ref="${5:-}" home_ref="${6:-}" crypttab_ref="${7:-}" dir tmp
   dir="$root/$gen"
   [ -d "$dir" ] || { _ubx_rebuild_warn "cannot write sidecar: no such generation directory: $dir"; return 1; }
   case "$systemd_ref" in
@@ -163,39 +166,47 @@ ubx_rebuild_write_sidecar() {
       return 1
       ;;
   esac
+  case "$crypttab_ref" in
+    *$'\t'* | *$'\n'*)
+      _ubx_rebuild_warn "crypttab manifest ref must not contain a TAB or newline: $crypttab_ref"
+      return 1
+      ;;
+  esac
   tmp="$(mktemp "$dir/.ubx-extra.XXXXXX")"
   {
     printf 'SYSTEMD_MANIFEST=%s\n' "$systemd_ref"
     printf 'SECRETS_MANIFEST=%s\n' "$secrets_ref"
     printf 'PRO_MANIFEST=%s\n' "$pro_ref"
     printf 'HOME_MANIFEST=%s\n' "$home_ref"
+    printf 'CRYPTTAB_MANIFEST=%s\n' "$crypttab_ref"
   } > "$tmp"
   mv -f "$tmp" "$dir/ubx-extra"
 }
 
-# ubx_rebuild_domain_refs ROOT GEN — prints seven TAB-separated fields:
-# ETC_REF<TAB>SYSTEMD_REF<TAB>USERS_REF<TAB>SNAP_REF<TAB>SECRETS_REF<TAB>PRO_REF<TAB>HOME_REF
+# ubx_rebuild_domain_refs ROOT GEN — prints eight TAB-separated fields:
+# ETC_REF<TAB>SYSTEMD_REF<TAB>USERS_REF<TAB>SNAP_REF<TAB>SECRETS_REF<TAB>PRO_REF<TAB>HOME_REF<TAB>CRYPTTAB_REF
 # for generation GEN under ROOT. GEN may be "" (no generation, e.g. the very
 # first switch ever) — in that case every field is "" ("nothing
 # declared"), which is exactly how an existing generation with
 # legally-empty fields reads too (bin/ubx-generations' header: "present as
 # fields, legally empty today"). SNAP_REF (GitHub issue #66) is read
 # directly off the generation's own manifest -- GEN_SNAP_MANIFEST, unlike
-# GEN_SYSTEMD_REF/SECRETS_MANIFEST/PRO_MANIFEST/HOME_MANIFEST, is already a
-# real bin/ubx-generations manifest field (see that script's header), so it
-# needs no sidecar of its own. SECRETS_REF (GitHub issue #78), PRO_REF
-# (GitHub issue #82), and HOME_REF (GitHub issue #98) are all read off the
-# SAME sidecar file SYSTEMD_REF already uses (see ubx_rebuild_write_sidecar
+# GEN_SYSTEMD_REF/SECRETS_MANIFEST/PRO_MANIFEST/HOME_MANIFEST/
+# CRYPTTAB_MANIFEST, is already a real bin/ubx-generations manifest field
+# (see that script's header), so it needs no sidecar of its own. SECRETS_REF
+# (GitHub issue #78), PRO_REF (GitHub issue #82), HOME_REF (GitHub issue
+# #98), and CRYPTTAB_REF (GitHub issue #170) are all read off the SAME
+# sidecar file SYSTEMD_REF already uses (see ubx_rebuild_write_sidecar
 # above).
 ubx_rebuild_domain_refs() {
   local root="$1" gen="$2" mf sidecar
   if [ -z "$gen" ]; then
-    printf '\t\t\t\t\t\t\n'
+    printf '\t\t\t\t\t\t\t\n'
     return 0
   fi
   mf="$root/$gen/manifest"
   sidecar="$(ubx_rebuild_sidecar_path "$root" "$gen")"
-  local etc_ref users_ref systemd_ref snap_ref secrets_ref pro_ref home_ref
+  local etc_ref users_ref systemd_ref snap_ref secrets_ref pro_ref home_ref crypttab_ref
   etc_ref="$(ubx_rebuild_manifest_get "$mf" GEN_ETC_REF)"
   users_ref="$(ubx_rebuild_manifest_get "$mf" GEN_USERS_MANIFEST)"
   systemd_ref="$(ubx_rebuild_manifest_get "$sidecar" SYSTEMD_MANIFEST)"
@@ -203,7 +214,8 @@ ubx_rebuild_domain_refs() {
   secrets_ref="$(ubx_rebuild_manifest_get "$sidecar" SECRETS_MANIFEST)"
   pro_ref="$(ubx_rebuild_manifest_get "$sidecar" PRO_MANIFEST)"
   home_ref="$(ubx_rebuild_manifest_get "$sidecar" HOME_MANIFEST)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$etc_ref" "$systemd_ref" "$users_ref" "$snap_ref" "$secrets_ref" "$pro_ref" "$home_ref"
+  crypttab_ref="$(ubx_rebuild_manifest_get "$sidecar" CRYPTTAB_MANIFEST)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$etc_ref" "$systemd_ref" "$users_ref" "$snap_ref" "$secrets_ref" "$pro_ref" "$home_ref" "$crypttab_ref"
 }
 
 # ubx_rebuild_resolve_ref REF DEFAULT_CONTENT WORKDIR NAME — resolves a
@@ -258,6 +270,15 @@ UBX_REBUILD_EMPTY_PRO_MANIFEST='{"version": 1, "enable": false, "tokenSecretPath
 # disabled" shape like the pro domain's own fixture above -- there is no
 # home-domain equivalent of "attach but disabled").
 UBX_REBUILD_EMPTY_HOME_MANIFEST='{"version": 1, "users": []}'
+# The crypttab domain's own "nothing declared" fixture (GitHub issue #170)
+# -- must satisfy bin/ubx-crypttab's own validate_manifest (its header,
+# "The manifest schema"): a real top-level `crypttabContent` string (empty
+# is valid -- crypttab(5) permits a genuinely empty file) alongside an
+# empty `volumes` list, mirroring UBX_REBUILD_EMPTY_ETC_MANIFEST/
+# UBX_REBUILD_EMPTY_HOME_MANIFEST's own "declares zero entries" shape
+# rather than the pro domain's "declared, but disabled" one -- there is no
+# crypttab-domain equivalent of "attach but disabled".
+UBX_REBUILD_EMPTY_CRYPTTAB_MANIFEST='{"version": 1, "crypttabContent": "", "volumes": []}'
 
 # -- GRUB default marker ------------------------------------------------------
 #

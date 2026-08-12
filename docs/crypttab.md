@@ -1,6 +1,6 @@
 # Passphrase-LUKS groundwork: crypttab and mount units
 
-```{admonition} Mechanism only, unwired (M4, issue #83); the installer LUKS flow is M7
+```{admonition} Wired into `ubx rebuild` (M4, issues #83 and #170); the installer LUKS flow is M7
 :class: note
 
 `nix/crypttab.nix`, `bin/ubx-crypttab`, and `bin/ubx-crypttab-apply` exist
@@ -12,22 +12,31 @@ rendering, the diff-driven planner, and a thin executor are all real and
 unit-tested (`tests/unit/175-crypttab-flake-wiring.sh`,
 `tests/unit/176-ubx-crypttab-plan.sh`,
 `tests/unit/177-ubx-crypttab-apply-executor.sh`,
-`tests/unit/233-ubx-crypttab-apply-idempotent.sh`).
+`tests/unit/233-ubx-crypttab-apply-idempotent.sh`). **Wiring this into a
+real running system's `ubx rebuild switch`** is done (GitHub issue #170):
+`bin/ubx`'s `execute_domains` builds and runs `bin/ubx-crypttab-apply
+--plan ... --manifest ... --crypttab-file ... --units-dir ...` (under
+`--apply`/`--dry-run` per the requested verb), immediately after the
+secrets block and before the pro block — see "Wiring into `ubx rebuild`"
+below for the ordering reasoning — the same way `bin/ubx-home-apply` is
+invoked alongside it. See `tests/unit/235-ubx-rebuild-crypttab-wiring.sh`
+and `tests/unit/236-ubx-crypttab-apply-real-invocation.sh`, which exist
+specifically to pin that real invocation.
 
-What this page describes is **groundwork only**: given a declared LUKS
-volume, it compiles a correct `/etc/crypttab` entry and matching systemd
-`.mount` unit. It does **not** decide which real disk to encrypt, prompt
-for a passphrase, or run `cryptsetup luksFormat` — that is the guided-
-install LUKS flow, separate M7 scope (`SPEC.md` §11 lists it apart from
-this groundwork). It is also **not currently wired into anything**: unlike
-{doc}`home`/{doc}`etc`/{doc}`systemd`, `bin/ubx`'s `execute_domains` does
-not invoke `bin/ubx-crypttab-apply`, and unlike {doc}`filesystems`/
-{doc}`localization`, no example config (`examples/server.nix`/
-`examples/desktop.nix`) or `nix/profiles.nix` parity image declares a
-`ubuntnix.crypttab` volume — this domain has no flake-evaluated proof
-target and no QEMU e2e coverage today. Every claim on this page is backed
-only by the unit tests named above, run against hand-crafted fixtures with
-no root and no real block device.
+What this page describes is still, functionally, **groundwork**: given a
+declared LUKS volume, it compiles a correct `/etc/crypttab` entry and
+matching systemd `.mount` unit, and now really converges them on a live
+system. It does **not** decide which real disk to encrypt, prompt for a
+passphrase, or run `cryptsetup luksFormat` — that is the guided-install
+LUKS flow, separate M7 scope (`SPEC.md` §11 lists it apart from this
+groundwork). And unlike {doc}`filesystems`/{doc}`localization`, no example
+config (`examples/server.nix`/`examples/desktop.nix`) or `nix/profiles.nix`
+parity image declares a `ubuntnix.crypttab` volume yet — this domain has no
+flake-evaluated proof target and no QEMU e2e coverage today (that e2e is
+tracked as separate follow-up work, deliberately out of scope for issue
+#170's wiring-only change). Every claim on this page beyond the wiring
+itself is backed only by the unit tests named above, run against
+hand-crafted fixtures with no root and no real block device.
 ```
 
 ## Why this exists
@@ -260,9 +269,9 @@ mount unit, since it is not secret material.
 
 This executor deliberately never runs `systemctl daemon-reload` or
 restarts a mount unit itself — that belongs to whatever orchestrates the
-whole rebuild/switch, once a later issue wires this domain into
-`bin/ubx`'s `execute_domains` the way {doc}`etc`/{doc}`systemd`/{doc}`home`
-already are.
+whole rebuild/switch, `bin/ubx`'s `execute_domains` (see "Wiring into `ubx
+rebuild`" below), the same way {doc}`etc`/{doc}`systemd`/{doc}`home`'s own
+executors are invoked without daemon-reload/restart logic of their own.
 
 **Dry-run by default.** `--dry-run` (the default) prints the `install`/
 `rm` calls it would run; `--apply` actually runs them. Fully exercisable
@@ -270,6 +279,50 @@ unprivileged against a temp `--crypttab-file`/`--units-dir` — writing
 there never needs root; a real `/etc/crypttab`/`/etc/systemd/system` write
 in production does, but that privilege requirement is the caller's
 problem, not something this script checks.
+
+## Wiring into `ubx rebuild`
+
+`bin/ubx`'s `execute_domains` runs `bin/ubx-crypttab-apply` immediately
+**after** the secrets block and **before** the pro block — the same
+position `plan_domains` computes this domain's plan in. Today that
+ordering has no real dependency to satisfy: `nix/crypttab.nix` restricts
+every declared volume's `keyFile` to `"none"`/`"-"` (see "Why `keyFile` is
+restricted to `none`/`-`" above), so no declared volume's key ever lives
+under `--run-secrets-dir`. The ordering is a deliberate
+**forward-compatibility** choice instead: the natural extension of this
+groundwork is a real keyfile-backed volume, and that keyfile's own bytes
+would need to be materialized (via {doc}`secrets`) before crypttab
+convergence could read them back out — converging crypttab after secrets
+materialization today means that future addition slots in without
+reshuffling this ordering again.
+
+`bin/ubx-crypttab-apply`, unlike `bin/ubx-snap-apply`, has its own real
+`--apply`/`--dry-run` gate (mirrors `bin/ubx-etc-apply`'s/`bin/ubx-systemd-
+apply`'s own posture — see those pages) — so `execute_domains` always
+invokes it, passing `--apply`/`--dry-run` straight through from the
+caller's own `ubx rebuild switch|test|boot --apply` flag. There is no
+`verb`-based carve-out the way the snap-purge sweep needs one: writing
+`/etc/crypttab` and a `.mount` unit file is retry-safe, so `ubx rebuild
+test --apply` really converges this domain too, exactly like {doc}`etc`/
+{doc}`systemd`/{doc}`secrets`/{doc}`home`.
+
+New `ubx rebuild`/`ubx rollback`/`ubx diff` flags (see `ubx rebuild
+--help`/`ubx rollback --help`/`ubx diff --help` for the authoritative
+list):
+
+| Flag | Where | Default |
+|---|---|---|
+| `--crypttab-manifest PATH` | `rebuild` only (rollback reads the ref back off the generation's own sidecar file) | *(omitted: nothing declared)* |
+| `--crypttab-observed FILE` | `rebuild`, `rollback`, `diff` | synthesized from the OLD generation's own declared crypttab manifest, assuming it is already fully converged |
+| `--crypttab-file FILE` | `rebuild`, `rollback` | `/etc/crypttab` |
+| `--crypttab-units-dir DIR` | `rebuild`, `rollback` | `/etc/systemd/system` |
+
+`--old-manifest` (this domain's own removal-scope input, see "Planning"
+above) is threaded through automatically: `plan_domains` passes both the
+OLD and NEW generation's resolved crypttab manifests to `bin/ubx-crypttab
+plan --manifest ... --old-manifest ...`, the same two-manifest shape
+{doc}`etc`/{doc}`systemd`/{doc}`home` already use (not the single-manifest
+shape {doc}`secrets`/{doc}`pro` use).
 
 ## Where this is proven
 
@@ -284,20 +337,37 @@ problem, not something this script checks.
   `bin/ubx-crypttab-apply`'s dry-run/apply output and its idempotency
   (re-applying an already-converged plan is a no-op) against temp
   `--crypttab-file`/`--units-dir` fixtures.
+- `tests/unit/235-ubx-rebuild-crypttab-wiring.sh` exercises the real
+  `ubx rebuild switch|test|boot`/`ubx rollback`/`ubx diff` wiring
+  end-to-end (GitHub issue #170): dry-run writes nothing, `--apply` lands
+  the declared crypttab line and `.mount` unit on real temp paths under
+  both `switch` and `test`, `boot` never activates anything live, omitting
+  `--crypttab-manifest` is reported as "nothing declared", and
+  `rollback`/`diff` both re-converge/report this domain by reading its ref
+  back off the generation's own sidecar file.
+- `tests/unit/236-ubx-crypttab-apply-real-invocation.sh` is the analogue of
+  `tests/unit/137-ubx-systemd-apply-real-invocation.sh`: a real, non-trivial
+  plan (write-crypttab + create-mount + update-mount + remove-mount) run to
+  completion against real temp paths, both directly and end-to-end via
+  `ubx rebuild switch --apply`.
 
 What this does **not** yet prove: there is no flake-evaluated proof target
 (no `packages.crypttab-manifest-proof` build assertion beyond eval-time
 forcing), no example config declares a `ubuntnix.crypttab` volume, and
 there is no QEMU/e2e test that boots an image with a real LUKS volume and
 asserts it unlocks and mounts — unlike {doc}`home` or the {doc}`filesystems`/
-{doc}`localization` parity images, this domain's proof stops at the
-planner/executor's own unit tests.
+{doc}`localization` parity images, this domain's real-system proof stops at
+the `ubx rebuild` wiring's own unit tests (real filesystem calls, no real
+block device or `cryptsetup`); that QEMU e2e is tracked as separate,
+not-yet-scheduled follow-up work.
 
 ## Where to track progress
 
-`nix/crypttab.nix`, `bin/ubx-crypttab`, and `bin/ubx-crypttab-apply` land at
-milestone **M4** (`SPEC.md` §11, issue #83) as groundwork only. Wiring this
-domain into `bin/ubx`'s `execute_domains` the way {doc}`etc`/{doc}`systemd`/
-{doc}`home` already are, and the real guided-install LUKS flow (formatting
-a disk, prompting for a passphrase, `cryptsetup luksFormat`) are both
-separate, not-yet-scheduled M7 work per `SPEC.md` §8.3/§11.
+`nix/crypttab.nix`, `bin/ubx-crypttab`, and `bin/ubx-crypttab-apply` landed
+at milestone **M4** (`SPEC.md` §11, issue #83) as groundwork, and are now
+wired into `bin/ubx`'s `execute_domains` the way {doc}`etc`/{doc}`systemd`/
+{doc}`home` already are (GitHub issue #170). What remains, both separate,
+not-yet-scheduled work: a QEMU e2e that boots an image with a real LUKS
+volume and asserts it unlocks and mounts, and the real guided-install LUKS
+flow (formatting a disk, prompting for a passphrase, `cryptsetup
+luksFormat`) — M7 scope per `SPEC.md` §8.3/§11.

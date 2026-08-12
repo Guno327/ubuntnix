@@ -10,9 +10,14 @@
 # -- Root cause --------------------------------------------------------
 #
 # `ubx_rebuild_domain_refs` (bin/ubx-rebuild-lib) prints one tab-separated
-# line, "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP\n". For a generation declaring
-# only a snap manifest, that line is "\t\t\t<snapref>\n" -- three EMPTY
-# leading fields. bin/ubx used to read this with a plain
+# line, at the time of the M3 bug "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP\n"
+# (today it is eight fields —
+# "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP<TAB>SECRETS<TAB>PRO<TAB>HOME<TAB>CRYPTTAB\n",
+# secrets/pro/home/crypttab each simply APPENDED at the end as they landed
+# — but the same positional-preservation requirement applies identically
+# to every field, old or new). For a generation declaring only a snap
+# manifest, that line was "\t\t\t<snapref>\n" -- three EMPTY leading
+# fields. bin/ubx used to read this with a plain
 # `IFS=$'\t' read -r A B C D`; bash's `read` treats a tab as a
 # WHITESPACE-CLASS IFS character and TRIMS/COLLAPSES adjacent empty
 # fields instead of preserving them positionally, so `<snapref>` was

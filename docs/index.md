@@ -66,6 +66,10 @@ through M7). See `SPEC.md` §11 for the milestone plan.
   machine-local mutable exceptions, and the diff-driven activation planner
   (compile + plan implemented in M2; applying a plan to a real `/etc` lands
   later).
+- {doc}`networking` — the netplan/hostname/hosts showcase module:
+  interfaces, wifi (with the Wi-Fi PSK rendered-config escape), and the
+  netplan v2 render contract, composed straight onto the `/etc` primitive
+  (implemented in M5; no live network-activation proof yet).
 - {doc}`secrets` — the git-crypt encryption boundary for `secrets/`,
   per-machine and per-user GPG identity onboarding, and the revocation path
   (mechanism implemented and unit-tested in M4; real installer-flow wiring
@@ -80,6 +84,11 @@ through M7). See `SPEC.md` §11 for the milestone plan.
   class rules, and the ordered unit-activation planner (declaration + plan
   + a thin executor implemented in M2; wiring into a real running system's
   `ubx rebuild switch` lands later).
+- {doc}`home` — per-user configuration (home modules): declared `$HOME`
+  files and per-user `systemctl --user` services, the diff-driven
+  activation planner, and the thin executor, wired into `ubx rebuild` and
+  proven live in CI by a real QEMU boot (implemented and wired in M5,
+  issue #98; live-QEMU activation proof, issue #105).
 - {doc}`ubx` — the `rebuild switch|boot|test`/`rollback`/`list-generations`/
   `diff` orchestrator: the GRUB-default matrix, the touched-domains report,
   and exactly how far each domain's live activation goes today
@@ -102,10 +111,12 @@ guards
 generations
 users
 etc
+networking
 secrets
 pro
 boot
 systemd
+home
 ubx
 reference/index
 ```

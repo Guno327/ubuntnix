@@ -1903,8 +1903,9 @@ let
         # FIRST call creates the account (`ubx-users execute` only ever
         # EMITS an activation script; `apply-passwords` cannot set a
         # password for an account not yet present in --shadow -- a clear,
-        # expected error at this point, not a bug) -- this driver runs
-        # that emitted script for real, exactly like scenario 1's own
+        # EXPECTED error at this point, not a bug, asserted precisely
+        # below rather than demanded away) -- this driver runs that
+        # emitted script for real, exactly like scenario 1's own
         # gen2-users-activate.sh pattern, so the account genuinely exists.
         # The SECOND call, against the identical users/secrets manifests,
         # converges the password for real: the secrets domain
@@ -1922,7 +1923,52 @@ let
           --users-out "$STATE/pw-users-activate.sh" \
           > "$STATE/m4-create.log" 2>&1
         rc=$?
-        [ "$rc" -eq 0 ] || mark_fail_pw "first 'ubx rebuild switch' (account creation) exited $rc -- see $STATE/m4-create.log"
+
+        # ---- first-switch assertion: narrowed, not deleted (issue #153) --
+        #
+        # `rc` here is NOT 0: bin/ubx runs under `set -euo pipefail`, and
+        # execute_domains' own "password hashes" block invokes
+        # `ubx-users apply-passwords`, which (bin/ubx-users' own
+        # cmd_apply_passwords) does `sys.exit(1 if errors else 0)` -- so
+        # this whole `ubx rebuild switch` inherits exit 1 the instant
+        # apply-passwords reports ANY error, which it always does here
+        # (alice/ubxm4pw is not present in --shadow yet). That is the
+        # documented, expected outcome of this FIRST call, not a bug --
+        # but it must still be pinned precisely enough to catch a REAL
+        # regression: this driver demands EXACTLY rc=1, the users
+        # activation script having actually been emitted (account
+        # creation, this call's own real side effect, must not have been
+        # lost), and the run's own JSON summary (printed to
+        # $STATE/m4-create.log, execute_domains never gives
+        # apply-passwords an --out file) containing ONLY the single,
+        # documented "not present in shadow" error for
+        # ${switchLoopPwUserName} -- any other rc, a missing/empty
+        # activation script, or any OTHER/ADDITIONAL error in that JSON is
+        # a real failure, asserted below exactly like every other
+        # mark_fail_pw check in this scenario.
+        [ -s "$STATE/pw-users-activate.sh" ] \
+          || mark_fail_pw "first 'ubx rebuild switch' (account creation) did not emit a non-empty users activation script $STATE/pw-users-activate.sh -- see $STATE/m4-create.log"
+        sed -n '/^{$/,/^}$/p' "$STATE/m4-create.log" > "$STATE/m4-create.json"
+        UBX_M4_PW_USER="${switchLoopPwUserName}" UBX_M4_PW_JSON="$STATE/m4-create.json" python3 <<'UBX_M4_CREATE_CHECK_PY_EOF'
+    import json
+    import os
+    import sys
+
+    with open(os.environ["UBX_M4_PW_JSON"], encoding="utf-8") as f:
+        payload = json.load(f)
+    user = os.environ["UBX_M4_PW_USER"]
+    expected = [
+        f"user '{user}': not present in /etc/shadow (create the user, e.g. "
+        "via 'ubx-users execute', before setting its password)"
+    ]
+    sys.exit(0 if payload.get("errors") == expected else 1)
+    UBX_M4_CREATE_CHECK_PY_EOF
+        m4_create_check_rc=$?
+        [ "$m4_create_check_rc" -eq 0 ] \
+          || mark_fail_pw "first 'ubx rebuild switch' (account creation) reported an unexpected apply-passwords error set (expected exactly one: '${switchLoopPwUserName}' not present in /etc/shadow) -- see $STATE/m4-create.log"
+        [ "$rc" -eq 1 ] \
+          || mark_fail_pw "first 'ubx rebuild switch' (account creation) exited $rc, expected exactly 1 (bin/ubx-users' own apply-passwords exits 1 when it reports the documented 'not present in shadow' error) -- see $STATE/m4-create.log"
+
         bash "$STATE/pw-users-activate.sh" >> "$STATE/m4-create.log" 2>&1
         getent passwd "${switchLoopPwUserName}" > /dev/null 2>&1 \
           || mark_fail_pw "declared hashedPasswordSecret user ${switchLoopPwUserName} is not present after running its activation script -- see $STATE/m4-create.log"

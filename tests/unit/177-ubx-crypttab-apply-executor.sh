@@ -160,4 +160,60 @@ rc=$?
 rc=$?
 [ "$rc" -eq 0 ] || fail "--apply (removal, second time) should exit 0 idempotently, got $rc"
 
+# =====================================================================
+# 5) applying the ORIGINAL create/write plan a SECOND time, back to back,
+#    must still exit 0 and leave the crypttab/mount-unit bytes exactly as
+#    they were (SPEC.md §4.3: activation "touches only what changed";
+#    GitHub issue #157). Re-seeds fresh crypttab-file/units-dir so this
+#    section is independent of section 4's removal above.
+# =====================================================================
+reapply_crypttab="$work/reapply-crypttab"
+reapply_units="$work/reapply-units"
+
+"$ubx_crypttab_apply" --plan "$plan" --manifest "$manifest" --crypttab-file "$reapply_crypttab" --units-dir "$reapply_units" --apply
+rc=$?
+[ "$rc" -eq 0 ] || fail "first --apply (reapply fixture) should exit 0, got $rc"
+
+"$ubx_crypttab_apply" --plan "$plan" --manifest "$manifest" --crypttab-file "$reapply_crypttab" --units-dir "$reapply_units" --apply
+rc=$?
+[ "$rc" -eq 0 ] || fail "applying the SAME (non-removal) plan a second time should exit 0, got $rc"
+
+if ! python3 - "$reapply_crypttab" "$manifest" <<'PYEOF'
+import json, sys
+crypttab_file, manifest_file = sys.argv[1:3]
+content = open(crypttab_file, encoding="utf-8").read()
+manifest = json.load(open(manifest_file, encoding="utf-8"))
+assert content == manifest["crypttabContent"], (content, manifest["crypttabContent"])
+PYEOF
+then
+  fail "re-applying the same plan a second time must not corrupt $reapply_crypttab's content"
+fi
+[ "$(stat -c '%a' "$reapply_crypttab")" = "600" ] || fail "re-applying the same plan a second time must not change $reapply_crypttab's mode"
+
+# =====================================================================
+# 6) an empty plan (no actions) is a real no-op: exit 0, and an
+#    already-converged crypttab-file/units-dir tree is left byte-for-byte
+#    untouched (snapshot before/after, not just "still exists").
+# =====================================================================
+before_crypttab_sha="$(sha256sum "$reapply_crypttab" | cut -d' ' -f1)"
+before_unit_sha="$(sha256sum "$reapply_units/mnt-data.mount" | cut -d' ' -f1)"
+# mtime has only whole-second resolution via `stat -c '%Y'`; sleep past a
+# second boundary first so a regression that spuriously re-touches (but
+# does not otherwise corrupt) the file is still caught below.
+sleep 1
+before_crypttab_mtime="$(stat -c '%Y' "$reapply_crypttab")"
+
+empty_actions_plan="$work/empty-actions-plan.json"
+echo '{"version": 1, "empty": true, "actions": []}' > "$empty_actions_plan"
+empty_rc=0
+"$ubx_crypttab_apply" --plan "$empty_actions_plan" --manifest "$manifest" --crypttab-file "$reapply_crypttab" --units-dir "$reapply_units" --apply > /dev/null 2>&1 || empty_rc=$?
+[ "$empty_rc" -eq 0 ] || fail "an empty (no-actions) plan should exit 0, got $empty_rc"
+
+after_crypttab_sha="$(sha256sum "$reapply_crypttab" | cut -d' ' -f1)"
+after_unit_sha="$(sha256sum "$reapply_units/mnt-data.mount" | cut -d' ' -f1)"
+after_crypttab_mtime="$(stat -c '%Y' "$reapply_crypttab")"
+[ "$before_crypttab_sha" = "$after_crypttab_sha" ] || fail "an empty plan must not change $reapply_crypttab's content"
+[ "$before_unit_sha" = "$after_unit_sha" ] || fail "an empty plan must not change $reapply_units/mnt-data.mount's content"
+[ "$before_crypttab_mtime" = "$after_crypttab_mtime" ] || fail "an empty plan must not even re-touch $reapply_crypttab's mtime (nothing should have been executed at all)"
+
 exit "$fails"

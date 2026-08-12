@@ -1,17 +1,22 @@
 # Mutation guards: apt, dpkg, snap
 
-```{admonition} Implemented standalone (M2); image wiring deferred
+```{admonition} Implemented standalone (M2); wired and proven in the switch-loop proof image only
 :class: note
 
 `bin/ubx-guard-apt`, `bin/ubx-guard-dpkg`, and `bin/ubx-guard-snap` exist in
 the repository as of milestone **M2** (`SPEC.md` §7, issue #31): each is a
 real, unit-tested script (`tests/unit/090-guard-lib.sh` through
 `093-guard-snap.sh`) that decides block-vs-pass for a given command line.
-**Installing them into the composed runtime image — diverting the real
-binaries aside and putting a guard in their place — is explicitly deferred**
-until issue #10's file-injection mechanism lands; see
-["What is deferred"](#what-is-deferred) below. Nothing on this page
-describes a behavior you can observe on a running ubuntnix system yet.
+**Installing them into a composed runtime image — diverting the real
+binaries aside and putting a guard in their place — is real**, but so far
+only inside `nix/boot.nix`'s switch-loop proof image
+(`switchLoopExtraFilesScript`, which diverts `apt`/`apt-get`/`dpkg` to
+`*.ubx-real` and installs the `ubx-guard-*` scripts in their place — issue
+#10's file-injection mechanism this depended on has landed, since
+`bootRootfs`'s own file-writing pattern turned out to be that mechanism).
+**No server or desktop profile image installs the guards yet** — see
+["What is deferred"](#what-is-deferred) below for exactly what is still
+missing.
 ```
 
 ## Why guards exist
@@ -155,35 +160,43 @@ Like `bin/ubx-systemd-apply`/`bin/ubx-etc-apply`, it defaults to
 `--apply`. `tests/unit/094-ubx-snap-purge.sh` exercises all of this with a
 recording stub in place of `UBX_SNAP_BIN` — no real snapd involved.
 
-Wiring this sweep into `ubx rebuild`'s actual convergence sequence is, like
-the three guards' own image installation, deferred: it needs issue #60's
-manifest shape to land first (this script's `--manifest` contract is
-written to consume whatever that turns out to be, without needing a
-follow-up edit here).
+Wiring this sweep into `ubx rebuild`'s actual convergence sequence is
+deferred separately from the three guards' own image installation above:
+it needs issue #60's manifest shape to land first (this script's
+`--manifest` contract is written to consume whatever that turns out to
+be, without needing a follow-up edit here).
 
 (what-is-deferred)=
 
 ## What is deferred
 
 This issue (#31) is scope-limited to the guard scripts themselves,
-unit-tested standalone with a stubbed "real" binary — **not** to wiring
-them into an actual running system. That is separate, later work, blocked
-on issue #10's file-injection mechanism. The intended install shape,
-so that the scripts above are already written against a stable contract:
+unit-tested standalone with a stubbed "real" binary. Wiring them into an
+actual running system needed a file-injection mechanism into the composed
+image (issue #10); that mechanism has landed — it turned out to be
+`nix/boot.nix`'s own `bootRootfs`/`extraFilesScript` file-writing pattern
+— and `nix/boot.nix`'s `switchLoopExtraFilesScript` (used only by the
+switch-loop proof image) already installs guards against it:
 
 - Guards apply **inside the composed runtime image only**. The
   compose-time `dpkg` that runs in the build sandbox (`SPEC.md` §4.1's
   Ubuntu-native stdenv) stays unguarded — it has to unpack `.deb`s and run
   maintainer scripts to build the image in the first place.
-- The real `apt`/`apt-get`/`dpkg`/`snap` binaries get moved aside (for
-  example, `dpkg-divert --divert /usr/bin/apt.ubx-real --rename /usr/bin/apt`,
-  repeated per command — or an equivalent PATH-shadowing symlink approach;
-  whichever M2+ image-composition work settles on), and the matching guard
-  script is installed in their place under the original name.
+- The real `apt`/`apt-get`/`dpkg` binaries get moved aside
+  (`ubx_m2_install_guard` in `nix/boot.nix`: `mv /usr/bin/<cmd>
+  /usr/bin/<cmd>.ubx-real`, falling back to installing the guard
+  un-diverted at `/usr/local/bin` if the real binary isn't present in that
+  image), and the matching guard script is installed in their place under
+  the original name. `snap` is M3 scope and is never composed into the
+  switch-loop proof image at all, so its guard is always installed
+  un-diverted, with `UBX_GUARD_REAL_BIN=/bin/true`.
 - Each installed guard is told where the real binary ended up via the
-  `UBX_GUARD_REAL_BIN` environment variable, set by whatever installs it
-  (a systemd-level environment file, a wrapper the divert target execs
-  through, etc.) — never hard-coded, for the reasons above.
+  `UBX_GUARD_REAL_BIN` environment variable, set at install time — never
+  hard-coded, for the reasons above.
 
-Until that lands, these guards are dormant: real code, real tests, no
-effect on any running ubuntnix machine.
+**What is still missing:** `nix/profiles.nix`'s `server-parity-image` and
+`desktop-parity-image` — the images a real machine would actually boot —
+do not install these guards yet (`grep -rn "ubx-guard" nix/*.nix` hits
+only `nix/boot.nix`'s switch-loop proof). Until that lands, the guards are
+proven end-to-end only in the switch-loop proof image, not in any
+production profile image.

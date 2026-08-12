@@ -27,6 +27,33 @@
 # tests/unit/214-live-iso-gap-classification.sh for the pinned regression
 # test on the classification logic itself.
 #
+# -- The ratchet (GitHub issue #146) ----------------------------------------
+#
+# Everything from here up through the "Gap classification" block below is
+# purely INFORMATIONAL reporting — as the comment right above the residual
+# print loop used to say verbatim, "it never sets `rc`; a growing gap is
+# expected." That was true of the raw/base-adjusted GAP (see issue #140:
+# the seed is deliberately still growing toward the full upstream task-set,
+# so THAT number regressing on every single PR is expected and correct).
+# But the fully-netted RESIDUAL computed at the bottom of the classification
+# block — genuinely-missing packages, net of both #140's base-layer
+# accounting and #143's live-ISO/kernel-ABI netting — is a different
+# animal: every package left in it is either a real, permanent divergence
+# (should shrink toward the exception/addition lists as it's investigated)
+# or a real, temporary gap the seed-growth work is meant to close (should
+# shrink as SPEC.md sec11's M5 work lands). It should never silently GROW,
+# and until issue #146 nothing here checked that — the residual could
+# regress every single PR and CI would stay green forever, because (per the
+# same comment) the whole block "never sets rc." tests/fixtures/upstream-
+# manifests/parity-ratchet-baseline.json pins the residual this test
+# actually measured against the fixtures committed alongside it (see that
+# file's own "_provenance" field for the exact commit and issue trail), and
+# ratchet_check() below (search that name) asserts the live residual never
+# exceeds it. Residual BELOW baseline still passes — improvement is always
+# welcome — but prints a "ratchet may be tightened" line rather than
+# silently absorbing the improvement, so tightening the pinned baseline is
+# always a deliberate, reviewable PR, not something that just happens.
+#
 # The M1–M6 parity harnesses (050/070 e2e, 187/194 seed-set) verify our
 # seed against the project's OWN committed archive.lock.json and a small
 # hand-typed list of boot-critical "required" names, because — as every one
@@ -99,8 +126,21 @@ server_manifest="$fixtures_dir/ubuntu-24.04.3-live-server-amd64.manifest"
 desktop_manifest="$fixtures_dir/ubuntu-24.04.3-desktop-amd64.manifest"
 base_packages="$fixtures_dir/ubuntu-base-24.04.4-base-amd64.packages"
 profiles_nix="nix/profiles.nix"
+# GitHub issue #146: the pinned residual-count ratchet baseline. Overridable
+# via UBX_PARITY_RATCHET_BASELINE_FILE — unset on every real invocation (so
+# $ratchet_baseline_file resolves to this real, committed file exactly as if
+# the override didn't exist), following the same "env var overrides a
+# real-by-default path" seam tests/lib/ubx-installer-parity-assert.sh uses
+# for UBX_PARITY_ROOT. tests/unit/215-parity-ratchet.sh, this test's sibling,
+# does not actually need the override (it drives the pure ratchet_check()
+# function directly with synthetic in-memory inputs — see that file's own
+# header for why that seam was preferred over faking a whole baseline file
+# here) but the override is left in place as the same defensive seam every
+# other fixture-path constant in this file already gets, in case a future
+# test wants to point this whole script at a synthetic baseline wholesale.
+ratchet_baseline_file="${UBX_PARITY_RATCHET_BASELINE_FILE:-$fixtures_dir/parity-ratchet-baseline.json}"
 
-for f in "$server_manifest" "$desktop_manifest" "$base_packages" archive.lock.json "$profiles_nix"; do
+for f in "$server_manifest" "$desktop_manifest" "$base_packages" "$ratchet_baseline_file" archive.lock.json "$profiles_nix"; do
   [ -f "$f" ] || {
     echo "FAIL: required input '$f' does not exist" >&2
     exit 1
@@ -129,13 +169,15 @@ for excl_var in serverSeedExceptions desktopSeedExceptions; do
   esac
 done
 
-if ! python3 - "$server_manifest" "$desktop_manifest" "$base_packages" <<'PYEOF'
+if ! python3 - "$server_manifest" "$desktop_manifest" "$base_packages" "$ratchet_baseline_file" <<'PYEOF'
 import hashlib
 import json
 import re
 import sys
 
-server_manifest, desktop_manifest, base_packages = sys.argv[1], sys.argv[2], sys.argv[3]
+server_manifest, desktop_manifest, base_packages, ratchet_baseline_file = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4],
+)
 
 rc = 0
 
@@ -405,6 +447,103 @@ def abi_skew(name):
     return bool(_ABI_SKEW_RE.match(name))
 
 
+# -- The ratchet itself (GitHub issue #146) ---------------------------------
+#
+# ratchet_check() is deliberately a PURE function: no file I/O, no `problem`/
+# `rc` global, nothing but its four arguments in and a plain result dict out.
+# That is the injection seam tests/unit/215-parity-ratchet.sh (this test's
+# sibling, written first per the issue's "tests first" instruction) relies
+# on: it cannot make the REAL residual numbers below regress on demand to
+# exercise the rise/fall/equal cases, so instead of driving this whole
+# 400+-line script end to end it sed-extracts just this function (the same
+# "extract 210's own source rather than hand-duplicate a second copy that
+# could drift" technique tests/unit/214-live-iso-gap-classification.sh
+# already uses for LIVE_ONLY_EXCLUSIONS/_ABI_SKEW_RE, applied here to a
+# function instead of a data literal) and calls it directly with synthetic
+# residual sets / baseline entries. Keeping every dependency as an explicit
+# parameter — rather than reading `baseline` or `problem()` off the module
+# namespace the way the rest of this script freely does — is what makes
+# that extraction safe: the function behaves identically whether it is
+# called from the real loop below or from a 20-line synthetic harness that
+# never runs any of the surrounding fixture-parsing code at all.
+def ratchet_check(label, baseline_count, baseline_packages, residual_names):
+    """Compare a live residual against its pinned ratchet baseline.
+
+    `baseline_count`/`baseline_packages` come from tests/fixtures/upstream-
+    manifests/parity-ratchet-baseline.json (see that file's own
+    "_provenance" field for exactly what was measured, against what
+    fixtures, at what commit, per issues #140/#143). `residual_names` is
+    the live, freshly-computed residual set for this run.
+
+    Returns {"status": "regression" | "tightened" | "steady", "message":
+    str | None}:
+      * "regression" — the live residual is BIGGER than the pinned
+        baseline. This is the case that must fail the build: parity quietly
+        getting worse, with no CI signal, is exactly what issue #146 exists
+        to stop. The message names the SPECIFIC packages that are in the
+        live residual but not in the pinned baseline package list — not
+        just the count — so a reviewer sees exactly what regressed instead
+        of having to go re-derive it by hand.
+      * "tightened" — the live residual is SMALLER than the pinned
+        baseline. This always PASSES (an improvement is never a failure)
+        but is not allowed to pass silently either: the message says
+        explicitly that the baseline could now be lowered, so a real
+        improvement gets banked as a deliberate follow-up PR instead of
+        just quietly making next run's slack bigger.
+      * "steady" — live residual == baseline exactly, today's steady state
+        for both variants. Passes with no message at all, per the issue's
+        explicit "equal ⇒ passes quietly" requirement — this is the
+        expected, common case and should not add noise to green CI output.
+    """
+    residual_names = set(residual_names)
+    baseline_packages = set(baseline_packages)
+    n = len(residual_names)
+
+    if n > baseline_count:
+        newly_entered = sorted(residual_names - baseline_packages)
+        if newly_entered:
+            detail = ", ".join(newly_entered)
+        else:
+            # The count rose but every live-residual name is already in the
+            # pinned baseline list — impossible unless the baseline package
+            # list and baseline count have drifted apart (e.g. hand-edited
+            # inconsistently). Still a real regression against the pinned
+            # count; say so rather than printing an empty, useless list.
+            detail = (
+                "(no individual package names differ from the pinned "
+                "baseline list, but the count still exceeds it — the "
+                "baseline file's residual_count/residual_packages have "
+                "drifted out of sync with each other; treat as a "
+                "regression and re-derive the baseline file)"
+            )
+        return {
+            "status": "regression",
+            "message": (
+                f"{label} parity ratchet (GitHub issue #146): residual "
+                f"{n} exceeds the pinned baseline of {baseline_count} — "
+                f"newly entered the residual: {detail}"
+            ),
+        }
+
+    if n < baseline_count:
+        return {
+            "status": "tightened",
+            "message": (
+                f"{label} parity ratchet (GitHub issue #146): residual "
+                f"{n} is below the pinned baseline of {baseline_count} — "
+                f"ratchet may be tightened to {n}. Lower "
+                "residual_count/residual_packages for this variant in "
+                "tests/fixtures/upstream-manifests/parity-ratchet-"
+                "baseline.json in a deliberate follow-up PR once this is "
+                "confirmed stable; do not let the slack just sit there."
+            ),
+        }
+
+    return {"status": "steady", "message": None}
+
+
+ratchet_baseline = json.load(open(ratchet_baseline_file, encoding="utf-8"))
+
 for lbl, upstream in variants.items():
     gap_with_base = upstream - effective_system
     live_only_hits = {n for n in gap_with_base if n in LIVE_ONLY_EXCLUSIONS}
@@ -418,6 +557,28 @@ for lbl, upstream in variants.items():
         f"{len(gap_with_base) - len(abi_skew_hits)}; residual (net of both) "
         f"= {len(residual)} genuinely missing."
     )
+
+    if lbl not in ratchet_baseline:
+        problem(
+            f"{ratchet_baseline_file} has no entry for variant {lbl!r} — "
+            "add one (see the file's _provenance field for how existing "
+            "entries were derived) before this variant's residual can be "
+            "ratcheted"
+        )
+        continue
+
+    baseline_entry = ratchet_baseline[lbl]
+    result = ratchet_check(
+        lbl,
+        baseline_entry["residual_count"],
+        baseline_entry["residual_packages"],
+        residual,
+    )
+    if result["status"] == "regression":
+        problem(result["message"])
+    elif result["status"] == "tightened":
+        print(f"OK: {result['message']}")
+    # "steady": intentionally silent — see ratchet_check()'s docstring.
 
 sys.exit(rc)
 PYEOF

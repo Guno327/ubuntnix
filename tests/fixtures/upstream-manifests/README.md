@@ -93,6 +93,33 @@ regenerate this fixture from the new tarball (see the fixture's own header
 for the exact extraction command) and update both this section and
 `tests/unit/213-ubuntu-base-fixture-pin.sh`'s expectations accordingly.
 
+## The residual ratchet baseline (GitHub issue #146)
+
+`tests/unit/210-upstream-manifest-parity.sh`'s gap-classification block
+(the section documented above, GitHub issue #143) nets the raw upstream
+gap down to a "residual" figure — packages genuinely missing from ubuntnix
+with no live-ISO or kernel-ABI-skew excuse — and, until issue #146, only
+ever PRINTED that number; nothing compared it to anything, so it could
+regress every single PR with CI staying green throughout.
+
+`parity-ratchet-baseline.json` is the fix: it pins, per variant, the exact
+residual package COUNT and package NAME LIST measured on `main` @
+`bb3e6fb` against the manifests/base-package-list above (Server 237,
+Desktop 1401 as of that commit — see the file's own `_provenance` field).
+210 now fails if a variant's live residual count exceeds the pinned
+`residual_count`, and names the specific packages in the live residual
+that are not in the pinned `residual_packages` list as the newly-entered
+regression, rather than just reporting a bigger number. A live residual
+BELOW baseline still passes (an improvement is never a failure) but prints
+a "ratchet may be tightened" note instead of silently absorbing the slack,
+so lowering this file is always a deliberate, reviewable follow-up PR.
+
+Refreshing this file (whether tightening after a real improvement, or
+widening after refreshing the manifests above for a new Ubuntu release)
+means re-running 210's gap-classification computation and recording the
+new counts/package lists here with an updated `_provenance` note — never
+just bumping the numbers to make a real regression disappear.
+
 ## Licensing
 
 These manifests are factual package inventories (name + version pairs)

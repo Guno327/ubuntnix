@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
-"""Generate docs/reference/options.md from the modules/ tree.
+"""Generate docs/reference/options.md from the nix/ tree.
 
-Best-effort *textual* scan of ``<root>/modules/**/*.nix`` for
-``options.<path> = mkOption { ... };`` declarations. It pulls out the
-option's dotted path plus, where present, its ``type``, ``default`` and
-``description`` fields, and renders a sorted Markdown page.
+Best-effort *textual* scan of ``<root>/nix/**/*.nix`` for ``mkOption``
+declarations, in either of the two shapes this codebase actually uses:
 
-This is a stopgap, and as of today it is a stopgap that emits an EMPTY
-page. `flake.nix` exists and is substantial, but the ``modules/`` tree
-this script scans does **not** exist yet: every real ``mkOption``
-declaration currently lives in ``nix/*.nix`` (``nix/networking.nix``,
-``nix/archive.nix``, ``nix/secrets.nix``, ``nix/pro.nix``,
-``nix/users.nix``, ``nix/lib.nix``, ...) as an *internal submodule type*
-used for structural validation, deliberately not yet wired to a public
-``options.ubuntnix.*`` surface. So this script reports "0 option(s) from
-0 file(s)" on every run, and docs/reference/options.md is empty by
-construction rather than by accident.
+  1. ``options.<dotted.path> = [prefix.]mkOption { ... };`` — a top-level
+     attachment of a type to the module system (e.g. ``options.pro =
+     lib.mkOption { type = proType; };`` in nix/pro.nix).
+  2. bare ``<name> = [prefix.]mkOption { ... };`` inside an ``options =
+     { ... };`` submodule block (e.g. ``hostname = lib.mkOption { ... };``
+     inside nix/networking.nix's ``networkingType`` submodule). This is
+     the shape essentially all real per-field options in nix/*.nix use
+     today, since every domain (networking, users, secrets, pro,
+     archive, ...) is expressed as an internal `lib.types.submodule` used
+     for structural validation rather than a single flat
+     ``options.<dotted.path>`` per field.
 
-Two things must therefore happen before this page carries real content,
-and they are separate decisions: (1) the public ``modules/`` surface has
-to exist at all, and (2) this textual regex scan should then be replaced
-by a nix-eval-based extractor that evaluates the real option declarations
-(types, defaults, submodules, merged descriptions, etc.) instead of
-grepping source text. Pointing --root at ``nix/`` today would NOT be a
-fix for (1): it would publish internal validation types as though they
-were a supported user-facing API.
+For each match it pulls out the option's path (dotted where shape 1
+applies, otherwise just the field name) plus, where present, its
+``type``, ``default`` and ``description`` fields, and renders a sorted
+Markdown page.
+
+Every real ``mkOption`` declaration today lives in ``nix/*.nix``
+(``nix/networking.nix``, ``nix/archive.nix``, ``nix/secrets.nix``,
+``nix/pro.nix``, ``nix/users.nix``, ``nix/lib.nix``, ...) as an *internal
+submodule type* used for structural validation, not yet wired to a
+public ``options.ubuntnix.*`` surface — so the paths this script reports
+are per-submodule field names, not a single unified ``ubuntnix.*``
+namespace. Once a public ``options.ubuntnix.*`` surface lands, replacing
+this textual regex scan with a nix-eval-based extractor (which can
+resolve real dotted paths, submodule nesting, and merged descriptions
+instead of grepping source text) remains the natural next step.
 
 Anything this script cannot parse
 (multi-line attrsets as defaults, computed paths, `lib.mkOption` written
 across unusual formatting, etc.) is simply omitted rather than guessed at.
+
+An empty result is treated as a bug, not a valid steady state: if
+``nix/`` exists and contains ``.nix`` files but none of them yield a
+single matched option, this script exits non-zero with a diagnostic
+instead of silently emitting an empty page (SPEC.md G10's reference must
+reflect the real tree; a silent empty page from a broken extractor would
+be indistinguishable from a genuinely option-free tree). Only a tree with
+*no* ``.nix`` files under ``nix/`` at all (or no ``nix/`` directory) is
+treated as the legitimate empty case and still exits 0.
 
 The output is deterministic: for the same input tree it always produces
 byte-identical output, sorted by option path then by declaring file.
@@ -50,13 +65,20 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Matches `options.<dotted.path> = [prefix.]mkOption {`, capturing the
-# dotted attribute path and leaving the parser positioned at the opening
-# brace of the mkOption argument. `prefix.` covers the common `lib.mkOption`
-# spelling; bare `mkOption` (imported via `inherit (lib) mkOption;` or
-# `with lib;`) is also matched.
+# Matches either of the two mkOption-declaration shapes this codebase uses
+# (see module docstring):
+#   (dotted) `options.<dotted.path> = [prefix.]mkOption {`
+#   (bare)   `<name> = [prefix.]mkOption {`, when <name> is not itself the
+#            tail of a preceding `options.` path (the negative lookbehind
+#            rejects starting a match on the "path" part of "options.path
+#            = mkOption", which the dotted alternative already covers).
+# Both leave the parser positioned at the opening brace of the mkOption
+# argument. `prefix.` covers the common `lib.mkOption` spelling; bare
+# `mkOption` (imported via `inherit (lib) mkOption;` or `with lib;`) is
+# also matched.
 OPTION_HEAD_RE = re.compile(
-    r"options\.(?P<path>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)"
+    r"(?:options\.(?P<dotted>[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)"
+    r"|(?<![.\w])(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
     r"\s*=\s*(?:[A-Za-z0-9_]+\.)?mkOption\s*(?P<brace>\{)"
 )
 
@@ -89,7 +111,7 @@ def find_options(text: str) -> list[dict]:
     """Best-effort extraction of mkOption declarations from one file's text."""
     found = []
     for m in OPTION_HEAD_RE.finditer(text):
-        path = m.group("path")
+        path = m.group("dotted") or m.group("bare")
         block = extract_block(text, m.start("brace"))
         fields: dict[str, str] = {}
         for fm in FIELD_RE.finditer(block):
@@ -103,7 +125,6 @@ def find_options(text: str) -> list[dict]:
 
 def render_markdown(
     root: Path,
-    modules_dir_exists: bool,
     files: list[Path],
     options: list[dict],
 ) -> str:
@@ -119,27 +140,20 @@ def render_markdown(
     )
     lines.append("")
 
-    if not modules_dir_exists:
-        lines.append(f"Scanned: `modules/` under `{root}` — directory not found.")
+    if not files:
+        lines.append(f"Scanned: `nix/` under `{root}` — no `.nix` files found.")
         lines.append("")
         lines.append(
-            "ubuntnix is pre-M1: no `modules/` tree exists in the repository "
-            "yet, so no options are declared."
+            "No `.nix` files exist under `nix/` in this tree, so no options "
+            "are declared."
         )
         lines.append("")
         return "\n".join(lines) + "\n"
 
     lines.append(
-        f"Scanned: `modules/` under `{root}` — {len(files)} `.nix` file(s) found."
+        f"Scanned: `nix/` under `{root}` — {len(files)} `.nix` file(s) found."
     )
     lines.append("")
-
-    if not options:
-        lines.append(
-            "No option declarations (`mkOption`) were found under `modules/` yet."
-        )
-        lines.append("")
-        return "\n".join(lines) + "\n"
 
     for opt in options:
         lines.append(f"## `{opt['path']}`")
@@ -177,7 +191,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--root",
         type=Path,
         default=None,
-        help="repo root to scan for modules/ (default: $UBX_REPO_ROOT or "
+        help="repo root to scan for nix/ (default: $UBX_REPO_ROOT or "
         "the parent of the docs/ dir containing this script)",
     )
     parser.add_argument(
@@ -192,13 +206,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     root = (args.root if args.root is not None else default_root()).resolve()
     out = (args.out if args.out is not None else default_out()).resolve()
 
-    modules_dir = root / "modules"
-    modules_dir_exists = modules_dir.is_dir()
+    nix_dir = root / "nix"
 
     files: list[Path] = []
     options: list[dict] = []
-    if modules_dir_exists:
-        files = sorted(modules_dir.rglob("*.nix"))
+    if nix_dir.is_dir():
+        files = sorted(nix_dir.rglob("*.nix"))
         for f in files:
             text = f.read_text(errors="replace")
             for opt in find_options(text):
@@ -206,14 +219,30 @@ def main(argv: Optional[list[str]] = None) -> int:
                 options.append(opt)
         options.sort(key=lambda o: (o["path"], o["file"]))
 
-    content = render_markdown(root, modules_dir_exists, files, options)
+    # An empty RESULT from a NON-empty source tree is a bug, not a valid
+    # steady state (see module docstring): don't silently write a
+    # misleadingly-empty page in that case, and don't leave a stale
+    # previous --out artifact around to be mistaken for current output.
+    if files and not options:
+        print(
+            f"error: found {len(files)} `.nix` file(s) under {nix_dir} but "
+            "extracted 0 mkOption declaration(s) from any of them -- this "
+            "almost certainly means the extractor regex in "
+            "docs/gen_reference.py no longer matches the option-declaration "
+            "shapes actually used in nix/*.nix, not that the tree has no "
+            "options. Refusing to emit a misleadingly-empty reference page.",
+            file=sys.stderr,
+        )
+        return 1
+
+    content = render_markdown(root, files, options)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content)
 
     print(
         f"wrote {out} ({len(options)} option(s) from {len(files)} file(s) "
-        f"under {modules_dir})"
+        f"under {nix_dir})"
     )
     return 0
 

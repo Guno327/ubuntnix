@@ -3,6 +3,30 @@
 # seed closure against the REAL upstream Ubuntu release manifests
 # (SPEC.md §12 R11, §11 M7; GitHub issue #118).
 #
+# -- These are LIVE-ISO manifests, and R11's target is NOT gap == 0 --------
+#
+# tests/fixtures/upstream-manifests/*.manifest are `*-live-server-*` /
+# `*-desktop-*` filenames because that is the ONLY installed-package
+# inventory Canonical publishes for a 24.04.x point release: the PM checked
+# both releases.ubuntu.com/24.04.3/ and the cdimage daily-live tree for
+# 24.04.3 and found no installed-system manifest at all — only
+# live-server/desktop/wsl `.manifest` files, which enumerate what the LIVE
+# BOOT MEDIUM carries (installer + live session), not what ends up on the
+# disk after `install` finishes. GitHub issue #143 traced two classes of
+# package that are consequently permanently, legitimately absent from any
+# installed ubuntnix system's effective package set while still showing up
+# in these fixtures, which the gap-classification block below (search
+# "issue #143") enumerates and nets out explicitly, each with its own
+# justification, rather than leaving them to silently inflate the "missing"
+# count forever. Given that, the honest R11 exit criterion for this metric
+# is gap ⊆ {live-only, kernel-ABI-skew} — i.e. the RESIDUAL after netting
+# both classes reaches 0 — never that the raw gap against these live-ISO
+# fixtures reaches 0, because a subset of what they list can never be
+# installed. See tests/fixtures/upstream-manifests/README.md for the same
+# point stated for humans browsing that directory, and
+# tests/unit/214-live-iso-gap-classification.sh for the pinned regression
+# test on the classification logic itself.
+#
 # The M1–M6 parity harnesses (050/070 e2e, 187/194 seed-set) verify our
 # seed against the project's OWN committed archive.lock.json and a small
 # hand-typed list of boot-critical "required" names, because — as every one
@@ -108,6 +132,7 @@ done
 if ! python3 - "$server_manifest" "$desktop_manifest" "$base_packages" <<'PYEOF'
 import hashlib
 import json
+import re
 import sys
 
 server_manifest, desktop_manifest, base_packages = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -286,6 +311,112 @@ for lbl, upstream in variants.items():
         f"uncovered by the locked closure alone; {len(gap_with_base)} "
         f"uncovered once the ubuntu-base layer ({len(base_names)} packages) "
         f"is also counted ({len(closed_by_base)} closed by the base layer)."
+    )
+
+# -- Gap classification: live-ISO false positives (GitHub issue #143) ------
+#
+# The gap figures printed just above are computed against
+# tests/fixtures/upstream-manifests/*.manifest, and — as this file's header
+# now explains — those are LIVE-ISO manifests (the boot medium's own
+# package set), not installed-system manifests, because Canonical publishes
+# no installed-system equivalent for 24.04.x. That means a fixed, knowable
+# subset of "missing" packages can NEVER be closed no matter how complete
+# ubuntnix's seed grows, because they only ever exist in the live
+# environment that installs a system, not on the system it installs. Two
+# such classes were identified by inspecting the actual gap set:
+#
+#   1. LIVE-ONLY packages: components of the live-boot/installer stack
+#      itself (casper's live-session machinery, subiquity/di-live's
+#      first-user and locale-prompt data, and the installer's own
+#      snapd-managed snaps). Enumerated by exact name below, each with its
+#      own why-this-one justification — mirroring how ADDITIONS_EXACT
+#      above documents ubuntnix's own by-design divergences instead of
+#      silently allow-listing them.
+#
+#   2. KERNEL-ABI-SKEW packages: upstream 24.04.3's live media was built
+#      against a specific kernel ABI build (Server: 6.8.0-71; Desktop's HWE
+#      track: 6.14.0-27) baked directly into these packages' NAMES
+#      (linux-image-6.8.0-71-generic and so on), while the snapshot
+#      archive.lock.json resolves against pins a different, newer ABI build
+#      of the SAME source (6.8.0-134 as of this writing — see
+#      linux-image-6.8.0-134-generic already declared). This is the exact
+#      mirror image of ADDITIONS_PREFIX above, which excuses OUR
+#      ABI-specific package names from looking like unexplained additions
+#      when diffed against upstream; this direction excuses upstream's
+#      ABI-specific names from looking like permanently-missing packages
+#      when they are, in substance, the same linux-generic/-hwe metapackage
+#      family we already ship. Because the concrete ABI number will change
+#      every time these fixtures are refreshed for a newer point release
+#      (unlike ADDITIONS_PREFIX, which only needs a literal prefix because
+#      OUR pin is a fixed constant at any given commit), this class is
+#      matched by a REGEX PATTERN on the kernel-version shape
+#      (`\d+\.\d+\.\d+-\d+`) rather than a hardcoded ABI string, so it
+#      survives a fixture refresh without edits here. The pattern is
+#      deliberately narrow — prefix + exact kernel-version-number shape +
+#      optional literal "-generic" suffix, nothing else — so it does NOT
+#      swallow a genuinely different, genuinely missing kernel package: for
+#      example "linux-tools-common" (versioned but carries no ABI number in
+#      its name) and Desktop's "linux-headers-generic-hwe-24.04" /
+#      "linux-image-generic-hwe-24.04" (real, distinctly-named HWE-track
+#      metapackages ubuntnix does not currently declare at all, not a mere
+#      ABI-pin mismatch of a package we do declare) both fail to match and
+#      correctly fall through to the "genuinely missing" residual instead
+#      of being netted out here.
+LIVE_ONLY_EXCLUSIONS = {
+    "casper": (
+        "the live-boot squashfs/initrd system that boots and drives the "
+        "live session itself; it unmounts/is discarded once the target "
+        "system is installed and rebooted, so it is never a member of an "
+        "installed system's package set by design."
+    ),
+    "user-setup": (
+        "the subiquity/di-live component that interactively creates the "
+        "first user account DURING install; it and its prompts run only in "
+        "the live installer environment and are not carried onto the "
+        "target system's disk."
+    ),
+    "localechooser-data": (
+        "data backing the live installer's locale-selection prompts shown "
+        "before/during install; consumed entirely within the live session, "
+        "never copied to the installed target."
+    ),
+    "snap": (
+        "the upstream_names() parser strips a `:arch`-shaped suffix off "
+        "every package name, which collapses every `snap:<name>` line in "
+        "these live manifests (snapd itself, core22, subiquity, and on "
+        "Desktop firefox/gnome-42-2204/gtk-common-themes/etc.) down to the "
+        "single bare name \"snap\". Those are snaps pre-seeded into the "
+        "live squashfs for the installer's own use (or, on Desktop, "
+        "default post-install snap seeds installed by subiquity/ubiquity "
+        "AFTER the deb-based rootfs this test models is already assembled) "
+        "— snapd manages them in its own separate namespace outside dpkg, "
+        "so they were never going to be members of the dpkg-based "
+        "effective_system this test computes, live manifest or not."
+    ),
+}
+
+_ABI_SKEW_RE = re.compile(
+    r"^linux-(headers|image|modules-extra|modules|tools)-"
+    r"\d+\.\d+\.\d+-\d+(-generic)?$"
+)
+
+
+def abi_skew(name):
+    return bool(_ABI_SKEW_RE.match(name))
+
+
+for lbl, upstream in variants.items():
+    gap_with_base = upstream - effective_system
+    live_only_hits = {n for n in gap_with_base if n in LIVE_ONLY_EXCLUSIONS}
+    abi_skew_hits = {n for n in gap_with_base if abi_skew(n)}
+    residual = gap_with_base - live_only_hits - abi_skew_hits
+    print(
+        f"OK: {lbl} gap classification (issue #143, live-ISO manifests) — "
+        f"raw gap {len(gap_with_base)}; net of {len(live_only_hits)} "
+        f"live-only package(s) = {len(gap_with_base) - len(live_only_hits)}; "
+        f"net of {len(abi_skew_hits)} kernel-ABI-skew package(s) = "
+        f"{len(gap_with_base) - len(abi_skew_hits)}; residual (net of both) "
+        f"= {len(residual)} genuinely missing."
     )
 
 sys.exit(rc)

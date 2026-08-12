@@ -313,6 +313,34 @@ only changes how 210 *reports* the upstream coverage gap; it does not
 relax the "declared ⊆ upstream + documented additions" subset assertion
 that check exists to enforce, which has nothing to do with the base layer.
 
+## The parity fixtures are live-ISO manifests, so the gap floor isn't zero
+
+`tests/fixtures/upstream-manifests/ubuntu-24.04.3-live-server-amd64.manifest`
+and its Desktop counterpart are `*-live-server-*`/`*-desktop-*` files
+because that is the *only* package inventory Canonical publishes for a
+24.04.x point release (checked against both `releases.ubuntu.com/24.04.3/`
+and the cdimage daily-live tree for GitHub issue #143) — there is no
+installed-system manifest to diff against instead. A live boot medium
+necessarily carries packages an installed system never does: the
+live-boot/installer stack itself (`casper`, `user-setup`,
+`localechooser-data`, the installer's pre-seeded snaps), and package names
+baked with the live medium's own kernel ABI build number
+(`linux-image-6.8.0-71-generic` and siblings) which will differ from
+whatever ABI build `archive.lock.json`'s snapshot happens to resolve for
+the same kernel source. Both classes are permanent, unclosable gap
+contributors no matter how complete ubuntnix's seed grows, so
+`tests/unit/210-upstream-manifest-parity.sh` enumerates each explicitly
+(`LIVE_ONLY_EXCLUSIONS`, with a per-package justification, and an
+`_ABI_SKEW_RE` pattern rather than a hardcoded ABI string so it survives a
+future fixture refresh) and reports the coverage gap net of both,
+informationally, alongside the raw figure —
+`tests/unit/214-live-iso-gap-classification.sh` pins that classification
+logic against the same fixtures. **The honest R11 exit target for this
+metric is therefore `gap ⊆ {live-only, kernel-ABI-skew}`, not a raw gap of
+zero.** As with the base-layer accounting above, this changes only how 210
+*reports* the gap; the "declared ⊆ upstream + documented additions" subset
+assertion is untouched.
+
 ## Where to track progress
 
 The archive lockfile and public-tier fetching land at milestone **M1**

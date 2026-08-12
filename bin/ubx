@@ -170,12 +170,14 @@ not_implemented() {
 # shared plan/report/execute helpers
 #
 # REPORTED domain order is FIXED throughout this file: etc, systemd, users,
-# snap, secrets — mirrors SPEC.md §4.3's switching table (row 1 combines
-# /etc + systemd units, row 2 is users, row 3 is snaps) and matches the
-# position bin/ubx-snap-purge's own sweep already established at the end of
-# execute_domains (issue #66). Every report this script prints (report_domains
-# below) lists domains in exactly this order, regardless of which verb
-# produced it.
+# snap, secrets, pro, home, crypttab — mirrors SPEC.md §4.3's switching
+# table (row 1 combines /etc + systemd units, row 2 is users, row 3 is
+# snaps) and matches the position bin/ubx-snap-purge's own sweep already
+# established at the end of execute_domains (issue #66), with every domain
+# added since (secrets, pro, home, crypttab) simply APPENDED at the end in
+# landing order. Every report this script prints (report_domains below)
+# lists domains in exactly this order, regardless of which verb produced
+# it.
 #
 # COMPUTED order (plan_domains/execute_domains below) is a SEPARATE thing,
 # and is NOT the same as reported order: secrets is computed, and applied,
@@ -583,14 +585,96 @@ else:
 PYEOF
 }
 
+# summarize_crypttab_plan PLAN_JSON — prints the total action count
+# (bin/ubx-crypttab's own plan schema, GitHub issue #170) -- same shape as
+# summarize_pro_plan.
+summarize_crypttab_plan() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+print(len(p["actions"]))
+PYEOF
+}
+
+# crypttab_plan_report PLAN_JSON — a human-readable render of a crypttab
+# plan (bin/ubx-crypttab has no `report` subcommand of its own, unlike
+# bin/ubx-systemd/bin/ubx-snap/bin/ubx-home -- mirrors this file's own
+# secrets_plan_report/pro_plan_report for the same reason: kept local to
+# bin/ubx since nothing else needs it).
+crypttab_plan_report() {
+  python3 - "$1" <<'PYEOF'
+import json
+import sys
+
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+lines = []
+for a in p["actions"]:
+    op = a["op"]
+    if op == "write-crypttab":
+        lines.append("write-crypttab")
+    elif op in ("create-mount", "update-mount"):
+        lines.append(f"{op}: {a['unitName']}")
+    elif op == "remove-mount":
+        lines.append(f"remove-mount: {a['unitName']}")
+    else:
+        lines.append(json.dumps(a, sort_keys=True))
+
+if not lines:
+    print("crypttab: nothing to do (fully converged)")
+else:
+    print(f"crypttab: {len(lines)} action(s) planned:")
+    for line in lines:
+        print(f"  - {line}")
+PYEOF
+}
+
+# crypttab_synthesize_observed OLD_DECLARED_JSON OUT_JSON — the crypttab
+# domain's "assume no drift" default observed-state manifest, derived FROM
+# the old generation's own DECLARED manifest -- exactly
+# pro_synthesize_observed's/home_synthesize_observed's own role (see either
+# function's comment for why this is the default absent a real
+# --crypttab-observed/`ubx-crypttab observe` call): a fully-converged
+# system running exactly the old declaration already has /etc/crypttab
+# holding the old declaration's own crypttabContent verbatim, and every
+# declared volume's mount unit (when it declares one) already installed
+# with its own mountUnitContent verbatim -- matches bin/ubx-crypttab's own
+# observed schema (that script's header, "The observed schema"), skipping
+# volumes whose mountUnitName/mountUnitContent are null (no mount unit was
+# ever declared for them).
+crypttab_synthesize_observed() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json
+import sys
+
+old_path, out_path = sys.argv[1:3]
+with open(old_path, encoding="utf-8") as f:
+    old = json.load(f)
+
+units = {}
+for v in old.get("volumes", []):
+    name = v.get("mountUnitName")
+    content = v.get("mountUnitContent")
+    if name is None or content is None:
+        continue
+    units[name] = content
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "crypttabContent": old.get("crypttabContent", ""), "units": units}, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
 # ubx_domain_refs_split PREFIX < <(ubx_rebuild_domain_refs ROOT GEN) — reads
 # ONE tab-separated
-# "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP<TAB>SECRETS<TAB>PRO<TAB>HOME\n" line
-# from stdin (ubx_rebuild_domain_refs' own output shape,
+# "ETC<TAB>SYSTEMD<TAB>USERS<TAB>SNAP<TAB>SECRETS<TAB>PRO<TAB>HOME<TAB>CRYPTTAB\n"
+# line from stdin (ubx_rebuild_domain_refs' own output shape,
 # bin/ubx-rebuild-lib) and assigns DOM_<PREFIX>ETC_REF /
 # DOM_<PREFIX>SYSTEMD_REF / DOM_<PREFIX>USERS_REF / DOM_<PREFIX>SNAP_REF /
-# DOM_<PREFIX>SECRETS_REF / DOM_<PREFIX>PRO_REF / DOM_<PREFIX>HOME_REF
-# (PREFIX is "OLD_" or "NEW_" at every call site below).
+# DOM_<PREFIX>SECRETS_REF / DOM_<PREFIX>PRO_REF / DOM_<PREFIX>HOME_REF /
+# DOM_<PREFIX>CRYPTTAB_REF (PREFIX is "OLD_" or "NEW_" at every call site
+# below).
 #
 # NOT a plain `IFS=$'\t' read -r a b c d` (every call site here used to be
 # exactly that, until GitHub issue #64's M3 snap-convergence e2e caught the
@@ -625,6 +709,7 @@ ubx_domain_refs_split() {
   printf -v "DOM_${prefix}SECRETS_REF" '%s' "${fields[4]:-}"
   printf -v "DOM_${prefix}PRO_REF" '%s' "${fields[5]:-}"
   printf -v "DOM_${prefix}HOME_REF" '%s' "${fields[6]:-}"
+  printf -v "DOM_${prefix}CRYPTTAB_REF" '%s' "${fields[7]:-}"
 }
 
 # -- plan_domains: computes (never executes) the three domain plans -------
@@ -763,6 +848,51 @@ plan_domains() {
   else
     DOM_SECRETS_PLAN=""
     DOM_SECRETS_TOUCH=0
+  fi
+
+  # -- crypttab (GitHub issue #170, groundwork from issue #83) ------------
+  #
+  # Computed here, after secrets and before pro (same "old/new declared
+  # manifest + old-manifest-drives-removal-scope + an observed-state
+  # default synthesized from the OLD declared manifest, overridable via
+  # --crypttab-observed" shape etc/systemd/home already use, NOT the
+  # secrets/pro single-manifest shape -- bin/ubx-crypttab plan's own
+  # --old-manifest is what drives mount-unit REMOVAL scope, see that
+  # script's header). Independent of every other domain -- a declared LUKS
+  # volume never needs a secret or a users cross-check (nix/crypttab.nix
+  # restricts keyFile to none/-, see docs/crypttab.md's "Why keyFile is
+  # restricted") -- so this block's position here (after secrets, before
+  # pro) is a forward-compatibility ordering choice, not a real dependency
+  # today: see execute_domains' own "-- crypttab" comment below for the
+  # reasoning that actually matters (a future keyfile-backed volume's key
+  # would live under --run-secrets-dir).
+  DOM_CRYPTTAB_SKIP=0
+  if [ -z "$DOM_OLD_CRYPTTAB_REF" ] && [ -z "$DOM_NEW_CRYPTTAB_REF" ]; then
+    DOM_CRYPTTAB_SKIP=1
+  fi
+  if [ "$DOM_CRYPTTAB_SKIP" = 0 ]; then
+    local crypttab_old_json crypttab_new_json crypttab_obs_json
+    crypttab_old_json="$(ubx_rebuild_resolve_ref "$DOM_OLD_CRYPTTAB_REF" "$UBX_REBUILD_EMPTY_CRYPTTAB_MANIFEST" "$workdir" old-crypttab)" \
+      || die "could not resolve the old generation's crypttab manifest"
+    crypttab_new_json="$(ubx_rebuild_resolve_ref "$DOM_NEW_CRYPTTAB_REF" "$UBX_REBUILD_EMPTY_CRYPTTAB_MANIFEST" "$workdir" new-crypttab)" \
+      || die "could not resolve the new generation's crypttab manifest"
+    if [ -n "${OPT_CRYPTTAB_OBSERVED:-}" ]; then
+      crypttab_obs_json="$OPT_CRYPTTAB_OBSERVED"
+    else
+      crypttab_obs_json="$workdir/crypttab-obs-synth.json"
+      crypttab_synthesize_observed "$crypttab_old_json" "$crypttab_obs_json"
+    fi
+    DOM_NEW_CRYPTTAB_JSON="$crypttab_new_json"
+
+    DOM_CRYPTTAB_PLAN="$workdir/crypttab-plan.json"
+    "$bindir/ubx-crypttab" plan --manifest "$crypttab_new_json" --old-manifest "$crypttab_old_json" \
+      --observed "$crypttab_obs_json" --out "$DOM_CRYPTTAB_PLAN" \
+      || die "ubx-crypttab plan refused (see its stderr above)"
+    DOM_CRYPTTAB_TOUCH="$(summarize_crypttab_plan "$DOM_CRYPTTAB_PLAN")"
+  else
+    DOM_CRYPTTAB_PLAN=""
+    DOM_CRYPTTAB_TOUCH=0
+    DOM_NEW_CRYPTTAB_JSON=""
   fi
 
   # -- pro (GitHub issue #82, milestone M4) --------------------------------
@@ -1015,7 +1145,7 @@ report_domains() {
     echo "pro: $DOM_PRO_TOUCH action(s) touched"
   fi
 
-  # home is reported LAST (GitHub issue #98, milestone M5), after pro --
+  # home is reported after pro (GitHub issue #98, milestone M5) --
   # same append-at-the-end convention.
   if [ "$DOM_HOME_SKIP" = 1 ]; then
     echo "home: nothing declared (no old or new home manifest)"
@@ -1023,6 +1153,16 @@ report_domains() {
     "$bindir/ubx-home" report --plan "$DOM_HOME_PLAN"
   else
     echo "home: $DOM_HOME_TOUCH action(s) touched"
+  fi
+
+  # crypttab is reported LAST (GitHub issue #170), after home -- same
+  # append-at-the-end convention.
+  if [ "$DOM_CRYPTTAB_SKIP" = 1 ]; then
+    echo "crypttab: nothing declared (no old or new crypttab manifest)"
+  elif [ "$verbose" = 1 ]; then
+    crypttab_plan_report "$DOM_CRYPTTAB_PLAN"
+  else
+    echo "crypttab: $DOM_CRYPTTAB_TOUCH action(s) touched"
   fi
 }
 
@@ -1047,6 +1187,7 @@ execute_domains() {
   local secrets_dir="${8:-}" run_secrets_dir="${9:-/run/secrets}" secrets_mounts_file="${10:-}"
   local pro_bin="${11:-pro}"
   local homes_dir="${12:-/home}" home_content_dir="${13:-}"
+  local crypttab_file="${14:-/etc/crypttab}" crypttab_units_dir="${15:-/etc/systemd/system}"
 
   if [ "$DOM_ETC_SKIP" = 0 ]; then
     local content_dir="$etc_content_dir"
@@ -1102,6 +1243,35 @@ execute_domains() {
       secrets_apply_args+=(--dry-run)
     fi
     "${secrets_apply_args[@]}"
+  fi
+
+  # -- crypttab (GitHub issue #170, groundwork from issue #83) ------------
+  #
+  # Runs immediately AFTER the secrets block above, never before: today,
+  # nix/crypttab.nix restricts every declared volume's `keyFile` to
+  # `"none"`/`"-"` (docs/crypttab.md's "Why keyFile is restricted" —
+  # neither spelling ever reads a real secret), so this ordering has NO
+  # real dependency to satisfy yet. It is deliberately placed here anyway,
+  # as a FORWARD-COMPATIBILITY choice: the natural extension of this
+  # groundwork is a real keyfile-backed volume, and a keyfile's own bytes
+  # would live under `--run-secrets-dir` exactly like the pro token below
+  # does today — converging crypttab after secrets materialization means
+  # that future addition slots in without reshuffling this ordering again.
+  # bin/ubx-crypttab-apply, unlike bin/ubx-snap-apply, HAS its own real
+  # dry-run/--apply gate (mirrors bin/ubx-etc-apply's/bin/ubx-systemd-
+  # apply's own posture, not the snap-call-site gate below) — so this is
+  # ALWAYS invoked, --apply/--dry-run passed straight through: writing
+  # /etc/crypttab and a .mount unit file is retry-safe (no `verb`-based
+  # carve-out the way the snap-purge sweep below needs one).
+  if [ "$DOM_CRYPTTAB_SKIP" = 0 ]; then
+    local crypttab_apply_args=("$bindir/ubx-crypttab-apply" --plan "$DOM_CRYPTTAB_PLAN" --manifest "$DOM_NEW_CRYPTTAB_JSON" \
+      --crypttab-file "$crypttab_file" --units-dir "$crypttab_units_dir")
+    if [ "$apply" = 1 ]; then
+      crypttab_apply_args+=(--apply)
+    else
+      crypttab_apply_args+=(--dry-run)
+    fi
+    "${crypttab_apply_args[@]}"
   fi
 
   # -- pro (GitHub issue #82, milestone M4) --------------------------------
@@ -1377,6 +1547,21 @@ Execution options:
   --home-content-dir DIR    (default: alongside the new home manifest, its
                             own tree/ subdirectory -- nix/home.nix's
                             render's own \$out/tree layout)
+  --crypttab-manifest PATH  new generation's declared crypttab manifest
+                            (nix/crypttab.nix's per-generation manifest,
+                            GitHub issue #170, groundwork from issue #83).
+                            Omitted entirely means "nothing declared for
+                            this domain", same as every other domain above.
+  --crypttab-observed FILE  (default: synthesized from the OLD generation's
+                            own declared crypttab manifest, assuming it is
+                            already fully converged -- see
+                            crypttab_synthesize_observed's own comment)
+  --crypttab-file FILE      the real (or, for tests, temp) /etc/crypttab
+                            path bin/ubx-crypttab-apply targets (default
+                            /etc/crypttab)
+  --crypttab-units-dir DIR  the real (or, for tests, temp) directory
+                            bin/ubx-crypttab-apply installs .mount units
+                            into (default /etc/systemd/system)
 
 See SPEC.md §4.3, §4.5 for the full verb semantics.
 USAGE
@@ -1387,15 +1572,16 @@ do_rebuild() {
   shift
 
   local root="" title="" rootfs_image="" kernel="" initrd="" root_device="" kernel_params="" snap_manifest=""
-  local etc_ref="" systemd_ref="" users_manifest="" secrets_manifest="" pro_manifest="" home_manifest=""
+  local etc_ref="" systemd_ref="" users_manifest="" secrets_manifest="" pro_manifest="" home_manifest="" crypttab_manifest=""
   local systemd_unit_dir="/etc/systemd/system" systemd_content_dir="" users_out=""
   local etc_dir="/etc" etc_content_dir=""
   local secrets_dir="" run_secrets_dir="/run/secrets" secrets_mounts_file="" pro_bin="pro"
   local homes_dir="/home" home_content_dir=""
+  local crypttab_file="/etc/crypttab" crypttab_units_dir="/etc/systemd/system"
   local apply=0 dry_run=0
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
-  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED=""
+  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED="" OPT_CRYPTTAB_OBSERVED=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1413,6 +1599,7 @@ do_rebuild() {
       --secrets-manifest) [ $# -ge 2 ] || die "--secrets-manifest requires an argument"; secrets_manifest="$2"; shift 2 ;;
       --pro-manifest) [ $# -ge 2 ] || die "--pro-manifest requires an argument"; pro_manifest="$2"; shift 2 ;;
       --home-manifest) [ $# -ge 2 ] || die "--home-manifest requires an argument"; home_manifest="$2"; shift 2 ;;
+      --crypttab-manifest) [ $# -ge 2 ] || die "--crypttab-manifest requires an argument"; crypttab_manifest="$2"; shift 2 ;;
       --etc-observed) [ $# -ge 2 ] || die "--etc-observed requires an argument"; OPT_ETC_OBSERVED="$2"; shift 2 ;;
       --etc-exceptions) [ $# -ge 2 ] || die "--etc-exceptions requires an argument"; OPT_ETC_EXCEPTIONS="$2"; shift 2 ;;
       --systemd-observed) [ $# -ge 2 ] || die "--systemd-observed requires an argument"; OPT_SYSTEMD_OBSERVED="$2"; shift 2 ;;
@@ -1420,6 +1607,7 @@ do_rebuild() {
       --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --pro-observed) [ $# -ge 2 ] || die "--pro-observed requires an argument"; OPT_PRO_OBSERVED="$2"; shift 2 ;;
       --home-observed) [ $# -ge 2 ] || die "--home-observed requires an argument"; OPT_HOME_OBSERVED="$2"; shift 2 ;;
+      --crypttab-observed) [ $# -ge 2 ] || die "--crypttab-observed requires an argument"; OPT_CRYPTTAB_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -1436,6 +1624,8 @@ do_rebuild() {
       --pro-bin) [ $# -ge 2 ] || die "--pro-bin requires an argument"; pro_bin="$2"; shift 2 ;;
       --homes-dir) [ $# -ge 2 ] || die "--homes-dir requires an argument"; homes_dir="$2"; shift 2 ;;
       --home-content-dir) [ $# -ge 2 ] || die "--home-content-dir requires an argument"; home_content_dir="$2"; shift 2 ;;
+      --crypttab-file) [ $# -ge 2 ] || die "--crypttab-file requires an argument"; crypttab_file="$2"; shift 2 ;;
+      --crypttab-units-dir) [ $# -ge 2 ] || die "--crypttab-units-dir requires an argument"; crypttab_units_dir="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h | --help) cmd_rebuild_usage; exit 0 ;;
@@ -1469,6 +1659,7 @@ do_rebuild() {
   DOM_NEW_SECRETS_REF="$secrets_manifest"
   DOM_NEW_PRO_REF="$pro_manifest"
   DOM_NEW_HOME_REF="$home_manifest"
+  DOM_NEW_CRYPTTAB_REF="$crypttab_manifest"
 
   local new_idx=""
   if [ "$dry_run" = 0 ]; then
@@ -1481,8 +1672,8 @@ do_rebuild() {
     [ -z "$snap_manifest" ] || create_args+=(--snap-manifest "$snap_manifest")
     new_idx="$("$bindir/ubx-generations" "${create_args[@]}")" \
       || die "rebuild $verb: failed to register the new generation"
-    ubx_rebuild_write_sidecar "$root" "$new_idx" "$systemd_ref" "$secrets_manifest" "$pro_manifest" "$home_manifest" \
-      || die "rebuild $verb: failed to record the systemd/secrets/pro/home manifest references for generation $new_idx"
+    ubx_rebuild_write_sidecar "$root" "$new_idx" "$systemd_ref" "$secrets_manifest" "$pro_manifest" "$home_manifest" "$crypttab_manifest" \
+      || die "rebuild $verb: failed to record the systemd/secrets/pro/home/crypttab manifest references for generation $new_idx"
   fi
 
   plan_domains "$workdir"
@@ -1502,7 +1693,8 @@ do_rebuild() {
       local exec_users_out="$users_out"
       [ -n "$exec_users_out" ] || exec_users_out="$root/$new_idx/users-activate.sh"
       execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "$verb" \
-        "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file" "$pro_bin" "$homes_dir" "$home_content_dir"
+        "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file" "$pro_bin" "$homes_dir" "$home_content_dir" \
+        "$crypttab_file" "$crypttab_units_dir"
       ubx_rebuild_write_booted "$root" "$new_idx"
 
       # -- Soft-reboot activation (issue #30) -----------------------------
@@ -1629,6 +1821,7 @@ is no longer retained under the given/default retention policy is refused
   --secrets-mounts-file FILE
   --pro-observed FILE --pro-bin CMD
   --home-observed FILE --homes-dir DIR --home-content-dir DIR
+  --crypttab-observed FILE --crypttab-file FILE --crypttab-units-dir DIR
 USAGE
 }
 
@@ -1638,9 +1831,10 @@ cmd_rollback() {
   local etc_dir="/etc" etc_content_dir=""
   local secrets_dir="" run_secrets_dir="/run/secrets" secrets_mounts_file="" pro_bin="pro"
   local homes_dir="/home" home_content_dir=""
+  local crypttab_file="/etc/crypttab" crypttab_units_dir="/etc/systemd/system"
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
-  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED=""
+  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED="" OPT_CRYPTTAB_OBSERVED=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1653,6 +1847,7 @@ cmd_rollback() {
       --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --pro-observed) [ $# -ge 2 ] || die "--pro-observed requires an argument"; OPT_PRO_OBSERVED="$2"; shift 2 ;;
       --home-observed) [ $# -ge 2 ] || die "--home-observed requires an argument"; OPT_HOME_OBSERVED="$2"; shift 2 ;;
+      --crypttab-observed) [ $# -ge 2 ] || die "--crypttab-observed requires an argument"; OPT_CRYPTTAB_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;
@@ -1669,6 +1864,8 @@ cmd_rollback() {
       --pro-bin) [ $# -ge 2 ] || die "--pro-bin requires an argument"; pro_bin="$2"; shift 2 ;;
       --homes-dir) [ $# -ge 2 ] || die "--homes-dir requires an argument"; homes_dir="$2"; shift 2 ;;
       --home-content-dir) [ $# -ge 2 ] || die "--home-content-dir requires an argument"; home_content_dir="$2"; shift 2 ;;
+      --crypttab-file) [ $# -ge 2 ] || die "--crypttab-file requires an argument"; crypttab_file="$2"; shift 2 ;;
+      --crypttab-units-dir) [ $# -ge 2 ] || die "--crypttab-units-dir requires an argument"; crypttab_units_dir="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h | --help) cmd_rollback_usage; exit 0 ;;
@@ -1733,7 +1930,8 @@ cmd_rollback() {
     # (GitHub issue #66 scoped this to `ubx rebuild switch|test` only), even
     # though a target generation may itself declare a snap manifest.
     execute_domains "$systemd_unit_dir" "$systemd_content_dir" "$apply" "$exec_users_out" "$etc_content_dir" "$etc_dir" "" \
-      "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file" "$pro_bin" "$homes_dir" "$home_content_dir"
+      "$secrets_dir" "$run_secrets_dir" "$secrets_mounts_file" "$pro_bin" "$homes_dir" "$home_content_dir" \
+      "$crypttab_file" "$crypttab_units_dir"
     ubx_rebuild_write_booted "$root" "$target"
     ubx_rebuild_write_grub_default "$root" "$target"
     echo "grub default: set to generation $target"
@@ -1797,6 +1995,7 @@ aware diff instead.
   --secrets-observed FILE
   --pro-observed FILE
   --home-observed FILE
+  --crypttab-observed FILE
   --passwd FILE --group FILE --shadow FILE
   --users-exceptions FILE --home-state FILE
 USAGE
@@ -1806,7 +2005,7 @@ cmd_diff() {
   local root=""
   OPT_ETC_OBSERVED="" OPT_ETC_EXCEPTIONS="" OPT_SYSTEMD_OBSERVED="" OPT_SNAP_OBSERVED=""
   OPT_PASSWD="" OPT_GROUP="" OPT_SHADOW="" OPT_USERS_EXCEPTIONS="" OPT_HOME_STATE=""
-  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED=""
+  OPT_SECRETS_OBSERVED="" OPT_PRO_OBSERVED="" OPT_HOME_OBSERVED="" OPT_CRYPTTAB_OBSERVED=""
   local -a pos=()
 
   while [ $# -gt 0 ]; do
@@ -1819,6 +2018,7 @@ cmd_diff() {
       --secrets-observed) [ $# -ge 2 ] || die "--secrets-observed requires an argument"; OPT_SECRETS_OBSERVED="$2"; shift 2 ;;
       --pro-observed) [ $# -ge 2 ] || die "--pro-observed requires an argument"; OPT_PRO_OBSERVED="$2"; shift 2 ;;
       --home-observed) [ $# -ge 2 ] || die "--home-observed requires an argument"; OPT_HOME_OBSERVED="$2"; shift 2 ;;
+      --crypttab-observed) [ $# -ge 2 ] || die "--crypttab-observed requires an argument"; OPT_CRYPTTAB_OBSERVED="$2"; shift 2 ;;
       --passwd) [ $# -ge 2 ] || die "--passwd requires an argument"; OPT_PASSWD="$2"; shift 2 ;;
       --group) [ $# -ge 2 ] || die "--group requires an argument"; OPT_GROUP="$2"; shift 2 ;;
       --shadow) [ $# -ge 2 ] || die "--shadow requires an argument"; OPT_SHADOW="$2"; shift 2 ;;

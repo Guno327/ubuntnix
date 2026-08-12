@@ -34,7 +34,7 @@ root="$work/gens"
 out="$("$ubx" rebuild --help 2>&1)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "'rebuild --help' should exit 0, got $rc"
-for word in switch boot test rootfs-image dry-run apply; do
+for word in switch boot test rootfs-image dry-run apply crypttab; do
   contains "$out" "$word" || fail "'rebuild --help' output missing '$word'"
 done
 

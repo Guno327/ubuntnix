@@ -179,11 +179,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. docs/crypttab.md -- must exist, name the real mechanism, and must NOT
-#    claim it is wired into `ubx rebuild`/execute_domains (it genuinely
-#    isn't -- unlike its filesystems/localization/home/etc siblings)
+# 5. docs/crypttab.md -- must exist, name the real mechanism, and, once
+#    bin/ubx's execute_domains really invokes bin/ubx-crypttab-apply
+#    (GitHub issue #170), must say so plainly and must NOT still claim the
+#    domain is unwired -- mirrors section 3's docs/systemd.md pattern
+#    above (an UNDERCLAIM is now the risk for this page, the opposite of
+#    the overclaim risk this section used to guard against before #170
+#    landed).
 # ---------------------------------------------------------------------------
 crypttab_doc="docs/crypttab.md"
+crypttab_apply_invocation_test="tests/unit/236-ubx-crypttab-apply-real-invocation.sh"
 if [ ! -f "$crypttab_doc" ]; then
   fail "$crypttab_doc does not exist (GitHub issue #156: nix/crypttab.nix/bin/ubx-crypttab*/bin/ubx-crypttab-apply have no documentation page)"
 else
@@ -193,14 +198,15 @@ else
     }
   done
 
-  # -- Positive check for the TRUE "unwired" half: if bin/ubx's
-  #    execute_domains genuinely does not invoke bin/ubx-crypttab-apply,
-  #    the doc must not claim otherwise (an overclaim, not an underclaim,
-  #    is the risk for this specific page -- see this test's header).
-  if ! grep -q "ubx-crypttab-apply" bin/ubx 2>/dev/null; then
-    if grep -qiE "wired into \`?ubx rebuild\`?|execute_domains (builds and runs|invokes) .*ubx-crypttab-apply" "$crypttab_doc"; then
-      fail "$crypttab_doc claims bin/ubx-crypttab-apply is wired into ubx rebuild/execute_domains, but bin/ubx does not invoke it -- grep -q ubx-crypttab-apply bin/ubx found nothing"
+  if grep -q "ubx-crypttab-apply" bin/ubx 2>/dev/null && [ -e "$crypttab_apply_invocation_test" ]; then
+    if grep -qiE "not currently wired into anything|no later issue wires this domain|it is also \*\*not\*\* currently wired" "$crypttab_doc"; then
+      fail "$crypttab_doc still claims the crypttab domain is unwired, but bin/ubx's execute_domains really invokes bin/ubx-crypttab-apply, pinned by $crypttab_apply_invocation_test"
     fi
+    grep -q -- "235-ubx-rebuild-crypttab-wiring\|236-ubx-crypttab-apply-real-invocation" "$crypttab_doc" || {
+      fail "$crypttab_doc no longer names a crypttab-wiring pinning test (tests/unit/235-ubx-rebuild-crypttab-wiring.sh or $crypttab_apply_invocation_test) -- it should cite the test(s) that pin the real invocation"
+    }
+  else
+    echo "SKIP-ish: bin/ubx does not invoke ubx-crypttab-apply, or $crypttab_apply_invocation_test is missing -- nothing to contradict in $crypttab_doc" >&2
   fi
 fi
 
@@ -258,7 +264,7 @@ for page in crypttab filesystems localization; do
 done
 
 if [ "$fails" -eq 0 ]; then
-  echo "OK: docs/modules.md, docs/index.md, docs/systemd.md, docs/guards.md, docs/crypttab.md, docs/filesystems.md, and docs/localization.md do not reassert stale absent/deferred claims contradicted by the real tree, guards.md still correctly scopes guard installation to the switch-loop proof image, crypttab.md correctly scopes itself as unwired groundwork, and filesystems.md/localization.md correctly claim their real parity-image wiring"
+  echo "OK: docs/modules.md, docs/index.md, docs/systemd.md, docs/guards.md, docs/crypttab.md, docs/filesystems.md, and docs/localization.md do not reassert stale absent/deferred claims contradicted by the real tree, guards.md still correctly scopes guard installation to the switch-loop proof image, crypttab.md correctly claims its real ubx rebuild/execute_domains wiring (GitHub issue #170), and filesystems.md/localization.md correctly claim their real parity-image wiring"
 fi
 
 exit "$fails"

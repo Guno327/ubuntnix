@@ -286,6 +286,33 @@ expected to consume this script's output, not `archive.lock.json`
 directly — `tests/unit/059-archive-public-cache-manifest.sh` pins the
 exclusion guarantee against a fixture carrying both tiers.
 
+## The parity model also has to account for the base layer
+
+The archive lockfile is not the whole story of what a composed ubuntnix
+system contains, and `tests/unit/210-upstream-manifest-parity.sh`'s R11
+coverage accounting (SPEC.md §12 R11, §11 M7; GitHub issue #140) has to
+know that. `nix/compose.nix`'s `composeRootfs` builds every rootfs by
+unpacking the `ubuntu-base` tarball FIRST and layering the locked closure
+on top of it (see that function's own "ubuntu-base plus every declared
+package" header) — `nix/stdenv.nix` is what fetches and SHA-256-pins that
+tarball, the one third-party artifact this whole project trusts outside
+pinned flake inputs (see that file's "Trust root" comment). A package that
+ships inside ubuntu-base itself — `bash`, `dash`, `grep`, `gzip`,
+`util-linux`, `base-files`, `login`, and eight others as of this writing —
+is present on every real composed system whether or not `archive.lock.json`
+also lists it. Diffing the locked closure alone against upstream therefore
+overstates the R11 coverage gap; the honest comparison is base ∪ closure.
+
+That base-layer inventory is committed as `tests/fixtures/upstream-
+manifests/ubuntu-base-24.04.4-base-amd64.packages` — derived from the
+pinned tarball's own `var/lib/dpkg/status`, not fetched or unpacked again
+at test time — and `tests/unit/213-ubuntu-base-fixture-pin.sh` is the
+tripwire that keeps it from silently drifting onto a different
+`ubuntu-base` spin than the one `nix/stdenv.nix` actually fetches. This
+only changes how 210 *reports* the upstream coverage gap; it does not
+relax the "declared ⊆ upstream + documented additions" subset assertion
+that check exists to enforce, which has nothing to do with the base layer.
+
 ## Where to track progress
 
 The archive lockfile and public-tier fetching land at milestone **M1**

@@ -31,6 +31,41 @@ its SHA-256, and update the pins + variant list in
 `tests/unit/210-upstream-manifest-parity.sh`. Keep older releases so parity
 stays versioned per Ubuntu release as R11 prescribes.
 
+## The `ubuntu-base` base-layer package list (GitHub issue #140)
+
+The two `.manifest` files above are Server/Desktop ISO manifests — the full
+package set an *installed* system has. But `nix/compose.nix`'s
+`composeRootfs` does not build a composed ubuntnix rootfs from the locked
+closure alone: it unpacks the `ubuntu-base` tarball FIRST and layers the
+locked closure on top (`nix/compose.nix`, the "ubuntu-base plus every
+declared package" language at both its `composeRootfs` header and its
+`composeRootfs` implementation). Every package already inside `ubuntu-base`
+— `bash`, `dash`, `grep`, `gzip`, `util-linux`, `base-files`, `login`, and
+so on — is therefore present on every real composed system whether or not
+`archive.lock.json` also lists it, and diffing the locked closure alone
+against the Server/Desktop manifests (as `tests/unit/210-upstream-manifest-
+parity.sh` used to) overstates the R11 coverage gap by exactly that many
+packages.
+
+`ubuntu-base-24.04.4-base-amd64.packages` is the fix: the plain
+sorted, one-name-per-line list of every package dpkg considers installed
+inside the *same* `ubuntu-base-24.04.4-base-amd64.tar.gz` tarball that
+`nix/stdenv.nix` fetches and hash-pins (not a separately-chosen version —
+see that file's own "Trust root" comment for the pin's provenance). Unlike
+the two `.manifest` files, this is not itself a Canonical-published
+artifact; it's derived from the tarball's own `var/lib/dpkg/status`, as
+documented in the fixture's own header comment. `tests/unit/210-upstream-
+manifest-parity.sh` unions it with the locked closure when reporting R11
+coverage, and `tests/unit/213-ubuntu-base-fixture-pin.sh` asserts this
+fixture's recorded provenance SHA-256 still matches `nix/stdenv.nix`'s live
+pin, sorted order, and no duplicates — so it cannot silently drift onto a
+different `ubuntu-base` spin than the one actually fetched at build time.
+
+If `nix/stdenv.nix`'s pin ever moves to a new `ubuntu-base` point release,
+regenerate this fixture from the new tarball (see the fixture's own header
+for the exact extraction command) and update both this section and
+`tests/unit/213-ubuntu-base-fixture-pin.sh`'s expectations accordingly.
+
 ## Licensing
 
 These manifests are factual package inventories (name + version pairs)

@@ -37,3 +37,20 @@ for d in tests/unit tests/e2e; do
     exit 1;
   }
 done
+
+# Python bytecode is a build artifact -- interpreter- and
+# architecture-specific, silently stale against its own .py source, and
+# pure binary churn in every diff. Nine `__pycache__/*.pyc` files were
+# committed by accident once (GitHub issue #161, a stray `git add -A`
+# after a `compileall` run, with no .gitignore rule to stop it); this
+# asserts they never come back. The check is on what git TRACKS, not on
+# what exists on disk, because a local test run legitimately creates
+# __pycache__ directories that are simply ignored.
+if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+  tracked_pyc=$(git ls-files | grep -E '(^|/)__pycache__/|\.pyc$' || true)
+  [ -z "$tracked_pyc" ] || {
+    echo "Python bytecode is tracked in the repo (see .gitignore, issue #161):";
+    echo "$tracked_pyc";
+    exit 1;
+  }
+fi

@@ -16,18 +16,24 @@
 # -- What relationship is checked, and why it is a SUBSET check ------------
 #
 # nix/profiles.nix's own header establishes the contract "declared ⊆
-# archive.lock.json": our locked closure is the minimal, mutually-proven
-# base set (171 pkgs) plus a few stdenv/tooling fixtures — it is NOT the
-# full upstream Server/Desktop task-set. Extending the profiles to the full
-# upstream seed (so that upstream ⊆ ours) is a product-scope decision that
-# is deliberately owner-gated (#118). What this test CAN assert without
-# that decision, and what R11 fundamentally requires, is the OTHER
-# direction: every package ubuntnix declares must be a genuine member of
-# the upstream release — with the sole, explicitly-enumerated exception of
-# ubuntnix's own additions (the `nix` closure and build/image tooling,
-# which by design are not in stock Ubuntu). Any declared package that is
-# neither in the upstream manifest nor in that documented additions list is
-# an unexplained divergence and fails CI.
+# archive.lock.json". This test asserts the direction of R11 that holds at
+# every point along the way: every package ubuntnix declares must be a
+# genuine member of an upstream release — with the sole, explicitly-
+# enumerated exception of ubuntnix's own additions (the `nix` closure and
+# build/image tooling, which by design are not in stock Ubuntu). Any
+# declared package that is neither in the upstream manifest nor in that
+# documented additions list is an unexplained divergence and fails CI.
+#
+# NOTE (issue #118): this header used to say the locked closure was a
+# minimal 171-package base that was deliberately NOT the upstream task-set,
+# and that extending it was owner-gated. That is no longer accurate. SPEC
+# §10 ("same software set" as upstream) and §11's M5 exit criterion MANDATE
+# the full upstream Server seed, so the seed is being grown toward it one
+# task-set metapackage per PR (ubuntu-minimal, ubuntu-standard,
+# ubuntu-server-minimal, ubuntu-server, linux-generic). The subset
+# direction asserted here stays correct and useful throughout that growth —
+# it is what catches an unexplained package appearing in our closure — but
+# it is a floor, not a statement that upstream ⊆ ours is out of scope.
 set -u
 
 cd "$UBX_REPO_ROOT" || exit 1
@@ -125,7 +131,13 @@ def upstream_names(path):
 #      * fakeroot + initramfs/image build tooling
 #    Kernel packages are pinned to a concrete ABI (e.g.
 #    linux-image-6.8.0-134-generic) that never equals upstream's metapackage
-#    name, so they are matched by prefix rather than exact name.
+#    name, so they are matched by prefix rather than exact name. The
+#    linux-headers- prefix joins them with the linux-generic metapackage
+#    (GitHub issue #118): upstream's own manifest carries
+#    linux-headers-6.8.0-71{,-generic}, i.e. these ARE real upstream
+#    packages — they simply pin a different ABI than the snapshot we
+#    resolve against, which is exactly the linux-image-/linux-modules-
+#    situation and not a genuine ubuntnix-only divergence.
 ADDITIONS_EXACT = {
     # nix runtime + its closure's transitive deps
     "nix-bin",
@@ -143,7 +155,7 @@ ADDITIONS_EXACT = {
     "bzip2",
     "mtools",
 }
-ADDITIONS_PREFIX = ("linux-image-", "linux-modules-")
+ADDITIONS_PREFIX = ("linux-image-", "linux-modules-", "linux-headers-")
 
 
 def is_addition(name):

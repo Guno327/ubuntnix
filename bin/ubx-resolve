@@ -707,11 +707,42 @@ resolve() {
     -o "APT::Architectures::=amd64"
     -o "Acquire::Languages=none"
     # The declared set -- not apt's Recommends graph -- controls what a
-    # ubuntnix system contains (SPEC.md §5's minimal-by-default posture;
-    # same posture debootstrap takes). Without this, declaring a kernel
-    # meta-package drags in Recommends like firmware blobs that the spec
-    # never asked for; anything genuinely needed must be declared (or be a
-    # hard Depends of something declared).
+    # ubuntnix system contains: the same posture debootstrap takes. Without
+    # this, declaring a kernel meta-package drags in Recommends like
+    # firmware blobs that were never declared; anything genuinely needed
+    # must be declared (or be a hard Depends of something declared).
+    #
+    # CORRECTION (GitHub issue #118, 2026-08-12). This comment previously
+    # attributed the flag to "SPEC.md §5's minimal-by-default posture".
+    # That citation is wrong and should not be reintroduced: SPEC §5
+    # ("Package policy") says nothing about minimality -- its four bullets
+    # are snap-preferred/deb-fallback, verified provenance, archive
+    # components, and Ubuntu Pro. The SPEC's only "minimal" is §1.1's
+    # "minimal primitive core", which scopes the CONFIGURATION SURFACE
+    # (how few module/option primitives the system exposes), not the
+    # installed software set. Those are different axes, and conflating
+    # them let a load-bearing justification go unchallenged for months.
+    #
+    # This matters because the SPEC clauses that DO speak to the installed
+    # software set point the other way: §10's parity principle is "same
+    # software, same defaults" as an upstream install, and §11's M5 exit
+    # criterion mandates the full upstream Server seed. Upstream installs
+    # with apt's default of Recommends ON, so disabling it here is a real,
+    # deliberate divergence from the parity target rather than a neutral
+    # implementation detail -- and it is measurably the dominant one:
+    # resolving the current declared seed against the pinned snapshot with
+    # Recommends enabled takes upstream Server coverage from 440/687 to
+    # ~668/687 (issue #118's 2026-08-12 analysis comment has the full
+    # method and numbers).
+    #
+    # The flag is therefore left AS-IS for now on purpose, not by
+    # inheritance: flipping it roughly doubles the closure (~465 -> ~700)
+    # and pulls hardware daemons onto the Server profile, so it is a
+    # product decision escalated to the owner on #118, not a change to
+    # make silently from inside the resolver. Whoever resolves that issue
+    # updates this block -- either flipping the flag, or recording the
+    # decision that ubuntnix deliberately ships a Recommends-free subset
+    # of upstream (which then needs SPEC §10 amended to say so).
     -o "APT::Install-Recommends=false"
     -o "APT::Install-Suggests=false"
     # Isolated network hiccups on the CI runner shouldn't fail the whole
